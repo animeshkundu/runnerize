@@ -1,0 +1,102 @@
+# Manual publish pipeline for runnerize.
+#
+# Triggered on demand (workflow_dispatch). It bumps the version, tags and
+# pushes the release commit, publishes to npm, and cuts a GitHub Release.
+#
+# npm auth uses OIDC TRUSTED PUBLISHING — there is no stored NPM_TOKEN. A
+# matching trusted publisher must be configured on npmjs.com for the `runnerize`
+# package, bound to THIS workflow file name (publish.yml) for org/repo
+# animeshkundu/runnerize. npm >= 11.5.1 supplies the OIDC auth automatically.
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semver bump for this release
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  publish:
+    name: Bump & publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Only ever publish from the default branch; workflow_dispatch can be
+    # launched from any branch, so guard against publishing a feature branch.
+    if: github.ref_name == github.event.repository.default_branch
+    permissions:
+      contents: write # push the release commit/tag and create the Release
+      id-token: write # OIDC trusted publishing + provenance attestation
+    steps:
+      # Full history + tags so the version bump and release notes have context.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # Zero runtime deps and no committed lockfile. Use a strict `npm ci` when a
+      # lockfile exists; otherwise `npm install --no-package-lock`, which keeps a
+      # generated lockfile out of the tree so the version-bump commit below does
+      # not silently commit one to the repo.
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-package-lock
+          fi
+
+      # Unit gate: a failure here means nothing is bumped, pushed, or published.
+      - name: Run unit tests
+        run: npm test
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Bump package.json, create the release commit and the vX.Y.Z tag. The tag
+      # name is derived from the bumped package.json (not parsed from stdout).
+      - name: Bump version and tag
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          npm version "$BUMP" -m "release: v%s"
+          tag="v$(node -p "require('./package.json').version")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Released $tag"
+
+      - name: Push commit and tag
+        run: git push --follow-tags
+
+      # OIDC trusted publishing requires npm >= 11.5.1; Node 20 bundles an older
+      # npm. Pin to the 11.x line (which supports Node 20) rather than @latest so
+      # a future npm major cannot silently break the publish.
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g "npm@^11.5.1"
+
+      # No NODE_AUTH_TOKEN: auth is the OIDC id-token exchanged with npm.
+      # --provenance records a signed build attestation tying the package to
+      # this workflow and commit.
+      - name: Publish to npm (trusted publishing + provenance)
+        run: npm publish --provenance --access public
+
+      # Auto-generated notes from merged PRs/commits since the previous tag.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.bump.outputs.tag }}" --verify-tag --generate-notes

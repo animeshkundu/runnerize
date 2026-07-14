@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>runnerize — stateless, on-demand self-hosted GitHub Actions runners</title>
+  <meta name="description" content="Stateless, on-demand self-hosted GitHub Actions runners for your private repos. A dispatcher mints a just-in-time runner per queued job inside a throwaway rootless container, then auto-deregisters. Zero standing runners, zero host credentials." />
+  <meta name="color-scheme" content="light dark" />
+  <link rel="preconnect" href="https://github.com" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236c63ff'/%3E%3Cstop offset='1' stop-color='%2312b3a6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='%230c0d12'/%3E%3Cpath d='M8 9l6 7-6 7' fill='none' stroke='url(%23g)' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M15 9l6 7-6 7' fill='none' stroke='url(%23g)' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round' opacity='0.55'/%3E%3Cpath d='M22 9l4 4.7' fill='none' stroke='url(%23g)' stroke-width='2.6' stroke-linecap='round' opacity='0.25'/%3E%3C/svg%3E" />
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="runnerize — stateless, on-demand self-hosted GitHub Actions runners" />
+  <meta property="og:description" content="A dispatcher mints a just-in-time runner per queued job inside a throwaway rootless container, then auto-deregisters. No standing runners, no host credentials." />
+  <meta property="og:url" content="https://animeshkundu.github.io/runnerize" />
+  <meta name="twitter:card" content="summary_large_image" />
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- ─────────────────────────  HEADER  ───────────────────────── -->
+  <header class="site-header" id="top">
+    <div class="wrap header-inner">
+      <a class="brand" href="#top" aria-label="runnerize home">
+        <svg class="brand-mark" width="30" height="30" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+          <defs>
+            <linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="var(--grad-a)" />
+              <stop offset="1" stop-color="var(--grad-b)" />
+            </linearGradient>
+          </defs>
+          <rect width="32" height="32" rx="8" fill="var(--mark-bg)" />
+          <path d="M8 9l6 7-6 7" fill="none" stroke="url(#brandGrad)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M15 9l6 7-6 7" fill="none" stroke="url(#brandGrad)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" opacity="0.55" />
+          <path d="M22 9l4 4.7" fill="none" stroke="url(#brandGrad)" stroke-width="2.6" stroke-linecap="round" opacity="0.25" />
+        </svg>
+        <span class="brand-word">runner<span class="brand-word-accent">ize</span></span>
+      </a>
+
+      <nav class="site-nav" aria-label="Primary">
+        <a href="#how">How it works</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#security">Security</a>
+        <a href="#backends">Backends</a>
+        <a class="nav-ext" href="https://github.com/animeshkundu/runnerize">GitHub<span aria-hidden="true"> ↗</span></a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- ─────────────────────────  HERO  ───────────────────────── -->
+    <section class="hero">
+      <div class="wrap hero-inner">
+        <p class="eyebrow"><span class="dot"></span> v0.1 · live-validated on Win 11 + WSL2</p>
+        <h1 class="hero-title">
+          Self-hosted runners that
+          <span class="grad-text">vanish after one job.</span>
+        </h1>
+        <p class="hero-lede">
+          <strong>runnerize</strong> is a stateless, on-demand pool of self-hosted GitHub Actions runners
+          for your <strong>private</strong> repos. One always-on dispatcher mints a just-in-time runner per
+          queued job inside a throwaway rootless container, runs exactly one job, then auto-deregisters.
+          No standing runners. No host credentials. Nothing persists.
+        </p>
+
+        <div class="install">
+          <div class="code-block" data-copy-scope>
+            <div class="code-head">
+              <span class="code-dot code-dot--r"></span>
+              <span class="code-dot code-dot--y"></span>
+              <span class="code-dot code-dot--g"></span>
+              <span class="code-label">no install needed</span>
+              <button class="copy-btn" type="button" data-copy="npx github:animeshkundu/runnerize run" aria-label="Copy install command">
+                <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M9 9V5.5A1.5 1.5 0 0 1 10.5 4h8A1.5 1.5 0 0 1 20 5.5v8a1.5 1.5 0 0 1-1.5 1.5H15M4 10.5A1.5 1.5 0 0 1 5.5 9h8A1.5 1.5 0 0 1 15 10.5v8A1.5 1.5 0 0 1 13.5 20h-8A1.5 1.5 0 0 1 4 18.5z"/></svg>
+                <span class="copy-btn-text">Copy</span>
+              </button>
+            </div>
+            <pre class="code-body"><code><span class="tok-c"># run the dispatcher — pulls straight from GitHub</span>
+<span class="tok-p">npx</span> github:animeshkundu/runnerize <span class="tok-a">run</span></code></pre>
+          </div>
+          <p class="install-alt">
+            or install globally
+            <code class="inline-code">npm i -g runnerize</code>
+            <span class="sep" aria-hidden="true">·</span>
+            Node ≥ 18 · zero dependencies
+          </p>
+        </div>
+
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="#quickstart">Get started</a>
+          <a class="btn btn-ghost" href="https://github.com/animeshkundu/runnerize">
+            <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49l-.01-1.71c-2.78.62-3.37-1.22-3.37-1.22-.46-1.18-1.11-1.5-1.11-1.5-.9-.63.07-.62.07-.62 1 .07 1.53 1.05 1.53 1.05.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.4 9.4 0 0 1 2.5-.34c.85 0 1.71.12 2.5.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.35 4.79-4.58 5.05.36.32.68.94.68 1.9l-.01 2.82c0 .27.18.6.69.49A10.03 10.03 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></svg>
+            Star on GitHub
+          </a>
+          <a class="btn btn-ghost" href="https://www.npmjs.com/package/runnerize">
+            <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M2 4h20v14h-8v2H9v-2H2V4Zm2 2v10h4V8h3v8h3V8h3v8h2V6H4Z"/></svg>
+            npm
+          </a>
+        </div>
+
+        <ul class="trust-row" aria-label="At a glance">
+          <li><strong>0</strong> npm dependencies</li>
+          <li><strong>1</strong> job per runner, then gone</li>
+          <li><strong>MIT</strong> licensed</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────  PILLARS  ───────────────────────── -->
+    <section class="section pillars-section" aria-label="Core ideas">
+      <div class="wrap">
+        <ul class="pillars">
+          <li class="pillar">
+            <span class="pillar-icon" aria-hidden="true">
+              <svg width="22" height="22" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M3 12a9 9 0 1 0 9-9M3 12V5m0 7h7"/></svg>
+            </span>
+            <h3>Stateless by design</h3>
+            <p>Every job runs in a fresh container from a fat image. No cross-job state, no persistent-workspace collisions, no long-lived runner credentials left on disk.</p>
+          </li>
+          <li class="pillar">
+            <span class="pillar-icon" aria-hidden="true">
+              <svg width="22" height="22" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 3l7 3v5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6l7-3Z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4"/></svg>
+            </span>
+            <h3>Private-only, fail-closed</h3>
+            <p>Only your own <code>private</code>, non-fork user repos are ever dispatched. Privacy is re-checked immediately before every mint and fails closed on any doubt.</p>
+          </li>
+          <li class="pillar">
+            <span class="pillar-icon" aria-hidden="true">
+              <svg width="22" height="22" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 19V9m5 10V5m5 14v-7m5 7V8"/></svg>
+            </span>
+            <h3>Count-based scaling</h3>
+            <p>It scales the <em>number</em> of runners to match queued demand and lets GitHub assign the jobs — the correct model for ephemeral runners, never pinned to a job id.</p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────  HOW IT WORKS  ───────────────────────── -->
+    <section class="section" id="how">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">How it works</p>
+          <h2>One dispatcher. Runners that live for a single job.</h2>
+          <p class="section-sub">
+            The dispatcher watches your owned private repos. Every poll it counts queued jobs whose labels
+            a flavor can serve, mints just enough just-in-time runners to meet demand, and hands each one a
+            throwaway container. The runner takes exactly one job, deregisters itself, and the container is
+            destroyed. The job never sees your host credentials or caches.
+          </p>
+        </div>
+
+        <figure class="diagram-figure">
+          <svg class="flow" viewBox="0 0 1040 470" role="img"
+               aria-labelledby="flowTitle flowDesc" preserveAspectRatio="xMidYMid meet">
+            <title id="flowTitle">runnerize dispatch flow</title>
+            <desc id="flowDesc">
+              The always-on dispatcher polls GitHub every fifteen seconds and counts queued jobs in your
+              private repos. For each unit of demand it re-checks that the repo is still private, then mints
+              a just-in-time runner and launches it in a throwaway rootless container. The container runs
+              exactly one job pulled from GitHub, the runner auto-deregisters, and the container is
+              destroyed. The freed concurrency slot is released back to the dispatcher for the next poll.
+            </desc>
+
+            <defs>
+              <linearGradient id="flowAccent" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0" stop-color="var(--grad-a)" />
+                <stop offset="1" stop-color="var(--grad-b)" />
+              </linearGradient>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0 0L10 5L0 10z" fill="var(--dg-arrow)" />
+              </marker>
+              <marker id="arrowFaint" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0 0L10 5L0 10z" fill="var(--dg-arrow-faint)" />
+              </marker>
+              <marker id="arrowAccent" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+                <path d="M0 0L10 5L0 10z" fill="var(--dg-run-stroke)" />
+              </marker>
+            </defs>
+
+            <!-- ephemeral enclosure -->
+            <g class="dg-zone">
+              <rect x="592" y="40" width="424" height="390" rx="18"
+                    fill="var(--dg-zone-fill)" stroke="var(--dg-zone-stroke)" stroke-width="1.5" stroke-dasharray="6 7" />
+              <text x="804" y="66" class="dg-zone-label" text-anchor="middle">ephemeral · stateless · one job each</text>
+            </g>
+
+            <!-- connectors -->
+            <!-- github -> dispatcher -->
+            <path class="dg-edge" d="M150 168 L150 214" fill="none" stroke="var(--dg-arrow)" stroke-width="2" marker-end="url(#arrow)" />
+            <!-- dispatcher -> mint -->
+            <path class="dg-edge" d="M296 268 L636 122" fill="none" stroke="var(--dg-arrow)" stroke-width="2" marker-end="url(#arrow)" />
+            <!-- mint -> container -->
+            <path class="dg-edge" d="M804 168 L804 214" fill="none" stroke="var(--dg-run-stroke)" stroke-width="2" marker-end="url(#arrowAccent)" />
+            <!-- container -> destroy -->
+            <path class="dg-edge" d="M804 306 L804 352" fill="none" stroke="var(--dg-run-stroke)" stroke-width="2" marker-end="url(#arrowAccent)" />
+            <!-- container runs the job from github (faint back-link) -->
+            <path class="dg-edge dg-edge--faint" d="M636 260 C 470 260 360 240 300 210" fill="none"
+                  stroke="var(--dg-arrow-faint)" stroke-width="1.6" stroke-dasharray="5 5" marker-end="url(#arrowFaint)" />
+            <!-- destroy -> dispatcher (slot released return) -->
+            <path class="dg-edge dg-edge--faint" d="M636 388 C 420 430 250 420 175 320" fill="none"
+                  stroke="var(--dg-arrow-faint)" stroke-width="1.6" stroke-dasharray="5 5" marker-end="url(#arrowFaint)" />
+
+            <!-- edge labels -->
+            <g class="dg-elabel">
+              <text x="166" y="196" text-anchor="start">① poll ~15s · count queued jobs</text>
+              <text x="452" y="176" text-anchor="middle" transform="rotate(-23 452 176)">② mint JIT · re-check private</text>
+              <text x="820" y="196" text-anchor="start">③ launch container</text>
+              <text x="820" y="334" text-anchor="start">④ one job, then exit</text>
+            </g>
+            <g class="dg-elabel dg-elabel--faint">
+              <text x="410" y="238" text-anchor="middle">runs the queued job</text>
+              <text x="360" y="418" text-anchor="middle">slot released → next poll</text>
+            </g>
+
+            <!-- NODE: GitHub -->
+            <g class="dg-node">
+              <rect x="34" y="60" width="232" height="108" rx="14" fill="var(--dg-src-fill)" stroke="var(--dg-src-stroke)" stroke-width="1.5" />
+              <g transform="translate(58 92)">
+                <path fill="var(--dg-src-ic)" d="M12 0C5.37 0 0 5.5 0 12.3c0 5.44 3.44 10.05 8.21 11.68.6.11.82-.27.82-.59l-.02-2.05c-3.34.74-4.04-1.47-4.04-1.47-.55-1.42-1.33-1.8-1.33-1.8-1.09-.76.08-.74.08-.74 1.2.09 1.84 1.26 1.84 1.26 1.07 1.87 2.81 1.33 3.5 1.02.1-.8.42-1.33.76-1.64-2.67-.31-5.47-1.37-5.47-6.07 0-1.34.47-2.44 1.24-3.3-.13-.31-.54-1.56.11-3.25 0 0 1.01-.33 3.3 1.26a11.3 11.3 0 0 1 6 0c2.29-1.59 3.3-1.26 3.3-1.26.65 1.69.24 2.94.12 3.25.77.86 1.23 1.96 1.23 3.3 0 4.71-2.8 5.75-5.48 6.06.43.38.81 1.13.81 2.28l-.01 3.38c0 .32.21.71.82.59A12.03 12.03 0 0 0 24 12.3C24 5.5 18.63 0 12 0Z"/>
+              </g>
+              <text x="98" y="102" class="dg-title">Your private repos</text>
+              <text x="98" y="124" class="dg-sub">queued Actions jobs</text>
+              <g transform="translate(58 138)">
+                <rect x="0" y="0" width="150" height="20" rx="10" fill="var(--dg-badge-fill)" />
+                <circle cx="12" cy="10" r="3.5" fill="var(--dg-run-stroke)" />
+                <text x="24" y="14" class="dg-badge-text">status: queued</text>
+              </g>
+            </g>
+
+            <!-- NODE: Dispatcher -->
+            <g class="dg-node">
+              <rect x="34" y="214" width="262" height="118" rx="14" fill="var(--dg-disp-fill)" stroke="var(--dg-disp-stroke)" stroke-width="1.5" />
+              <g transform="translate(58 240)">
+                <rect x="0" y="0" width="26" height="26" rx="7" fill="none" stroke="var(--dg-disp-ic)" stroke-width="1.8"/>
+                <path d="M7 13l3.4 3.4L19 8" fill="none" stroke="var(--dg-disp-ic)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </g>
+              <text x="96" y="252" class="dg-title">Dispatcher</text>
+              <text x="96" y="273" class="dg-sub">one always-on process</text>
+              <text x="58" y="304" class="dg-note">count-based · semaphore-gated</text>
+              <text x="58" y="322" class="dg-note">reconciles stale registrations</text>
+            </g>
+
+            <!-- NODE: JIT mint -->
+            <g class="dg-node">
+              <rect x="636" y="88" width="336" height="80" rx="13" fill="var(--dg-mint-fill)" stroke="var(--dg-mint-stroke)" stroke-width="1.5" />
+              <g transform="translate(660 116)">
+                <path d="M13 0L3 15h8l-2 11 12-16h-9z" fill="none" stroke="var(--dg-mint-ic)" stroke-width="1.8" stroke-linejoin="round"/>
+              </g>
+              <text x="700" y="122" class="dg-title">Mint JIT runner</text>
+              <text x="700" y="144" class="dg-sub">min(demand, free slots) · off-argv token</text>
+            </g>
+
+            <!-- NODE: Container -->
+            <g class="dg-node">
+              <rect x="636" y="214" width="336" height="92" rx="13" fill="var(--dg-run-fill)" stroke="var(--dg-run-stroke)" stroke-width="1.6" />
+              <g transform="translate(660 244)">
+                <rect x="0" y="2" width="24" height="20" rx="4" fill="none" stroke="var(--dg-run-ic)" stroke-width="1.8"/>
+                <path d="M0 9h24M8 2v20" fill="none" stroke="var(--dg-run-ic)" stroke-width="1.8"/>
+              </g>
+              <text x="700" y="246" class="dg-title">Throwaway rootless container</text>
+              <text x="700" y="268" class="dg-sub">fat image · no host creds or caches</text>
+              <g transform="translate(700 282)">
+                <rect x="0" y="0" width="112" height="18" rx="9" fill="var(--dg-badge-fill)" />
+                <text x="12" y="13" class="dg-badge-text">runs exactly 1 job</text>
+              </g>
+            </g>
+
+            <!-- NODE: Destroy -->
+            <g class="dg-node">
+              <rect x="636" y="352" width="336" height="66" rx="13" fill="var(--dg-kill-fill)" stroke="var(--dg-kill-stroke)" stroke-width="1.5" />
+              <g transform="translate(660 372)">
+                <path d="M2 5h20M9 5V2h6v3M4 5l1.4 18h13L20 5" fill="none" stroke="var(--dg-kill-ic)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+              </g>
+              <text x="700" y="380" class="dg-title">Auto-deregister &amp; destroy</text>
+              <text x="700" y="400" class="dg-sub">nothing persists</text>
+            </g>
+          </svg>
+          <figcaption class="diagram-cap">
+            Over-minting is safe: an unassigned runner is killed by the idle watchdog, releasing its slot.
+          </figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────  QUICKSTART  ───────────────────────── -->
+    <section class="section section--tint" id="quickstart">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">Quickstart</p>
+          <h2>Point a workflow at it and go.</h2>
+          <p class="section-sub">
+            You need Node ≥ 18, a container runtime for the default linux flavor (native <code>podman</code>/<code>docker</code>
+            on Linux, WSL2 on Windows, Colima or <code>podman machine</code> on macOS), and a GitHub token
+            resolved from <code>$GH_TOKEN</code> / <code>$GITHUB_TOKEN</code>, else <code>gh auth token</code>.
+          </p>
+        </div>
+
+        <div class="quick-grid">
+          <div class="quick-col">
+            <h3 class="quick-h">1 · Run the dispatcher</h3>
+            <div class="code-block" data-copy-scope>
+              <div class="code-head">
+                <span class="code-dot code-dot--r"></span><span class="code-dot code-dot--y"></span><span class="code-dot code-dot--g"></span>
+                <span class="code-label">terminal</span>
+                <button class="copy-btn" type="button" data-copy="node bin/runnerize.js run" aria-label="Copy run command">
+                  <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M9 9V5.5A1.5 1.5 0 0 1 10.5 4h8A1.5 1.5 0 0 1 20 5.5v8a1.5 1.5 0 0 1-1.5 1.5H15M4 10.5A1.5 1.5 0 0 1 5.5 9h8A1.5 1.5 0 0 1 15 10.5v8A1.5 1.5 0 0 1 13.5 20h-8A1.5 1.5 0 0 1 4 18.5z"/></svg>
+                  <span class="copy-btn-text">Copy</span>
+                </button>
+              </div>
+              <pre class="code-body"><code><span class="tok-c"># start the dispatcher (foreground)</span>
+<span class="tok-p">node</span> bin/runnerize.js <span class="tok-a">run</span>
+
+<span class="tok-c"># see flavors, private repos, live runners</span>
+<span class="tok-p">node</span> bin/runnerize.js <span class="tok-a">status</span>
+
+<span class="tok-c"># enumerate demand, mint nothing</span>
+<span class="tok-p">node</span> bin/runnerize.js <span class="tok-a">run</span> --dry-run
+
+<span class="tok-c"># one reconcile / cleanup pass</span>
+<span class="tok-p">node</span> bin/runnerize.js <span class="tok-a">remove</span>
+
+<span class="tok-c"># install as a boot service</span>
+<span class="tok-p">node</span> bin/runnerize.js <span class="tok-a">service</span> install</code></pre>
+            </div>
+          </div>
+
+          <div class="quick-col">
+            <h3 class="quick-h">2 · Target the runner</h3>
+            <div class="code-block" data-copy-scope>
+              <div class="code-head">
+                <span class="code-dot code-dot--r"></span><span class="code-dot code-dot--y"></span><span class="code-dot code-dot--g"></span>
+                <span class="code-label">.github/workflows/ci.yml</span>
+                <button class="copy-btn" type="button" data-copy="jobs:&#10;  build:&#10;    runs-on: [self-hosted, linux, x64]" aria-label="Copy workflow snippet">
+                  <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M9 9V5.5A1.5 1.5 0 0 1 10.5 4h8A1.5 1.5 0 0 1 20 5.5v8a1.5 1.5 0 0 1-1.5 1.5H15M4 10.5A1.5 1.5 0 0 1 5.5 9h8A1.5 1.5 0 0 1 15 10.5v8A1.5 1.5 0 0 1 13.5 20h-8A1.5 1.5 0 0 1 4 18.5z"/></svg>
+                  <span class="copy-btn-text">Copy</span>
+                </button>
+              </div>
+              <pre class="code-body"><code><span class="tok-k">jobs</span>:
+  <span class="tok-k">build</span>:
+    <span class="tok-k">runs-on</span>: [<span class="tok-a">self-hosted</span>, <span class="tok-a">linux</span>, <span class="tok-a">x64</span>]</code></pre>
+            </div>
+            <p class="quick-note">
+              Always name the OS and arch labels. A bare <code>[self-hosted]</code> is ambiguous across
+              flavors, so runnerize maps it to the default linux flavor only.
+            </p>
+            <h3 class="quick-h quick-h--sp">Flags &amp; environment</h3>
+            <div class="table-wrap">
+              <table class="opt-table">
+                <tbody>
+                  <tr><td><code>--max &lt;n&gt;</code></td><td>max concurrent runners <span class="muted">(default 4)</span></td></tr>
+                  <tr><td><code>--interval &lt;ms&gt;</code></td><td>poll interval <span class="muted">(default 15000; adapts with repo count)</span></td></tr>
+                  <tr><td><code>--idle-timeout &lt;ms&gt;</code></td><td>kill an unclaimed runner after this <span class="muted">(default 120000)</span></td></tr>
+                  <tr><td><code>RUNNERIZE_LINUX_IMAGE</code></td><td>fat image <span class="muted">(default <code>catthehacker/ubuntu:full-latest</code>)</span></td></tr>
+                  <tr><td><code>RUNNERIZE_RUNNER_DIR</code></td><td>use a preinstalled runner dir instead of downloading</td></tr>
+                  <tr><td><code>RUNNERIZE_WSL_DISTRO</code></td><td>pin the WSL distro <span class="muted">(Windows host)</span></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────  SECURITY  ───────────────────────── -->
+    <section class="section" id="security">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">Security model</p>
+          <h2>The job never touches your host.</h2>
+        </div>
+        <div class="sec-grid">
+          <article class="sec-card">
+            <span class="sec-ic" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 3l7 3v5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6l7-3Z"/></svg>
+            </span>
+            <h3>Private-only, re-checked</h3>
+            <p>Only repos that are <code>private</code>, owned by you, and of type <code>User</code> are dispatched; forks are excluded by default. Privacy is re-verified immediately before every mint and <strong>fails closed</strong>.</p>
+          </article>
+          <article class="sec-card">
+            <span class="sec-ic" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+            </span>
+            <h3>Container isolation</h3>
+            <p>Each job runs in a throwaway rootless container that cannot read the host keychain, credential file, or process memory. Validated end to end: a job could not read a host secret.</p>
+          </article>
+          <article class="sec-card">
+            <span class="sec-ic" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M15 7a4 4 0 1 0-3.9 5H13l2 2 2-2 2 2 1.5-1.5L18 10.9A4 4 0 0 0 15 7Z"/><circle cx="15" cy="7" r="0" fill="currentColor"/></svg>
+            </span>
+            <h3>Scoped credential</h3>
+            <p>The token is held only by the dispatcher and passed to the runner via env, never on a command line. The runner binary is SHA-256-verified before use. A short-lived, <code>actions:write</code>-scoped GitHub App is the recommended production credential.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────  BACKENDS  ───────────────────────── -->
+    <section class="section section--tint" id="backends">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">Backends</p>
+          <h2>Linux today. Windows &amp; macOS opt-in.</h2>
+          <p class="section-sub">
+            The linux flavor is the validated default. The native Windows and macOS backends are
+            detected-and-stubbed opt-ins, wired for auto-detection but not yet exercised end to end.
+          </p>
+        </div>
+        <div class="table-wrap">
+          <table class="matrix">
+            <thead>
+              <tr><th scope="col">Flavor</th><th scope="col">Host</th><th scope="col">Mechanism</th><th scope="col">Status</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>linux</code></td>
+                <td>any — Linux, WSL, Colima</td>
+                <td>rootless container, fat image</td>
+                <td><span class="status status--ok">working</span></td>
+              </tr>
+              <tr>
+                <td><code>windows</code></td>
+                <td>Windows 11 Pro / Enterprise</td>
+                <td>Windows Sandbox (disposable)</td>
+                <td><span class="status status--stub">stub · auto-detects when enabled</span></td>
+              </tr>
+              <tr>
+                <td><code>macos</code></td>
+                <td>Apple hardware</td>
+                <td><code>tart</code> VM</td>
+                <td><span class="status status--stub">stub · requires <code>tart</code></span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────  LIMITS + ROADMAP  ───────────────────────── -->
+    <section class="section" id="roadmap">
+      <div class="wrap">
+        <div class="lr-grid">
+          <div class="lr-col">
+            <p class="kicker">Honest limitations</p>
+            <h2 class="lr-h">Where it fits — and where it doesn't</h2>
+            <ul class="lr-list lr-list--limit">
+              <li>One dispatcher is a single always-on process. If it's down, jobs queue up to GitHub's 24-hour timeout; WSL and macOS aren't guaranteed always-on across a headless reboot.</li>
+              <li>Per-job latency is poll interval plus container start — great for occasional private-repo CI, not for tight edit-run loops.</li>
+              <li>Native Windows and macOS statelessness needs VMs, which are heavier than Linux containers.</li>
+            </ul>
+          </div>
+          <div class="lr-col">
+            <p class="kicker">Roadmap</p>
+            <h2 class="lr-h">What's next</h2>
+            <ul class="lr-list lr-list--road">
+              <li>Scoped GitHub App credential — short-lived, <code>actions:write</code> only, no code access — as the default production auth.</li>
+              <li>Windows Sandbox and macOS <code>tart</code> backends exercised end to end.</li>
+              <li>Published tagged releases via <code>npx github:animeshkundu/runnerize#&lt;tag&gt;</code> and npm.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────  CTA  ───────────────────────── -->
+    <section class="cta" id="get-started">
+      <div class="wrap cta-inner">
+        <h2>Stop paying for standing runners.</h2>
+        <p>Run private-repo CI on your own machine, one ephemeral runner at a time.</p>
+        <div class="code-block cta-code" data-copy-scope>
+          <div class="code-head">
+            <span class="code-dot code-dot--r"></span><span class="code-dot code-dot--y"></span><span class="code-dot code-dot--g"></span>
+            <span class="code-label">get started</span>
+            <button class="copy-btn" type="button" data-copy="npx github:animeshkundu/runnerize run" aria-label="Copy install command">
+              <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M9 9V5.5A1.5 1.5 0 0 1 10.5 4h8A1.5 1.5 0 0 1 20 5.5v8a1.5 1.5 0 0 1-1.5 1.5H15M4 10.5A1.5 1.5 0 0 1 5.5 9h8A1.5 1.5 0 0 1 15 10.5v8A1.5 1.5 0 0 1 13.5 20h-8A1.5 1.5 0 0 1 4 18.5z"/></svg>
+              <span class="copy-btn-text">Copy</span>
+            </button>
+          </div>
+          <pre class="code-body"><code><span class="tok-p">npx</span> github:animeshkundu/runnerize <span class="tok-a">run</span></code></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ─────────────────────────  FOOTER  ───────────────────────── -->
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <div class="footer-brand">
+        <span class="brand">
+          <svg class="brand-mark" width="26" height="26" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+            <rect width="32" height="32" rx="8" fill="var(--mark-bg)" />
+            <path d="M8 9l6 7-6 7" fill="none" stroke="url(#brandGrad)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M15 9l6 7-6 7" fill="none" stroke="url(#brandGrad)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" opacity="0.55" />
+            <path d="M22 9l4 4.7" fill="none" stroke="url(#brandGrad)" stroke-width="2.6" stroke-linecap="round" opacity="0.25" />
+          </svg>
+          <span class="brand-word">runner<span class="brand-word-accent">ize</span></span>
+        </span>
+        <p class="footer-tag">Stateless, on-demand self-hosted GitHub Actions runners for private repos.</p>
+      </div>
+      <nav class="footer-links" aria-label="Footer">
+        <div class="footer-col">
+          <h4>Project</h4>
+          <a href="https://github.com/animeshkundu/runnerize">GitHub</a>
+          <a href="https://www.npmjs.com/package/runnerize">npm</a>
+          <a href="https://github.com/animeshkundu/runnerize/issues">Issues</a>
+        </div>
+        <div class="footer-col">
+          <h4>Docs</h4>
+          <a href="https://github.com/animeshkundu/runnerize#readme">README</a>
+          <a href="https://github.com/animeshkundu/runnerize/blob/main/CONTRACTS.md">Contracts</a>
+          <a href="https://github.com/animeshkundu/runnerize/blob/main/LICENSE">License · MIT</a>
+        </div>
+      </nav>
+    </div>
+    <div class="wrap footer-base">
+      <span>MIT licensed</span>
+      <span class="footer-sep" aria-hidden="true">·</span>
+      <span>Zero npm dependencies</span>
+      <span class="footer-sep" aria-hidden="true">·</span>
+      <span>Node ≥ 18</span>
+    </div>
+  </footer>
+
+  <script>
+    // Progressive enhancement: copy-to-clipboard for command blocks. Works without JS (no button feedback).
+    (function () {
+      var supportsClipboard = navigator.clipboard && typeof navigator.clipboard.writeText === 'function';
+      document.querySelectorAll('.copy-btn').forEach(function (btn) {
+        if (!supportsClipboard) { btn.style.display = 'none'; return; }
+        btn.addEventListener('click', function () {
+          var text = (btn.getAttribute('data-copy') || '').replace(/&#10;/g, '\n');
+          navigator.clipboard.writeText(text).then(function () {
+            var label = btn.querySelector('.copy-btn-text');
+            var prev = label ? label.textContent : '';
+            btn.classList.add('is-copied');
+            if (label) label.textContent = 'Copied';
+            window.setTimeout(function () {
+              btn.classList.remove('is-copied');
+              if (label) label.textContent = prev || 'Copy';
+            }, 1600);
+          }).catch(function () {});
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

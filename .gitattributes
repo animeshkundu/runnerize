@@ -1,0 +1,31 @@
+# Normalize all text to LF in the repo. runnerize shells out to bash on Linux
+# and WSL, and embeds shell scripts as JS template literals; a CRLF slipping in
+# would break `#!/usr/bin/env bash` and `set -euo pipefail`. Keep everything LF.
+* text=auto eol=lf
+
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+.editorconfig   text eol=lf
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+LICENSE         text eol=lf
+
+# Windows batch/PowerShell, if ever added, want CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binaries: never touch.
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary

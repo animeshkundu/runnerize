@@ -8,9 +8,9 @@
   "files": ["bin", "src", "README.md", "LICENSE"],
   "scripts": {
     "start": "node bin/runnerize.js",
-    "test": "node --test test/unit",
-    "test:e2e": "node --test test/e2e",
-    "test:all": "node --test test"
+    "test": "node --test test/unit/*.test.js",
+    "test:e2e": "node --test test/e2e/*.test.js",
+    "test:all": "node --test test/unit/*.test.js test/e2e/*.test.js"
   },
   "repository": { "type": "git", "url": "git+https://github.com/animeshkundu/runnerize.git" },
   "homepage": "https://animeshkundu.github.io/runnerize",

@@ -1,0 +1,145 @@
+# Continuous integration for runnerize.
+#
+# Gating model:
+#   - "Lint & parse" and "Unit tests" run on EVERY pull request (including fork
+#     PRs) and every push to main. They need no secrets, so they are the
+#     universal, always-green-or-red blocker. Mark these as required status
+#     checks in branch protection.
+#   - "E2E" needs a real GitHub token, a throwaway repo, and podman, so it can
+#     only run where repository secrets are exposed. Fork PRs do NOT receive
+#     secrets, so the job is skipped there. A job skipped by its `if` condition
+#     reports "Success", so E2E is still safe to require in branch protection:
+#     it genuinely blocks same-repo PRs and pushes to main, and is a no-op pass
+#     on fork PRs. If a maintainer requires E2E, fork PRs will still be
+#     mergeable (skipped == success) and same-repo changes are truly gated.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: CI only reads the repository.
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same PR branch; never cancel main.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint & parse
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # Syntax-check the CLI entrypoints and every source module without
+      # executing anything (zero deps, so nothing else to build). Covers every
+      # file under bin/ (CLI binaries may be extensionless) plus every .js under
+      # src/. Missing directories are tolerated so this never crashes on layout
+      # changes.
+      - name: Parse-check bin/** and src/**/*.js
+        run: |
+          set -euo pipefail
+          files="$( { find bin -type f 2>/dev/null; find src -type f -name '*.js' 2>/dev/null; } | sort )"
+          if [ -z "$files" ]; then
+            echo "::error::no files found to syntax-check"
+            exit 1
+          fi
+          printf '%s\n' "$files" | while IFS= read -r f; do
+            echo "node --check $f"
+            node --check "$f"
+          done
+
+  unit:
+    name: Unit tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No lockfile and zero runtime deps, so `npm ci` will fail; fall back to
+      # `npm install`, which is effectively a no-op here.
+      - name: Install dependencies
+        run: npm ci || npm install
+      - name: Run unit tests
+        run: npm test
+
+  e2e:
+    name: E2E
+    needs: unit
+    # Only run where repository secrets are available: pushes to main, and
+    # pull requests originating from this repository (not forks). The `secrets`
+    # context is NOT usable in a job-level `if`, so the secret-presence check is
+    # done in the first step below instead.
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Decide whether the E2E environment is configured. If E2E_GH_TOKEN or
+      # E2E_REPO is missing, pass green with a notice instead of failing, so a
+      # not-yet-configured repo is not blocked on setup it hasn't done.
+      - name: Check E2E configuration
+        id: check
+        env:
+          E2E_GH_TOKEN: ${{ secrets.E2E_GH_TOKEN }}
+          E2E_REPO: ${{ vars.E2E_REPO }}
+        run: |
+          if [ -n "$E2E_GH_TOKEN" ] && [ -n "$E2E_REPO" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::E2E skipped: set the E2E_GH_TOKEN secret and the E2E_REPO variable to enable end-to-end tests."
+          fi
+
+      - name: Checkout
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Podman ships on the ubuntu-latest image; install only as a fallback.
+      - name: Ensure podman is available
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          if command -v podman >/dev/null 2>&1; then
+            podman --version
+          else
+            echo "podman not found; installing"
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.enabled == 'true'
+        run: npm ci || npm install
+
+      # Real end-to-end run against a throwaway repo. RUNNERIZE_LINUX_IMAGE
+      # overrides the fat default image with a smaller one to keep CI fast;
+      # override via the E2E_IMAGE repo variable if needed.
+      - name: Run E2E tests
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          E2E_GH_TOKEN: ${{ secrets.E2E_GH_TOKEN }}
+          E2E_REPO: ${{ vars.E2E_REPO }}
+          RUNNERIZE_LINUX_IMAGE: ${{ vars.E2E_IMAGE || 'catthehacker/ubuntu:act-latest' }}
+        run: npm run test:e2e
