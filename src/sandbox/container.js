@@ -113,9 +113,9 @@ if [[ ! -x "$destination/run.sh" ]]; then
   trap 'rm -rf "$temporary"' EXIT
   cp -a "$source_dir"/. "$temporary"/
   [[ -x "$temporary/run.sh" ]] || { echo 'runner source is missing run.sh' >&2; exit 1; }
-  rm -rf "$destination"
-  mv "$temporary" "$destination"
-  trap - EXIT
+  if mv -T "$temporary" "$destination" 2>/dev/null; then
+    trap - EXIT
+  fi
 fi
 printf '%s' "$destination"
 `, [source]);

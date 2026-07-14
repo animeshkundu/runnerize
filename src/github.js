@@ -7,6 +7,7 @@ const API_ROOT = 'https://api.github.com';
 const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const etagCache = new Map();
+const ETAG_CACHE_MAX = 500;
 let cachedToken;
 let rateLimitPausedUntil = 0;
 let rateLimitGate;
@@ -198,7 +199,13 @@ export async function api(method, path, {
 
     if (etagKey && response.ok) {
       const etag = response.headers.get('etag');
-      if (etag) etagCache.set(etagKey, { etag, data });
+      if (etag) {
+        // Bounded LRU: re-insert to mark most-recently-used, evict oldest past the cap.
+        // Ephemeral per-run job keys (jobs:repo:run.id) would otherwise leak unboundedly.
+        etagCache.delete(etagKey);
+        etagCache.set(etagKey, { etag, data });
+        if (etagCache.size > ETAG_CACHE_MAX) etagCache.delete(etagCache.keys().next().value);
+      }
     }
     return { status: response.status, data, notModified: false };
   }
