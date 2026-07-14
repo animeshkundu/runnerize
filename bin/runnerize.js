@@ -1,0 +1,201 @@
+#!/usr/bin/env node
+
+import {
+  countQueuedMatchingJobs,
+  deleteRunner,
+  getUser,
+  listOwnedPrivateRepos,
+  listRunners,
+} from '../src/github.js';
+import { runDispatcher } from '../src/dispatcher.js';
+import { detectFlavors } from '../src/sandbox/index.js';
+import { installService, uninstallService } from '../src/service.js';
+
+const HELP = `runnerize - on-demand ephemeral GitHub Actions runners
+
+Usage:
+  runnerize run [--max <n>] [--interval <ms>] [--idle-timeout <ms>] [--dry-run]
+  runnerize status
+  runnerize remove
+  runnerize service install|uninstall
+  runnerize --help
+
+Options:
+  --max <n>              Maximum concurrent runners (default: 4)
+  --interval <ms>        Poll interval in milliseconds (default: 15000)
+  --idle-timeout <ms>    Kill an unclaimed runner after this time (default: 120000)
+  --dry-run              Count and display demand without minting runners
+  -h, --help             Show this help
+`;
+
+function positiveInteger(raw, flag) {
+  if (raw === undefined || !/^\d+$/.test(raw) || Number(raw) < 1) {
+    throw new Error(`${flag} requires a positive integer`);
+  }
+  return Number(raw);
+}
+
+function parseRunFlags(args) {
+  const options = {};
+  let dryRun = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    switch (flag) {
+      case '--max':
+        options.maxConcurrent = positiveInteger(args[++index], flag);
+        break;
+      case '--interval':
+        options.pollIntervalMs = positiveInteger(args[++index], flag);
+        break;
+      case '--idle-timeout':
+        options.idleTimeoutMs = positiveInteger(args[++index], flag);
+        break;
+      case '--dry-run':
+        dryRun = true;
+        break;
+      case '-h':
+      case '--help':
+        console.log(HELP);
+        process.exit(0);
+        break;
+      default:
+        throw new Error(`Unknown option: ${flag}`);
+    }
+  }
+
+  return { options, dryRun };
+}
+
+async function collectState({ includeDemand = false } = {}) {
+  const [user, repos, flavors] = await Promise.all([
+    getUser(),
+    listOwnedPrivateRepos(),
+    detectFlavors(),
+  ]);
+
+  const repositoryState = [];
+  for (const repo of repos) {
+    const runners = await listRunners(repo.full_name);
+    const demand = {};
+    if (includeDemand) {
+      for (const flavor of flavors) {
+        demand[flavor.key] = await countQueuedMatchingJobs(repo.full_name, flavor.labels);
+      }
+    }
+    repositoryState.push({ name: repo.full_name, runners, demand });
+  }
+
+  return { user, repos, flavors, repositoryState };
+}
+
+async function dryRun() {
+  const state = await collectState({ includeDemand: true });
+  console.log(`Authenticated as ${state.user.login} (${state.user.type})`);
+  console.log(`Owned private repositories: ${state.repos.length}`);
+  console.log(`Available flavors: ${state.flavors.map((flavor) => flavor.key).join(', ') || 'none'}`);
+  for (const repo of state.repositoryState) {
+    const counts = Object.entries(repo.demand)
+      .map(([flavor, count]) => `${flavor}=${count}`)
+      .join(' ');
+    console.log(`${repo.name}: ${counts || 'no available flavors'}`);
+  }
+  console.log('Dry run complete. No runners were minted.');
+}
+
+async function status() {
+  const state = await collectState();
+  console.log(`Authenticated as ${state.user.login} (${state.user.type})`);
+  console.log(`Owned private repositories: ${state.repos.length}`);
+  for (const flavor of state.flavors) {
+    console.log(`Flavor ${flavor.key}: labels=[${flavor.labels.join(', ')}]`);
+  }
+
+  let count = 0;
+  for (const repo of state.repositoryState) {
+    for (const runner of repo.runners) {
+      count += 1;
+      const labels = runner.labels.map((label) =>
+        typeof label === 'string' ? label : label.name,
+      );
+      console.log(`${repo.name}: ${runner.name} id=${runner.id} status=${runner.status} labels=[${labels.join(', ')}]`);
+    }
+  }
+  if (count === 0) console.log('Currently registered runners: none');
+}
+
+async function remove() {
+  const repos = await listOwnedPrivateRepos();
+  let removed = 0;
+
+  for (const repo of repos) {
+    const runners = await listRunners(repo.full_name);
+    for (const runner of runners) {
+      if (runner.status === 'offline' && runner.name.startsWith('runnerize-')) {
+        await deleteRunner(repo.full_name, runner.id);
+        removed += 1;
+        console.log(`Removed offline ephemeral runner ${runner.name} from ${repo.full_name}`);
+      }
+    }
+  }
+  console.log(`Cleanup complete: removed ${removed} runner registration(s).`);
+}
+
+async function runForeground(args) {
+  const { options, dryRun: shouldDryRun } = parseRunFlags(args);
+  if (shouldDryRun) return dryRun();
+
+  const controller = new AbortController();
+  let stopping = false;
+  const stop = (signalName) => {
+    if (stopping) return;
+    stopping = true;
+    console.log(JSON.stringify({
+      time: new Date().toISOString(),
+      event: 'shutdown_requested',
+      signal: signalName,
+    }));
+    controller.abort();
+  };
+
+  process.once('SIGINT', () => stop('SIGINT'));
+  process.once('SIGTERM', () => stop('SIGTERM'));
+  await runDispatcher({ ...options, signal: controller.signal });
+}
+
+async function main() {
+  const [command = '--help', ...args] = process.argv.slice(2);
+
+  switch (command) {
+    case '-h':
+    case '--help':
+    case 'help':
+      console.log(HELP);
+      return;
+    case 'run':
+      await runForeground(args);
+      return;
+    case 'status':
+      if (args.length) throw new Error(`Unexpected argument: ${args[0]}`);
+      await status();
+      return;
+    case 'remove':
+      if (args.length) throw new Error(`Unexpected argument: ${args[0]}`);
+      await remove();
+      return;
+    case 'service':
+      if (args.length !== 1 || !['install', 'uninstall'].includes(args[0])) {
+        throw new Error('Usage: runnerize service install|uninstall');
+      }
+      if (args[0] === 'install') await installService();
+      else await uninstallService();
+      return;
+    default:
+      throw new Error(`Unknown command: ${command}`);
+  }
+}
+
+main().catch((error) => {
+  console.error(`runnerize: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+});

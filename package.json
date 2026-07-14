@@ -1,0 +1,14 @@
+{
+  "name": "runnerize",
+  "version": "0.1.0",
+  "description": "Stateless, on-demand self-hosted GitHub Actions runners for your private repos. A dispatcher mints an ephemeral JIT runner per queued job and runs it in a throwaway sandbox.",
+  "bin": { "runnerize": "bin/runnerize.js" },
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "files": ["bin", "src", "CONTRACTS.md", "README.md"],
+  "scripts": {
+    "start": "node bin/runnerize.js"
+  },
+  "license": "MIT",
+  "dependencies": {}
+}
