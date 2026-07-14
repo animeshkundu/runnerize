@@ -9,6 +9,7 @@ import {
 import { detectFlavors } from './sandbox/index.js';
 
 const RUNNER_NAME_PREFIX = 'runnerize-';
+const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
 
 class Semaphore {
   #capacity;
@@ -73,14 +74,14 @@ async function reconcile(repos, signal) {
     if (signal?.aborted) break;
 
     try {
-      const runners = await listRunners(repo.full_name);
+      const runners = await listRunners(repo.full_name, { signal });
       const stale = runners.filter(
         (runner) => runner.status === 'offline' && runner.name.startsWith(RUNNER_NAME_PREFIX),
       );
 
       for (const runner of stale) {
         if (signal?.aborted) break;
-        await deleteRunner(repo.full_name, runner.id);
+        await deleteRunner(repo.full_name, runner.id, { signal });
         removed += 1;
         log('runner_reconciled', { repo: repo.full_name, runnerId: runner.id });
       }
@@ -115,23 +116,27 @@ export async function runDispatcher({
 
   const semaphore = new Semaphore(maxConcurrent);
   const launches = new Set();
-  const inflightByFlavor = new Map();
-  const inflightByRepoFlavor = new Map();
+  const unassignedByFlavor = new Map();
+  const unassignedByRepoFlavor = new Map();
+  const repoBackoffUntil = new Map();
   let lastReconcile = 0;
   let lastRepoCount = 0;
 
-  const inflightKey = (repo, flavor) => `${flavor}\0${repo}`;
-  const incrementInflight = (repo, flavor) => {
-    inflightByFlavor.set(flavor, (inflightByFlavor.get(flavor) ?? 0) + 1);
-    const key = inflightKey(repo, flavor);
-    inflightByRepoFlavor.set(key, (inflightByRepoFlavor.get(key) ?? 0) + 1);
+  const unassignedKey = (repo, flavor) => `${flavor}\0${repo}`;
+  const incrementUnassigned = (repo, flavor) => {
+    unassignedByFlavor.set(flavor, (unassignedByFlavor.get(flavor) ?? 0) + 1);
+    const key = unassignedKey(repo, flavor);
+    unassignedByRepoFlavor.set(key, (unassignedByRepoFlavor.get(key) ?? 0) + 1);
   };
-  const decrementInflight = (repo, flavor) => {
-    inflightByFlavor.set(flavor, Math.max(0, (inflightByFlavor.get(flavor) ?? 1) - 1));
-    const key = inflightKey(repo, flavor);
-    const next = Math.max(0, (inflightByRepoFlavor.get(key) ?? 1) - 1);
-    if (next === 0) inflightByRepoFlavor.delete(key);
-    else inflightByRepoFlavor.set(key, next);
+  const decrementUnassigned = (repo, flavor) => {
+    const flavorCount = Math.max(0, (unassignedByFlavor.get(flavor) ?? 1) - 1);
+    if (flavorCount === 0) unassignedByFlavor.delete(flavor);
+    else unassignedByFlavor.set(flavor, flavorCount);
+
+    const key = unassignedKey(repo, flavor);
+    const repoFlavorCount = Math.max(0, (unassignedByRepoFlavor.get(key) ?? 1) - 1);
+    if (repoFlavorCount === 0) unassignedByRepoFlavor.delete(key);
+    else unassignedByRepoFlavor.set(key, repoFlavorCount);
   };
 
   log('dispatcher_started', { maxConcurrent, pollIntervalMs, idleTimeoutMs });
@@ -140,7 +145,7 @@ export async function runDispatcher({
     while (!signal?.aborted) {
       let repos;
       try {
-        repos = await listOwnedPrivateRepos();
+        repos = await listOwnedPrivateRepos({ signal });
         lastRepoCount = repos.length;
       } catch (error) {
         log('repo_poll_error', errorFields(error));
@@ -171,14 +176,19 @@ export async function runDispatcher({
         for (const repo of repos) {
           if (signal?.aborted) break;
           try {
-            const queued = await countQueuedMatchingJobs(repo.full_name, flavor.labels);
-            const alreadyInflight = inflightByRepoFlavor.get(
-              inflightKey(repo.full_name, flavor.key),
+            const queued = await countQueuedMatchingJobs(
+              repo.full_name,
+              flavor.labels,
+              { isDefault: flavor.key === 'linux' },
+              { signal },
+            );
+            const alreadyUnassigned = unassignedByRepoFlavor.get(
+              unassignedKey(repo.full_name, flavor.key),
             ) ?? 0;
             perRepo.push({
               repo: repo.full_name,
               queued,
-              unmet: Math.max(0, queued - alreadyInflight),
+              unmet: Math.max(0, queued - alreadyUnassigned),
             });
           } catch (error) {
             log('demand_count_error', {
@@ -190,36 +200,75 @@ export async function runDispatcher({
         }
 
         const demand = perRepo.reduce((sum, entry) => sum + entry.queued, 0);
-        const inflight = inflightByFlavor.get(flavor.key) ?? 0;
-        const toMint = Math.max(0, Math.min(demand - inflight, semaphore.free()));
-        log('demand_counted', { flavor: flavor.key, demand, inflight, toMint });
+        const unassigned = unassignedByFlavor.get(flavor.key) ?? 0;
+        const toMint = Math.max(0, Math.min(demand - unassigned, semaphore.free()));
+        log('demand_counted', { flavor: flavor.key, demand, unassigned, toMint });
 
         for (let minted = 0; minted < toMint && !signal?.aborted; minted += 1) {
-          const target = perRepo.find((entry) => entry.unmet > 0);
+          const target = perRepo.find(
+            (entry) => entry.unmet > 0 && (repoBackoffUntil.get(entry.repo) ?? 0) <= Date.now(),
+          );
           if (!target) break;
           target.unmet -= 1;
 
-          if (!(await isStillPrivate(target.repo))) {
+          if (!(await isStillPrivate(target.repo, { signal }))) {
             log('mint_skipped_not_private', { repo: target.repo, flavor: flavor.key });
             continue;
           }
           if (signal?.aborted || semaphore.free() === 0) break;
 
           semaphore.acquire();
-          incrementInflight(target.repo, flavor.key);
+          incrementUnassigned(target.repo, flavor.key);
 
           let launchPromise;
           launchPromise = (async () => {
+            let unassigned = true;
+            let runnerId;
+            const decrementUnassignedOnce = () => {
+              if (!unassigned) return;
+              unassigned = false;
+              decrementUnassigned(target.repo, flavor.key);
+            };
+
             try {
-              const jit = await generateJitConfig(target.repo, flavor.labels);
+              const {
+                encodedJitConfig,
+                runnerId: generatedRunnerId,
+                runnerName,
+              } = await generateJitConfig(target.repo, flavor.labels, { signal });
+              runnerId = generatedRunnerId;
               // Once registered, the runner must launch even if shutdown arrived while
               // GitHub was generating its config; otherwise an orphan is left behind.
-              log('runner_launching', { repo: target.repo, flavor: flavor.key });
-              const result = await flavor.launch(jit, { idleTimeoutMs });
+              log('runner_launching', { repo: target.repo, flavor: flavor.key, runnerName });
+
+              let result;
+              try {
+                result = await flavor.launch(encodedJitConfig, {
+                  idleTimeoutMs,
+                  onStarted: decrementUnassignedOnce,
+                });
+                if (!result?.startedJob) {
+                  throw new Error('runner exited without starting a job');
+                }
+              } catch (error) {
+                repoBackoffUntil.set(target.repo, Date.now() + LAUNCH_FAILURE_BACKOFF_MS);
+                try {
+                  await deleteRunner(target.repo, runnerId, { signal });
+                } catch (deleteError) {
+                  log('runner_deregister_error', {
+                    repo: target.repo,
+                    flavor: flavor.key,
+                    runnerId,
+                    ...errorFields(deleteError),
+                  });
+                }
+                throw error;
+              }
+
               log('runner_exited', {
                 repo: target.repo,
                 flavor: flavor.key,
-                startedJob: Boolean(result?.startedJob),
+                startedJob: true,
               });
             } catch (error) {
               log('runner_launch_error', {
@@ -228,7 +277,7 @@ export async function runDispatcher({
                 ...errorFields(error),
               });
             } finally {
-              decrementInflight(target.repo, flavor.key);
+              decrementUnassignedOnce();
               semaphore.release();
               launches.delete(launchPromise);
             }

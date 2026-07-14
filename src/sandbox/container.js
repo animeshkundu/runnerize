@@ -7,18 +7,34 @@ import { ensureImage, ensureRunnerBinary } from '../runner.js';
 
 const DEFAULT_IMAGE = 'catthehacker/ubuntu:full-latest';
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+const CLEANUP_TIMEOUT_MS = 5_000;
+const KILL_GRACE_MS = 1_000;
+const FORCE_SETTLE_MS = 7_000;
 
 function collect(command, args, options = {}) {
+  const { timeoutMs, ...spawnOptions } = options;
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...options });
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptions });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const settle = (callback) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      callback();
+    };
+    const timer = timeoutMs ? setTimeout(() => {
+      child.kill('SIGKILL');
+      settle(() => reject(new Error(`${command} timed out after ${timeoutMs}ms`)));
+    }, timeoutMs) : null;
+    timer?.unref?.();
     child.stdout?.on('data', (chunk) => { stdout += chunk; });
     child.stderr?.on('data', (chunk) => { stderr += chunk; });
-    child.once('error', reject);
-    child.once('close', (code) => code === 0
+    child.once('error', (error) => settle(() => reject(error)));
+    child.once('close', (code) => settle(() => code === 0
       ? resolve({ stdout, stderr })
-      : reject(new Error(`${command} exited with code ${code}: ${stderr.trim()}`)));
+      : reject(new Error(`${command} exited with code ${code}: ${stderr.trim()}`))));
   });
 }
 
@@ -88,10 +104,12 @@ async function stageWslRunner(distro, runnerDir) {
   const { stdout } = await wslShell(distro, `
 set -euo pipefail
 source_dir="$1"
-destination="$HOME/.cache/runnerize/runner"
+version="$("$source_dir/bin/Runner.Listener" --version)"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'runner source returned an invalid version' >&2; exit 1; }
+destination="$HOME/.cache/runnerize/runners/$version"
 if [[ ! -x "$destination/run.sh" ]]; then
   mkdir -p "$(dirname "$destination")"
-  temporary="$(mktemp -d "$HOME/.cache/runnerize/.runner.XXXXXX")"
+  temporary="$(mktemp -d "$HOME/.cache/runnerize/runners/.runner.XXXXXX")"
   trap 'rm -rf "$temporary"' EXIT
   cp -a "$source_dir"/. "$temporary"/
   [[ -x "$temporary/run.sh" ]] || { echo 'runner source is missing run.sh' >&2; exit 1; }
@@ -119,7 +137,7 @@ printf '%s' "$script"
 async function removeWslFile(distro, file) {
   if (!file) return;
   try {
-    await collect('wsl.exe', ['-d', distro, '-e', 'rm', '-f', '--', file]);
+    await collect('wsl.exe', ['-d', distro, '-e', 'rm', '-f', '--', file], { timeoutMs: CLEANUP_TIMEOUT_MS });
   } catch {
     // Best-effort cleanup after the container exits.
   }
@@ -140,10 +158,15 @@ async function stopContainer(target, name) {
   const args = ['rm', '-f', name];
   const call = invocation(target, args, process.env);
   try {
-    await collect(call.command, call.args, { env: call.env });
+    await collect(call.command, call.args, { env: call.env, timeoutMs: CLEANUP_TIMEOUT_MS });
   } catch {
     // It may have exited between the watchdog firing and cleanup.
   }
+}
+
+// Keep runner-output heuristics here so lifecycle wording changes have one update point.
+function isJobStartLine(line) {
+  return /\bRunning job(?:\s*:|\b)|\bJob\s+.+?\s+(?:started|running)\b/i.test(line);
 }
 
 const INNER_SCRIPT = `#!/usr/bin/env bash
@@ -165,7 +188,7 @@ export const linux = {
     return Boolean(await backend());
   },
 
-  async launch(encodedJitConfig, { idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS } = {}) {
+  async launch(encodedJitConfig, { idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS, onStarted } = {}) {
     if (!encodedJitConfig || typeof encodedJitConfig !== 'string') {
       throw new TypeError('encodedJitConfig must be a non-empty string');
     }
@@ -220,42 +243,58 @@ export const linux = {
         });
         let startedJob = false;
         let stdoutRemainder = '';
+        let stderrRemainder = '';
         let stderr = '';
         let timedOut = false;
         let settled = false;
+        let forceTimer;
+        let killTimer;
 
+        const settle = (callback) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (forceTimer) clearTimeout(forceTimer);
+          if (killTimer) clearTimeout(killTimer);
+          callback();
+        };
+        const observeOutput = (text, remainder) => {
+          const buffered = remainder + text;
+          const lines = buffered.split(/\r?\n/);
+          const nextRemainder = lines.pop() || '';
+          if (!startedJob && (lines.some(isJobStartLine) || isJobStartLine(nextRemainder))) {
+            startedJob = true;
+            clearTimeout(timer);
+            onStarted?.();
+          }
+          return nextRemainder;
+        };
         const timer = setTimeout(() => {
           if (startedJob) return;
           timedOut = true;
           void stopContainer(target, name);
+          child.kill('SIGTERM');
+          killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+          killTimer.unref?.();
+          forceTimer = setTimeout(() => settle(() => resolve({ startedJob: false })), FORCE_SETTLE_MS);
+          forceTimer.unref?.();
         }, idleTimeoutMs);
         timer.unref?.();
 
         child.stdout.on('data', (chunk) => {
-          stdoutRemainder += chunk.toString();
-          const lines = stdoutRemainder.split(/\r?\n/);
-          stdoutRemainder = lines.pop() || '';
-          if (lines.some((line) => /Running job/i.test(line)) || /Running job/i.test(stdoutRemainder)) {
-            startedJob = true;
-            clearTimeout(timer);
-          }
+          stdoutRemainder = observeOutput(chunk.toString(), stdoutRemainder);
         });
-        child.stderr.on('data', (chunk) => { stderr += chunk; });
-        child.once('error', (error) => {
-          clearTimeout(timer);
-          if (!settled) {
-            settled = true;
-            reject(error);
-          }
+        child.stderr.on('data', (chunk) => {
+          const text = chunk.toString();
+          stderr += text;
+          stderrRemainder = observeOutput(text, stderrRemainder);
         });
-        child.once('close', (code) => {
-          clearTimeout(timer);
-          if (settled) return;
-          settled = true;
+        child.once('error', (error) => settle(() => reject(error)));
+        child.once('close', (code) => settle(() => {
           if (timedOut) resolve({ startedJob: false });
           else if (code === 0) resolve({ startedJob });
           else reject(new Error(`${target.runtime} runner container exited with code ${code}: ${stderr.trim()}`));
-        });
+        }));
       });
     } finally {
       if (target.distro) await removeWslFile(target.distro, mountedScript);

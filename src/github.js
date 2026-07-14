@@ -8,9 +8,39 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const etagCache = new Map();
 let cachedToken;
+let rateLimitPausedUntil = 0;
+let rateLimitGate;
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function abortError(signal) {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The operation was aborted', 'AbortError');
+}
+
+function waitFor(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError(signal));
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).then(cleanup, cleanup);
+  });
+}
+
+function pauseRateLimit(ms) {
+  const pausedUntil = Date.now() + Math.min(Math.max(0, ms), 60_000);
+  if (pausedUntil <= rateLimitPausedUntil) return;
+
+  rateLimitPausedUntil = pausedUntil;
+  rateLimitGate = new Promise((resolve) => setTimeout(resolve, pausedUntil - Date.now()));
+}
+
+async function awaitRateLimit(signal) {
+  while (rateLimitGate && Date.now() < rateLimitPausedUntil) {
+    await waitFor(rateLimitGate, signal);
+  }
 }
 
 function repoPath(fullName) {
@@ -33,18 +63,29 @@ function retryDelayMs(response, attempt) {
   const retryAfter = response.headers.get('retry-after');
   if (retryAfter) {
     const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+    if (Number.isFinite(seconds)) return Math.min(60_000, Math.max(0, seconds * 1_000));
 
     const date = Date.parse(retryAfter);
-    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+    if (Number.isFinite(date)) return Math.min(60_000, Math.max(0, date - Date.now()));
   }
 
   const reset = Number(response.headers.get('x-ratelimit-reset'));
   if (Number.isFinite(reset) && reset > 0) {
-    return Math.max(0, reset * 1_000 - Date.now());
+    return Math.min(60_000, Math.max(0, reset * 1_000 - Date.now()));
   }
 
-  return 1_000 * 2 ** attempt;
+  return Math.min(60_000, 1_000 * 2 ** attempt);
+}
+
+function rateLimitDelayMs(response, data, attempt) {
+  const remainingHeader = response.headers.get('x-ratelimit-remaining');
+  const remaining = Number(remainingHeader);
+  if (response.headers.has('retry-after')
+    || (remainingHeader !== null && Number.isFinite(remaining) && remaining <= 1)
+    || isRateLimited(response, data)) {
+    return retryDelayMs(response, attempt);
+  }
+  return 0;
 }
 
 function isRateLimited(response, data) {
@@ -66,11 +107,12 @@ function assertSuccess(result, operation) {
   return result.data;
 }
 
-async function paginated(pathForPage, etagPrefix, selectItems = (data) => data) {
+async function paginated(pathForPage, etagPrefix, selectItems = (data) => data, { signal } = {}) {
   const items = [];
   for (let page = 1; ; page += 1) {
     const result = await api('GET', pathForPage(page), {
       etagKey: etagPrefix ? `${etagPrefix}:${page}` : undefined,
+      signal,
     });
     const data = assertSuccess(result, `GET ${pathForPage(page)}`);
     const pageItems = selectItems(data);
@@ -80,8 +122,9 @@ async function paginated(pathForPage, etagPrefix, selectItems = (data) => data) 
   }
 }
 
-export async function getToken() {
+export async function getToken({ signal } = {}) {
   if (cachedToken) return cachedToken;
+  if (signal?.aborted) throw abortError(signal);
 
   const envToken = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
   if (envToken) {
@@ -93,6 +136,7 @@ export async function getToken() {
     encoding: 'utf8',
     timeout: DEFAULT_TIMEOUT_MS,
     windowsHide: true,
+    signal,
   });
   const token = stdout.trim();
   if (!token) throw new Error('No GitHub token is available');
@@ -100,12 +144,22 @@ export async function getToken() {
   return cachedToken;
 }
 
-export async function api(method, path, { body, etagKey, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-  const token = await getToken();
+export async function api(method, path, {
+  body,
+  etagKey,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  signal,
+} = {}) {
+  const token = await getToken({ signal });
   const cached = etagKey ? etagCache.get(etagKey) : undefined;
 
   for (let attempt = 0; ; attempt += 1) {
+    await awaitRateLimit(signal);
+
     const controller = new AbortController();
+    const onAbort = () => controller.abort(abortError(signal));
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const headers = {
       Accept: 'application/vnd.github+json',
@@ -116,6 +170,7 @@ export async function api(method, path, { body, etagKey, timeoutMs = DEFAULT_TIM
     if (cached?.etag) headers['If-None-Match'] = cached.etag;
 
     let response;
+    let text;
     try {
       response = await fetch(new URL(path, API_ROOT), {
         method,
@@ -123,18 +178,21 @@ export async function api(method, path, { body, etagKey, timeoutMs = DEFAULT_TIM
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal,
       });
+      text = response.status === 304 ? '' : await response.text();
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
     }
 
     if (response.status === 304) {
       return { status: 304, data: cached?.data, notModified: true };
     }
 
-    const text = await response.text();
     const data = parseResponseData(text, response.headers.get('content-type') || '');
+    const delay = rateLimitDelayMs(response, data, attempt);
+    if (delay > 0) pauseRateLimit(delay);
     if (isRateLimited(response, data) && attempt < MAX_RATE_LIMIT_RETRIES) {
-      await sleep(retryDelayMs(response, attempt));
+      await awaitRateLimit(signal);
       continue;
     }
 
@@ -146,16 +204,18 @@ export async function api(method, path, { body, etagKey, timeoutMs = DEFAULT_TIM
   }
 }
 
-export async function getUser() {
-  const data = assertSuccess(await api('GET', '/user', { etagKey: 'user' }), 'Get user');
+export async function getUser({ signal } = {}) {
+  const data = assertSuccess(await api('GET', '/user', { etagKey: 'user', signal }), 'Get user');
   return { login: data.login, type: data.type };
 }
 
-export async function listOwnedPrivateRepos() {
-  const me = await getUser();
+export async function listOwnedPrivateRepos({ signal } = {}) {
+  const me = await getUser({ signal });
   const repos = await paginated(
     (page) => `/user/repos?affiliation=owner&per_page=100&page=${page}`,
     'owned-repos',
+    undefined,
+    { signal },
   );
 
   return repos
@@ -172,47 +232,63 @@ export async function listOwnedPrivateRepos() {
     }));
 }
 
-export async function isStillPrivate(fullName) {
+export async function isStillPrivate(fullName, { signal } = {}) {
   try {
-    const me = await getUser();
-    const result = await api('GET', `/repos/${repoPath(fullName)}`);
+    const me = await getUser({ signal });
+    const result = await api('GET', `/repos/${repoPath(fullName)}`, { signal });
     if (result.status < 200 || result.status >= 300) return false;
     return result.data?.private === true
       && result.data.owner?.login === me.login
       && result.data.owner?.type === 'User';
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return false;
   }
 }
 
-export async function countQueuedMatchingJobs(fullName, flavorLabels) {
+export async function countQueuedMatchingJobs(
+  fullName,
+  flavorLabels,
+  { isDefault = false, signal } = {},
+) {
   const repo = repoPath(fullName);
   const normalizedFlavorLabels = new Set(flavorLabels.map((label) => label.toLowerCase()));
-  let count = 0;
+  const genericLabels = new Set(['self-hosted', 'x64', 'arm64']);
+  const osLabel = flavorLabels
+    .map((label) => label.toLowerCase())
+    .find((label) => !genericLabels.has(label));
+  const runsById = new Map();
 
   for (const status of ['queued', 'in_progress']) {
     const runs = await paginated(
       (page) => `/repos/${repo}/actions/runs?status=${status}&per_page=100&page=${page}`,
       `runs:${fullName}:${status}`,
       (data) => data?.workflow_runs,
+      { signal },
     );
+    for (const run of runs) runsById.set(run.id, run);
+  }
 
-    for (const run of runs) {
-      const jobs = await paginated(
-        (page) => `/repos/${repo}/actions/runs/${encodeURIComponent(run.id)}/jobs?per_page=100&page=${page}`,
-        `jobs:${fullName}:${run.id}`,
-        (data) => data?.jobs,
-      );
-      count += jobs.filter((job) => job.status === 'queued'
-        && Array.isArray(job.labels)
-        && job.labels.every((label) => normalizedFlavorLabels.has(label.toLowerCase()))).length;
-    }
+  let count = 0;
+  for (const run of runsById.values()) {
+    const jobs = await paginated(
+      (page) => `/repos/${repo}/actions/runs/${encodeURIComponent(run.id)}/jobs?per_page=100&page=${page}`,
+      `jobs:${fullName}:${run.id}`,
+      (data) => data?.jobs,
+      { signal },
+    );
+    count += jobs.filter((job) => {
+      if (job.status !== 'queued' || !Array.isArray(job.labels)) return false;
+      const jobLabels = job.labels.map((label) => label.toLowerCase());
+      return jobLabels.every((label) => normalizedFlavorLabels.has(label))
+        && (isDefault || (osLabel !== undefined && jobLabels.includes(osLabel)));
+    }).length;
   }
 
   return count;
 }
 
-export async function generateJitConfig(fullName, labels) {
+export async function generateJitConfig(fullName, labels, { signal } = {}) {
   const data = assertSuccess(await api(
     'POST',
     `/repos/${repoPath(fullName)}/actions/runners/generate-jitconfig`,
@@ -223,20 +299,28 @@ export async function generateJitConfig(fullName, labels) {
         labels,
         work_folder: '_work',
       },
+      signal,
     },
   ), 'Generate JIT runner config');
 
-  if (typeof data?.encoded_jit_config !== 'string') {
-    throw new Error('GitHub API did not return an encoded JIT runner config');
+  if (typeof data?.encoded_jit_config !== 'string'
+    || data?.runner?.id === undefined
+    || typeof data.runner.name !== 'string') {
+    throw new Error('GitHub API did not return a complete JIT runner config');
   }
-  return data.encoded_jit_config;
+  return {
+    encodedJitConfig: data.encoded_jit_config,
+    runnerId: data.runner.id,
+    runnerName: data.runner.name,
+  };
 }
 
-export async function listRunners(fullName) {
+export async function listRunners(fullName, { signal } = {}) {
   const runners = await paginated(
     (page) => `/repos/${repoPath(fullName)}/actions/runners?per_page=100&page=${page}`,
     `runners:${fullName}`,
     (data) => data?.runners,
+    { signal },
   );
   return runners.map((runner) => ({
     id: runner.id,
@@ -248,10 +332,11 @@ export async function listRunners(fullName) {
   }));
 }
 
-export async function deleteRunner(fullName, id) {
+export async function deleteRunner(fullName, id, { signal } = {}) {
   const result = await api(
     'DELETE',
     `/repos/${repoPath(fullName)}/actions/runners/${encodeURIComponent(id)}`,
+    { signal },
   );
   if (result.status === 404) return;
   assertSuccess(result, 'Delete runner');
