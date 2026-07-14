@@ -46,15 +46,20 @@ async function runSession({ github, flavor, options = {} }, body) {
         try { launch.succeed(); } catch { /* already settled */ }
       }
     }
-    if (dispatcherPromise) {
-      await Promise.race([
-        dispatcherPromise.catch(() => {}),
-        tick(3000).then(() => { throw new Error('dispatcher did not drain within 3s'); }),
-      ]);
+    try {
+      if (dispatcherPromise) {
+        await Promise.race([
+          dispatcherPromise.catch(() => {}),
+          tick(3000).then(() => { throw new Error('dispatcher did not drain within 3s'); }),
+        ]);
+      }
+    } finally {
+      // Always restore shared state, even if the drain timed out or threw, so
+      // globalThis.fetch / the flavor singletons / GH_TOKEN never leak into the next test.
+      restoreFlavor();
+      stub.restore();
+      if (prevToken === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevToken;
     }
-    restoreFlavor();
-    stub.restore();
-    if (prevToken === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevToken;
   }
 }
 

@@ -214,32 +214,45 @@ test('api: bounded ETag cache evicts past the cap (no unbounded growth)', async 
 });
 
 test('api: ETag cache is LRU — a re-touched key survives eviction while a stale one is dropped', async () => {
-  // Distinct from the FIFO cap test: this pins down the *recency* bump. `hot` is inserted
-  // first, then re-read right before the cap is crossed. In a pure-FIFO cache `hot` (the
-  // oldest by insertion) would be the first evicted; in an LRU cache the re-read moves it
-  // to most-recently-used, so `cold` (inserted second, never touched) is evicted instead.
-  // This fails if the production `etagCache.delete(key)` recency re-touch is removed.
-  await withGithub({ user: { login: 'alice', type: 'User' } }, async (gh) => {
-    await gh.api('GET', '/user', { etagKey: 'hot' });  // cached (oldest by insertion)
-    await gh.api('GET', '/user', { etagKey: 'cold' }); // cached (second oldest)
-    for (let i = 0; i < 497; i += 1) {
-      await gh.api('GET', '/user', { etagKey: `f${i}` }); // fill to exactly the cap (499)
-    }
+  // Distinct from the FIFO cap test: this pins down the *recency* bump at
+  // `etagCache.delete(etagKey)` (before re-set) in src/github.js. That move only happens
+  // on a fresh 200 — a 304 returns early without touching the cache — so we drive it via
+  // per-repo listRunners endpoints (each carries its OWN server ETag, unlike the shared
+  // /user etag) and bump just the `hot` repo's ETag to force a 200 re-read. In a pure-FIFO
+  // cache `hot` (oldest by insertion) evicts first; in the real LRU cache the 200 re-read
+  // makes it most-recently-used, so `cold` (inserted second, never re-touched) evicts
+  // instead. Removing the production recency re-touch flips this and fails the test.
+  const runnersFor = (n) => ({ [`me/${n}`]: [{ id: 1, name: `runnerize-${n}`, status: 'offline', labels: [] }] });
+  const fillers = Array.from({ length: 497 }, (_, i) => `f${i}`);
+  const runners = Object.assign({}, runnersFor('hot'), runnersFor('cold'),
+    ...fillers.map((n) => runnersFor(n)));
 
-    // Re-read `hot`: a 304 (still cached) that also bumps it to most-recently-used.
-    const hotHit = await gh.api('GET', '/user', { etagKey: 'hot' });
-    assert.equal(hotHit.notModified, true, 'hot is still cached before the cap is crossed');
+  await withGithub({ user: { login: 'me', type: 'User' }, runners }, async (gh, stub) => {
+    await gh.listRunners('me/hot');   // caches etagKey runners:me/hot:1 (oldest)
+    await gh.listRunners('me/cold');  // caches runners:me/cold:1 (second oldest)
+    for (const n of fillers) await gh.listRunners(`me/${n}`); // fill to the cap (499 entries)
 
-    // Two fresh inserts cross the cap twice. FIFO would evict hot then cold; LRU (because
-    // hot was just touched) evicts cold and the oldest filler, sparing hot.
-    await gh.api('GET', '/user', { etagKey: 'push1' });
-    await gh.api('GET', '/user', { etagKey: 'push2' });
+    // Force `hot`'s re-read to be a fresh 200 so the recency move fires.
+    stub.bumpEtag('runners:me/hot:1');
+    const hotReadCallsBefore = stub.countCalls('GET', /\/me\/hot\/actions\/runners$/);
+    await gh.listRunners('me/hot'); // 200 -> recency bump to most-recently-used
+    assert.equal(stub.countCalls('GET', /\/me\/hot\/actions\/runners$/), hotReadCallsBefore + 1);
 
-    const hotAfter = await gh.api('GET', '/user', { etagKey: 'hot' });
-    assert.equal(hotAfter.notModified, true, 'the re-touched (hot) key survived eviction — cache is LRU, not FIFO');
+    // Cross the cap. FIFO would evict hot then cold; LRU (hot just re-touched) spares hot.
+    await gh.listRunners('me/push1'); // size 500
+    await gh.listRunners('me/push2'); // size 501 -> evict oldest
 
-    const coldAfter = await gh.api('GET', '/user', { etagKey: 'cold' });
-    assert.equal(coldAfter.notModified, false, 'the never-re-touched (cold) key was evicted');
+    // Whether a cached key survived is read out from whether the next GET is conditional.
+    const hotCalls = () => stub.callsMatching('GET', /\/me\/hot\/actions\/runners$/);
+    const coldCalls = () => stub.callsMatching('GET', /\/me\/cold\/actions\/runners$/);
+
+    await gh.listRunners('me/hot');
+    const lastHot = hotCalls().at(-1);
+    assert.ok(lastHot.ifNoneMatch, 'the re-touched (hot) key survived eviction — sends If-None-Match (LRU, not FIFO)');
+
+    await gh.listRunners('me/cold');
+    const lastCold = coldCalls().at(-1);
+    assert.equal(lastCold.ifNoneMatch, null, 'the never-re-touched (cold) key was evicted — no If-None-Match');
   });
 });
 
