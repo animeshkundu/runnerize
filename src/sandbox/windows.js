@@ -100,12 +100,14 @@ async function stopSandbox(id) {
 async function waitForExec(sandboxId) {
   const deadline = Date.now() + EXEC_READY_TIMEOUT_MS;
   let lastError;
-  while (Date.now() < deadline) {
+  while (true) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     try {
       await collect('wsb.exe', [
         'exec', '--id', sandboxId, '--run-as', 'System',
         '--command', 'cmd.exe /c exit 0',
-      ], { timeoutMs: EXEC_READY_ATTEMPT_TIMEOUT_MS });
+      ], { timeoutMs: Math.min(EXEC_READY_ATTEMPT_TIMEOUT_MS, remaining) });
       return;
     } catch (error) {
       lastError = error;
@@ -152,7 +154,11 @@ async function observeRunner(execPromise, controlDir, idleTimeoutMs, onStarted) 
       startedJob = true;
       onStarted?.();
     }
-    if (outcome.error && startedJob) throw outcome.error;
+    if (outcome.error) {
+      throw new Error(startedJob
+        ? 'windows runner failed after starting a job'
+        : 'windows runner exited before starting a job', { cause: outcome.error });
+    }
     return { startedJob };
   }
 }

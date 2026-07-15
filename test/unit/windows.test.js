@@ -153,14 +153,32 @@ test('windows.launch times out before assignment, stops, and removes control fil
   });
 });
 
-test('windows.launch resolves false when exec fails before a job starts', async () => {
+test('windows.launch surfaces an exec failure before a job starts', async () => {
   await withWindowsLaunch(async (windows) => {
     const stub = createLaunchStub({ onRunnerExec(child) { child.emitStderr('runner failed'); child.close(1); } });
+    try {
+      await assert.rejects(
+        withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 1000 })),
+        (error) => {
+          assert.equal(error.message, 'windows runner exited before starting a job');
+          assert.match(error.cause?.message, /runner failed/);
+          return true;
+        },
+      );
+      assert.ok(stub.find('stop'));
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('windows.launch resolves false when exec exits cleanly before a job starts', async () => {
+  await withWindowsLaunch(async (windows) => {
+    const stub = createLaunchStub({ onRunnerExec(child) { child.close(0); } });
     try {
       assert.deepEqual(await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 1000 })), {
         startedJob: false,
       });
-      assert.ok(stub.find('stop'));
     } finally {
       stub.restore();
     }
@@ -180,7 +198,7 @@ test('windows.launch stop polling normalizes IDs and waits for a lingering sandb
       } else if (child.args.includes('share')) {
         child.close(0);
       } else if (child.args.includes('exec')) {
-        child.close(1);
+        child.close(0);
       } else if (child.args.includes('list')) {
         listCalls += 1;
         const environments = listCalls < 3 ? [{ Id: `{${sandboxId.toUpperCase()}}` }] : [];
