@@ -4,17 +4,13 @@ Zero-dependency tests using Node's built-in runner (`node:test`) and `node:asser
 No npm dependencies, no test framework.
 
 ```bash
-npm test          # unit suite   -> node --test test/unit
-npm run test:e2e  # e2e suite    -> node --test test/e2e   (skips cleanly without infra)
-npm run test:all  # both
+npm test          # unit suite   -> node --test test/unit/*.test.js
+npm run test:e2e  # e2e suite    -> node --test test/e2e/*.test.js (skips cleanly without infra)
+npm run test:all  # both globs
 ```
 
-> Node version note: the frozen scripts pass a **directory** (`test/unit`) to
-> `node --test`. Directory arguments are discovered recursively on **Node 18 and 20**
-> (the CI matrix). On **Node 21+** a bare directory is instead resolved as a module, so
-> `node --test test/unit` errors there. To run locally on a newer Node, use a glob:
-> `node --test "test/unit/**/*.test.js"`. The CI matrix (Node 18, 20) runs the frozen
-> command as-is.
+The explicit globs work consistently across the supported Node versions. CI tests
+Node 22 as the lower bound and Node 24 as the current LTS runtime.
 
 ## Layout
 

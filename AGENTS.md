@@ -22,7 +22,7 @@ Status: **v0.1**, live-validated on Windows 11 + WSL2 (rootless Podman). The
 `macos` (`tart`) and native `windows` (Windows Sandbox) flavors are detected-and-
 stubbed opt-ins, not yet exercised end to end.
 
-**Zero runtime dependencies.** Node ESM, `>=18`, built-ins only (`fetch`,
+**Zero runtime dependencies.** Node ESM, `>=20`, built-ins only (`fetch`,
 `node:crypto`, `node:child_process`, `node:fs`, `node:os`, `node:util`, ...).
 
 ---
@@ -179,7 +179,7 @@ tests, and every implementer in the same change — and say so explicitly in the
 
 ## Build, test, run locally
 
-Requirements: **Node ≥ 18**, and for the `linux` flavor a container runtime
+Requirements: **Node ≥ 20**, and for the `linux` flavor a container runtime
 (`podman` preferred, or `docker`) — native on Linux, or inside a WSL2 distro on
 Windows. A GitHub token via `$GH_TOKEN`/`$GITHUB_TOKEN` or `gh auth token`.
 

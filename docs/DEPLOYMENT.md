@@ -22,7 +22,7 @@ Native Windows/macOS execution is a TODO (see "Enabling native flavors" below).
 
 ## Prerequisites (any host)
 
-- **Node >= 18** on PATH.
+- **Node >= 20** on PATH.
 - **A container runtime**: rootless **podman** (preferred) or docker, reachable the
   way the host's flavor expects (native on Linux; via WSL on Windows; via a Linux VM
   on macOS — see per-host sections).
@@ -57,7 +57,7 @@ Two sub-cases; both run the **linux** flavor (Windows Sandbox is a stub).
 - Install **WSL2** with a distro, and **rootless podman inside WSL**
   (`wsl -e podman --version` must work). runnerize on Windows shells out to
   `wsl.exe -e podman ...` and stages the runner into a WSL-native cache.
-- Node >= 18 on the **Windows** side (the dispatcher process is Windows-Node; it
+- Node >= 20 on the **Windows** side (the dispatcher process is Windows-Node; it
   drives WSL podman). `gh` authenticated on Windows, or `GH_TOKEN` set.
 - When invoking through git-bash, export `MSYS_NO_PATHCONV=1` and
   `MSYS2_ARG_CONV_EXCL='*'` so bash does not mangle WSL paths. (Not needed when
@@ -94,7 +94,7 @@ Runs the **linux** flavor (the `macos`/tart backend is a stub).
 - Provide a Linux container engine: **Colima** (`brew install colima && colima start`)
   or `podman machine` (`podman machine init && podman machine start`). Either gives
   a Linux VM whose podman/docker runnerize uses for Linux-container jobs.
-- Node >= 18 (`brew install node`), and `gh` authenticated or `GH_TOKEN` set.
+- Node >= 20 (`brew install node`), and `gh` authenticated or `GH_TOKEN` set.
 
 ### Boot persistence on macOS
 - `runnerize service install` writes a **launchd** agent
@@ -106,7 +106,7 @@ Runs the **linux** flavor (the `macos`/tart backend is a stub).
 
 ## Linux host
 
-The native case. Node >= 18, rootless podman, `gh`/`GH_TOKEN`. Persistence:
+The native case. Node >= 20, rootless podman, `gh`/`GH_TOKEN`. Persistence:
 `runnerize service install` writes a **systemd user unit**
 (`~/.config/systemd/user/runnerize.service`, `Restart=always`) and enables it. For
 it to run before/without an interactive login: `loginctl enable-linger "$USER"`.

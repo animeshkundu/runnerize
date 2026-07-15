@@ -35,11 +35,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
       # Syntax-check the CLI entrypoints and every source module without
       # executing anything (zero deps, so nothing else to build). Covers every
       # file under bin/ (CLI binaries may be extensionless) plus every .js under
@@ -65,12 +65,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [18, 20]
+        node: [22, 24]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
       # No lockfile and zero runtime deps, so `npm ci` will fail; fall back to
@@ -109,13 +109,13 @@ jobs:
 
       - name: Checkout
         if: steps.check.outputs.enabled == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node
         if: steps.check.outputs.enabled == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
 
       # Podman ships on the ubuntu-latest image; install only as a fallback.
       - name: Ensure podman is available

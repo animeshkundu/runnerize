@@ -61,14 +61,14 @@ jobs:
     steps:
       # Full history + tags so version math and release notes have context.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
       # Zero runtime deps and no committed lockfile. Use a strict `npm ci` when a
@@ -140,9 +140,9 @@ jobs:
           git commit -m "release: $TAG"
           git tag -a "$TAG" -m "$TAG"
 
-      # OIDC trusted publishing requires npm >= 11.5.1; Node 20 bundles an older
-      # npm. Pin to the 11.x line (which supports Node 20) rather than @latest so
-      # a future npm major cannot silently break the publish. Done BEFORE publish
+      # OIDC trusted publishing requires npm >= 11.5.1. Pin to the 11.x line
+      # rather than relying on Node 24's bundled npm or using @latest, so a future
+      # npm major cannot silently break the publish. Done BEFORE publish
       # and before any push, to keep the pre-publish failure window small.
       - name: Ensure npm supports trusted publishing
         run: npm install -g "npm@^11.5.1"

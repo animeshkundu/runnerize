@@ -77,8 +77,8 @@ export function tick(ms = 0) {
  * Keep the event loop alive with a ref'd timer while awaiting `promise`. `container.js`
  * arms its idle-watchdog and force-settle timers with `.unref()`, so a test that only
  * awaits such a launch has no ref'd work to keep the loop alive; Node's test runner
- * (notably on Node 18/20) then reports "event loop resolved while promise pending" and
- * cancels the test. A ref'd heartbeat holds the loop open until settlement.
+ * can then report "event loop resolved while promise pending" and cancel the test.
+ * A ref'd heartbeat holds the loop open until settlement.
  */
 export async function withKeepAlive(promise, intervalMs = 50) {
   const heartbeat = setInterval(() => {}, intervalMs);

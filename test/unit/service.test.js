@@ -40,7 +40,7 @@ function successfulHarness(options = {}) {
     if (command[0] === 'sh' && command.includes('printf %s "$HOME"')) return '/home/ani';
     if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('command -v node')) {
       if (options.nodeAbsent) throw new Error('node missing');
-      return options.nodeOutput ?? '/usr/bin/node\nv20.18.1\n';
+      return options.nodeOutput ?? '/usr/bin/node\nv24.18.0\n';
     }
     if (command[0] === 'podman') {
       if (options.noRuntime) throw new Error('podman missing');
@@ -58,7 +58,7 @@ function successfulHarness(options = {}) {
     if (command[0]?.endsWith('/bin/node') && command[1] === '--version') {
       cachedNodeChecks += 1;
       if (options.cachedNode === false && cachedNodeChecks === 1) throw new Error('cached node missing');
-      return 'v20.18.1';
+      return 'v24.18.0';
     }
     return '';
   };
@@ -137,11 +137,11 @@ test('Windows install reuses the cached Node without downloading on reinstall', 
     await service.installService();
     assert.ok(harness.calls.some((call) => {
       const command = commandOf(call);
-      return command[0] === '/home/ani/.cache/runnerize/node/v20.18.1/bin/node'
+      return command[0] === '/home/ani/.cache/runnerize/node/v24.18.0/bin/node'
         && command[1] === '--version';
     }));
     assert.ok(!harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
-    assert.ok(harness.calls.some((call) => commandOf(call).includes('/home/ani/.cache/runnerize/node/v20.18.1/bin/node')));
+    assert.ok(harness.calls.some((call) => commandOf(call).includes('/home/ani/.cache/runnerize/node/v24.18.0/bin/node')));
   });
 });
 
@@ -159,7 +159,7 @@ test('Windows install persists a Windows token and downloads pinned Node when ab
       return command[0] === 'bash' && command[1] === '-c' && command[2].includes('sha256sum -c');
     });
     assert.ok(download, 'pinned Node download script invoked');
-    assert.ok(download.args.includes('c6fa75c841cbffac851678a472f2a5bd612fff8308ef39236190e1f8dbb0e567'));
+    assert.ok(download.args.includes('55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742'));
   });
 });
 
