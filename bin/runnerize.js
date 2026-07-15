@@ -17,7 +17,7 @@ Usage:
   runnerize run [--max <n>] [--interval <ms>] [--idle-timeout <ms>] [--dry-run]
   runnerize status
   runnerize remove
-  runnerize service install|uninstall
+  runnerize service install|uninstall [--no-elevate]
   runnerize --help
 
 Options:
@@ -25,6 +25,7 @@ Options:
   --interval <ms>        Poll interval in milliseconds (default: 15000)
   --idle-timeout <ms>    Kill an unclaimed runner after this time (default: 120000)
   --dry-run              Count and display demand without minting runners
+  --no-elevate           Never prompt for administrator access during service setup
   -h, --help             Show this help
 `;
 
@@ -183,13 +184,16 @@ async function main() {
       if (args.length) throw new Error(`Unexpected argument: ${args[0]}`);
       await remove();
       return;
-    case 'service':
-      if (args.length !== 1 || !['install', 'uninstall'].includes(args[0])) {
-        throw new Error('Usage: runnerize service install|uninstall');
+    case 'service': {
+      const [action, ...flags] = args;
+      if (!['install', 'uninstall'].includes(action) || flags.some((flag) => flag !== '--no-elevate') || flags.length > 1) {
+        throw new Error('Usage: runnerize service install|uninstall [--no-elevate]');
       }
-      if (args[0] === 'install') await installService();
-      else await uninstallService();
+      const options = { noElevate: flags.includes('--no-elevate') };
+      if (action === 'install') await installService(options);
+      else await uninstallService(options);
       return;
+    }
     default:
       throw new Error(`Unknown command: ${command}`);
   }

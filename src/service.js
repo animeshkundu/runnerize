@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +9,8 @@ const DEFAULT_WSL_NODE_VERSION = 'v24.18.0';
 const DEFAULT_WSL_NODE_SHA256 = '55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742';
 const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
 const packageRoot = dirname(dirname(binPath));
+const ELEVATION_TIMEOUT_MS = 55_000;
+const ELEVATION_POLL_MS = 250;
 
 function quoteSystemd(value) {
   return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
@@ -359,24 +361,93 @@ function writeStartupLauncher(distro, user) {
   return startupPath;
 }
 
-function installLogonTrigger(distro, user) {
+function elevationPaths(operation) {
+  const directory = join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), SERVICE_NAME);
+  return {
+    directory,
+    script: join(directory, `elevate-${operation}.ps1`),
+    marker: join(directory, `elevate-${operation}-result.txt`),
+  };
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function runElevated(operation, command) {
+  const paths = elevationPaths(operation);
+  mkdirSync(paths.directory, { recursive: true });
+  rmSync(paths.marker, { force: true });
+  const elevatedScript = [
+    "$ErrorActionPreference = 'Stop'",
+    'try {',
+    command,
+    `Set-Content -LiteralPath ${powershellLiteral(paths.marker)} -Value 'OK' -Encoding ASCII`,
+    '} catch {',
+    `Set-Content -LiteralPath ${powershellLiteral(paths.marker)} -Value ('ERROR: ' + $_.Exception.Message) -Encoding UTF8`,
+    'exit 1',
+    '}',
+  ].join('\r\n');
+  writeFileSync(paths.script, elevatedScript);
+
+  try {
+    const launchCommand = `Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',${powershellLiteral(`"${paths.script}"`)})`;
+    const launched = spawnSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', launchCommand,
+    ], { encoding: 'utf8', windowsHide: true });
+    if (launched.status !== 0 || launched.error) {
+      return { ok: false, reason: launched.stderr?.trim() || launched.stdout?.trim() || launched.error?.message || 'elevation was declined or unavailable' };
+    }
+
+    const deadline = Date.now() + ELEVATION_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (existsSync(paths.marker)) {
+        const marker = readFileSync(paths.marker, 'utf8').trim();
+        if (marker === 'OK') return { ok: true };
+        if (marker.startsWith('ERROR:')) return { ok: false, reason: marker };
+      }
+      await sleep(ELEVATION_POLL_MS);
+    }
+    return { ok: false, reason: `timed out after ${Math.round(ELEVATION_TIMEOUT_MS / 1000)} seconds` };
+  } finally {
+    rmSync(paths.script, { force: true });
+    rmSync(paths.marker, { force: true });
+  }
+}
+
+async function installLogonTrigger(distro, user, { noElevate = false } = {}) {
   const windowsUser = currentWindowsUser();
+  const script = taskSchedulerScript(distro, user, windowsUser);
+  console.log('Registering logon task...');
   const result = spawnSync('powershell.exe', [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
-    taskSchedulerScript(distro, user, windowsUser),
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
   ], { encoding: 'utf8', windowsHide: true });
   if (result.status === 0) {
     rmSync(windowsStartupPath(), { force: true });
+    console.log('Registered auto-start task.');
     return { kind: 'Task Scheduler', detail: `task ${SERVICE_NAME} for ${windowsUser}` };
   }
   if (!isAccessDenied(result)) {
     const detail = result.stderr?.trim() || result.stdout?.trim() || result.error?.message || `exit code ${result.status}`;
     throw new Error(`Failed to register Task Scheduler task ${SERVICE_NAME}: ${detail}`);
   }
+
+  if (!noElevate) {
+    console.log('Task registration needs administrator access — requesting elevation (decline to use a login-only Startup entry)...');
+    const elevated = await runElevated('install', script);
+    if (elevated.ok) {
+      rmSync(windowsStartupPath(), { force: true });
+      console.log('Registered auto-start task (elevated).');
+      return { kind: 'Task Scheduler (elevated)', detail: `task ${SERVICE_NAME} for ${windowsUser}` };
+    }
+    console.warn(`Elevated task registration did not complete: ${elevated.reason}`);
+  }
+
+  console.log('Falling back to a Startup-folder entry (login-only, no auto-restart).');
   return { kind: 'Startup folder fallback', detail: writeStartupLauncher(distro, user) };
 }
 
-function installWindows() {
+async function installWindows({ noElevate = false } = {}) {
   const context = resolveWslContext();
   console.log(`WSL distro: ${context.distro} (user ${context.user})`);
   const preflight = preflightWsl(context);
@@ -395,7 +466,7 @@ function installWindows() {
     : [node.path, installation.bin, 'service', 'install'];
   wslRun(context.distro, context.user, systemdWslArgs(installCommand));
   console.log('systemd user service: installed and enabled');
-  const trigger = installLogonTrigger(context.distro, context.user);
+  const trigger = await installLogonTrigger(context.distro, context.user, { noElevate });
   console.log(`Windows logon trigger: ${trigger.kind} (${trigger.detail})`);
   console.log(`View logs: wsl.exe -d ${context.distro} -u ${context.user} -e journalctl --user -u runnerize -f`);
   console.log('Uninstall: runnerize service uninstall');
@@ -405,7 +476,7 @@ function bestEffort(command, args) {
   spawnSync(command, args, { stdio: 'ignore', windowsHide: true });
 }
 
-function uninstallWindows() {
+async function uninstallWindows({ noElevate = false } = {}) {
   let context;
   try {
     context = resolveWslContext();
@@ -428,23 +499,45 @@ function uninstallWindows() {
     bestEffort('wsl.exe', wslArgs(context.distro, context.user, ['rm', '-rf', installation, `${context.home}/.cache/runnerize/node`, `${context.home}/.config/runnerize`]));
   }
 
-  const script = `Get-ScheduledTask -TaskName ${powershellLiteral(SERVICE_NAME)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false`;
-  bestEffort('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script]);
+  const script = `Get-ScheduledTask -TaskName ${powershellLiteral(SERVICE_NAME)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
+  const taskRemoval = spawnSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ], { encoding: 'utf8', windowsHide: true });
+  if (taskRemoval.status !== 0 && isAccessDenied(taskRemoval)) {
+    if (noElevate) {
+      console.warn(`Could not remove the elevated ${SERVICE_NAME} task without administrator access. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
+    } else {
+      console.log('Task removal needs administrator access — requesting elevation...');
+      const elevated = await runElevated('uninstall', script);
+      if (!elevated.ok) {
+        console.warn(`Could not remove the elevated ${SERVICE_NAME} task: ${elevated.reason}. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
+      } else {
+        console.log('Removed auto-start task (elevated).');
+      }
+    }
+  } else if (taskRemoval.status !== 0) {
+    const detail = taskRemoval.stderr?.trim() || taskRemoval.stdout?.trim() || taskRemoval.error?.message || `exit code ${taskRemoval.status}`;
+    console.warn(`Could not remove the ${SERVICE_NAME} task: ${detail}. Remove it manually in Task Scheduler if it still exists.`);
+  }
   rmSync(windowsStartupPath(), { force: true });
   console.log('Removed the WSL systemd service, Windows logon trigger, package copy, and Node cache where present.');
 }
 
-export async function installService() {
+function elevationDisabled(options) {
+  return Boolean(options.noElevate || process.env.RUNNERIZE_NO_ELEVATE);
+}
+
+export async function installService(options = {}) {
   if (platform() === 'darwin') return installLaunchd();
-  if (platform() === 'win32') return installWindows();
+  if (platform() === 'win32') return installWindows({ noElevate: elevationDisabled(options) });
   if (!commandExists('systemctl')) {
     throw new Error('systemd is required to install runnerize as a Linux/WSL service.');
   }
   return installSystemd();
 }
 
-export async function uninstallService() {
+export async function uninstallService(options = {}) {
   if (platform() === 'darwin') return uninstallLaunchd();
-  if (platform() === 'win32') return uninstallWindows();
+  if (platform() === 'win32') return uninstallWindows({ noElevate: elevationDisabled(options) });
   return uninstallSystemd();
 }

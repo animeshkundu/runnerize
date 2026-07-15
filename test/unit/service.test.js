@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -66,7 +66,20 @@ function successfulHarness(options = {}) {
     calls.push({ kind: 'spawn', file, args, options: spawnOptions });
     if (file === 'whoami.exe') return { status: 0, stdout: 'DESKTOP\\ani\n', stderr: '' };
     if (file === 'powershell.exe') {
-      if (options.accessDenied) return { status: 1, stdout: '', stderr: 'Access is denied' };
+      const command = args.at(-1);
+      const elevatedLaunch = command.includes('Start-Process powershell.exe -Verb RunAs');
+      const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
+      if ((options.accessDenied && !elevatedLaunch) || (options.uninstallAccessDenied && unregister)) {
+        return { status: 1, stdout: '', stderr: 'Access is denied' };
+      }
+      if (elevatedLaunch) {
+        if (options.elevationDeclined) return { status: 1, stdout: '', stderr: 'The operation was canceled by the user. (1223)' };
+        const markerMatch = command.match(/-File','([^']+)'/);
+        assert.ok(markerMatch, 'elevated script path included');
+        const scriptPath = markerMatch[1].replace(/^"|"$/g, '');
+        const markerPath = scriptPath.replace(/elevate-(install|uninstall)\.ps1$/, 'elevate-$1-result.txt');
+        writeFileSync(markerPath, options.elevationError ?? 'OK');
+      }
       return { status: 0, stdout: '', stderr: '' };
     }
     return { status: 0, stdout: '', stderr: '' };
@@ -79,7 +92,12 @@ async function withWindowsService(options, action) {
   const appData = mkdtempSync(join(tmpdir(), 'runnerize-service-'));
   const oldAppData = process.env.APPDATA;
   const oldToken = process.env.GH_TOKEN;
+  const oldLocalAppData = process.env.LOCALAPPDATA;
+  const oldNoElevate = process.env.RUNNERIZE_NO_ELEVATE;
   process.env.APPDATA = appData;
+  process.env.LOCALAPPDATA = appData;
+  if (options.noElevateEnv) process.env.RUNNERIZE_NO_ELEVATE = options.noElevateEnv;
+  else delete process.env.RUNNERIZE_NO_ELEVATE;
   if (options.token) process.env.GH_TOKEN = options.token;
   else delete process.env.GH_TOKEN;
   const restore = installStubs(harness);
@@ -93,6 +111,10 @@ async function withWindowsService(options, action) {
     else process.env.APPDATA = oldAppData;
     if (oldToken === undefined) delete process.env.GH_TOKEN;
     else process.env.GH_TOKEN = oldToken;
+    if (oldLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = oldLocalAppData;
+    if (oldNoElevate === undefined) delete process.env.RUNNERIZE_NO_ELEVATE;
+    else process.env.RUNNERIZE_NO_ELEVATE = oldNoElevate;
   }
 }
 
@@ -189,13 +211,57 @@ test('Windows install fails actionably when systemd is unavailable', async () =>
   });
 });
 
-test('Windows install falls back to a hidden Startup launcher on Task Scheduler access denied', async () => {
-  await withWindowsService({ accessDenied: true }, async (service, _harness, appData) => {
+test('Windows install uses Tier 1 Task Scheduler without elevation when registration succeeds', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    const powershell = harness.calls.filter((call) => call.file === 'powershell.exe');
+    assert.equal(powershell.length, 1);
+    assert.doesNotMatch(powershell[0].args.at(-1), /Start-Process/);
+  });
+});
+
+test('Windows install elevates Task Scheduler registration after Tier 1 access denied', async () => {
+  await withWindowsService({ accessDenied: true }, async (service, harness, appData) => {
+    await service.installService();
+    const elevated = harness.calls.find((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('Start-Process'));
+    assert.ok(elevated, 'UAC elevation attempted');
+    assert.doesNotMatch(elevated.args.at(-1), /-Wait/);
+    assert.equal(existsSync(join(appData, 'elevate-install.ps1')), false, 'temporary elevation script cleaned up');
+  });
+});
+
+test('Windows install falls back to a hidden Startup launcher when elevation is declined', async () => {
+  await withWindowsService({ accessDenied: true, elevationDeclined: true }, async (service, _harness, appData) => {
     await service.installService();
     const startup = join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs');
     const launcher = readFileSync(startup, 'utf8');
     assert.match(launcher, /wsl\.exe/);
     assert.match(launcher, /systemctl --user start runnerize/);
+  });
+});
+
+test('Windows install skips elevation when --no-elevate is set', async () => {
+  await withWindowsService({ accessDenied: true }, async (service, harness, appData) => {
+    await service.installService({ noElevate: true });
+    assert.ok(!harness.calls.some((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('Start-Process')));
+    assert.match(readFileSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs'), 'utf8'), /wsl\.exe/);
+  });
+});
+
+test('Windows install skips elevation when RUNNERIZE_NO_ELEVATE is non-empty', async () => {
+  await withWindowsService({ accessDenied: true, noElevateEnv: '1' }, async (service, harness) => {
+    await service.installService();
+    assert.ok(!harness.calls.some((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('Start-Process')));
+  });
+});
+
+test('Windows uninstall elevates task removal after non-elevated access denied', async () => {
+  await withWindowsService({ uninstallAccessDenied: true }, async (service, harness, appData) => {
+    await service.uninstallService();
+    const elevated = harness.calls.find((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('Start-Process'));
+    assert.ok(elevated, 'elevated task removal attempted');
+    assert.match(elevated.args.at(-1), /elevate-uninstall\.ps1/);
+    assert.equal(existsSync(join(appData, 'elevate-uninstall.ps1')), false);
   });
 });
 
