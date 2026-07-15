@@ -55,7 +55,7 @@ npm i -g runnerize
 runnerize service install
 ```
 
-The installer checks WSL, systemd, the container runtime, and GitHub authentication; prepares Node and runnerize inside WSL; installs a restarting systemd user service; enables user lingering where permitted; and adds a Windows logon trigger. It first registers the per-user Task Scheduler task without elevation. If Windows requires administrator access, it requests one UAC approval and registers the same task elevated. A declined prompt falls back immediately; after approval, elevated registration has a 55-second result timeout. Windows controls how long an unanswered UAC prompt remains open. If elevation is declined, unavailable, fails, or times out, runnerize falls back to the current user's Startup folder (login-only, without automatic restart).
+The installer checks WSL, systemd, the container runtime, and GitHub authentication; prepares Node and runnerize inside WSL; installs a restarting systemd user service; enables user lingering where permitted; and adds a Windows logon trigger. It first registers the per-user Task Scheduler task without elevation. If Windows requires administrator access, it requests one UAC approval and registers the same task elevated. The prompt and elevated command share a 55-second timeout and report success through the elevated process exit code. If elevation is declined, unavailable, fails, or times out, runnerize falls back to the current user's Startup folder (login-only, without automatic restart).
 
 For scripted installs or managed machines where you do not want a UAC prompt, pass `--no-elevate` or set `RUNNERIZE_NO_ELEVATE` to any non-empty value:
 

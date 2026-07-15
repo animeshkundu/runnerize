@@ -1,8 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
-import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const SERVICE_NAME = 'runnerize';
@@ -11,7 +10,11 @@ const DEFAULT_WSL_NODE_SHA256 = '55aa7153f9d88f28d765fcdad5ae6945b5c0f98a3688170
 const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
 const packageRoot = dirname(dirname(binPath));
 const ELEVATION_TIMEOUT_MS = 55_000;
-const ELEVATION_POLL_MS = 250;
+const windowsPowerShellPath = join(
+  process.env.SystemRoot || 'C:\\Windows',
+  'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
+);
+const powershellPath = existsSync(windowsPowerShellPath) ? windowsPowerShellPath : 'powershell.exe';
 
 function quoteSystemd(value) {
   return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
@@ -337,7 +340,7 @@ function windowsStartupPath() {
 }
 
 function currentWindowsUser() {
-  const result = captureResult('powershell.exe', [
+  const result = captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-Command', '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
   ]);
   const sid = result.status === 0 ? result.stdout?.trim() : '';
@@ -385,70 +388,37 @@ function writeStartupLauncher(distro, user) {
   return startupPath;
 }
 
-function elevationMarkerPath(operation, nonce) {
-  return join(
-    process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'),
-    SERVICE_NAME,
-    `elevate-${operation}-${nonce}-result.txt`,
-  );
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
 async function runElevated(operation, command, { timeoutMs = ELEVATION_TIMEOUT_MS } = {}) {
-  const nonce = randomBytes(16).toString('hex');
-  const marker = elevationMarkerPath(operation, nonce);
-  mkdirSync(dirname(marker), { recursive: true });
-  rmSync(marker, { force: true });
   const elevatedScript = [
     "$ErrorActionPreference = 'Stop'",
     'try {',
     command,
-    `Set-Content -LiteralPath ${powershellLiteral(marker)} -Value ${powershellLiteral(`OK:${nonce}`)} -Encoding ASCII`,
+    'exit 0',
     '} catch {',
-    `Set-Content -LiteralPath ${powershellLiteral(marker)} -Value (${powershellLiteral(`ERROR:${nonce}:`)} + $_.Exception.Message) -Encoding UTF8`,
+    'Write-Error $_',
     'exit 1',
     '}',
   ].join('\r\n');
   const encodedCommand = Buffer.from(elevatedScript, 'utf16le').toString('base64');
-  const readMarker = () => {
-    if (!existsSync(marker)) return null;
-    const result = readFileSync(marker, 'utf8').trim();
-    if (result === `OK:${nonce}`) return { ok: true };
-    if (result.startsWith(`ERROR:${nonce}:`)) return { ok: false, reason: `ERROR: ${result.slice(`ERROR:${nonce}:`.length)}` };
-    return null;
-  };
-
-  try {
-    const startProcess = `Start-Process powershell.exe -Verb RunAs -ErrorAction Stop -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',${powershellLiteral(encodedCommand)})`;
-    const launchCommand = `try { ${startProcess} } catch { Write-Error $_; exit 1 }`;
-    const launched = captureResult('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', launchCommand,
-    ], { encoding: 'utf8', windowsHide: true });
-    if (launched.status !== 0 || launched.error) {
-      return { ok: false, reason: launched.stderr?.trim() || launched.stdout?.trim() || launched.error?.message || 'elevation was declined or unavailable' };
-    }
-
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const result = readMarker();
-      if (result) return result;
-      await sleep(Math.min(ELEVATION_POLL_MS, Math.max(1, deadline - Date.now())));
-    }
-    const finalResult = readMarker();
-    return finalResult ?? { ok: false, reason: `timed out after ${Math.round(timeoutMs / 1000)} seconds` };
-  } finally {
-    rmSync(marker, { force: true });
+  const startProcess = `$p = Start-Process -FilePath ${powershellLiteral(powershellPath)} -Verb RunAs -Wait -PassThru -ErrorAction Stop -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',${powershellLiteral(encodedCommand)}); exit $p.ExitCode`;
+  const launchCommand = `try { ${startProcess} } catch { Write-Error $_; exit 1 }`;
+  const launched = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', launchCommand,
+  ], { encoding: 'utf8', windowsHide: true, timeout: timeoutMs });
+  if (launched.error?.code === 'ETIMEDOUT' || launched.error?.killed || launched.error?.signal) {
+    return { ok: false, reason: 'elevation prompt was not answered' };
   }
+  if (launched.status !== 0 || launched.error) {
+    return { ok: false, reason: launched.stderr?.trim() || launched.stdout?.trim() || launched.error?.message || `elevated ${operation} failed` };
+  }
+  return { ok: true };
 }
 
 async function installLogonTrigger(distro, user, { noElevate = false, elevationTimeoutMs } = {}) {
   const windowsUser = currentWindowsUser();
   const script = taskSchedulerScript(distro, user, windowsUser);
   console.log('Registering logon task...');
-  const result = captureResult('powershell.exe', [
+  const result = captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
   ], { encoding: 'utf8', windowsHide: true });
   if (result.status === 0) {
@@ -529,7 +499,7 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs } = {}) 
   }
 
   const script = `Get-ScheduledTask -TaskName ${powershellLiteral(SERVICE_NAME)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
-  const taskRemoval = captureResult('powershell.exe', [
+  const taskRemoval = captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
   ], { encoding: 'utf8', windowsHide: true });
   if (taskRemoval.status !== 0 && isAccessDenied(taskRemoval)) {

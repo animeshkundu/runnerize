@@ -76,9 +76,8 @@ other Windows host: it serves Linux-container jobs via WSL podman.
 1. It first registers a hidden, per-user Task Scheduler task without elevation. The
    task starts the WSL systemd user service at logon and restarts on failure.
 2. If registration is access-denied, it requests one UAC approval and registers the
-   same task elevated. A declined prompt fails immediately. After approval, runnerize
-   polls a result marker for at most 55 seconds; Windows itself controls how long an
-   unanswered UAC prompt remains open.
+   same task elevated. The prompt and elevated command share a 55-second timeout;
+   success or failure is reported through the elevated process exit code.
 3. If elevation is declined, unavailable, or times out, it writes a hidden
    `...\Start Menu\Programs\Startup\runnerize.vbs` launcher for the current user.
    This fallback starts only at login and cannot automatically restart after a crash.
@@ -92,7 +91,7 @@ $env:RUNNERIZE_NO_ELEVATE = '1'; runnerize service install
 ```
 
 Uninstall first removes the task without elevation. If an elevated task is
-access-denied, it uses the same UAC and post-approval marker flow unless elevation is disabled. When
+access-denied, it uses the same bounded UAC flow unless elevation is disabled. When
 removal cannot be elevated, it prints manual Task Scheduler instructions and still
 removes the Startup entry and WSL materialized files where present.
 
