@@ -216,8 +216,19 @@ export async function getUser({ signal } = {}) {
   return { login: data.login, type: data.type };
 }
 
+// Repos the operator never wants dispatched to, from RUNNERIZE_EXCLUDE_REPOS
+// (comma/whitespace-separated "owner/name", case-insensitive). Use it to keep a
+// long-running local dispatcher off repos whose self-hosted jobs are served
+// elsewhere — e.g. runnerize's own CI test repo, so the two don't race for a job.
+function excludedRepos() {
+  const raw = process.env.RUNNERIZE_EXCLUDE_REPOS;
+  if (!raw) return new Set();
+  return new Set(raw.split(/[\s,]+/).map((name) => name.trim().toLowerCase()).filter(Boolean));
+}
+
 export async function listOwnedPrivateRepos({ signal } = {}) {
   const me = await getUser({ signal });
+  const excluded = excludedRepos();
   const repos = await paginated(
     (page) => `/user/repos?affiliation=owner&per_page=100&page=${page}`,
     'owned-repos',
@@ -230,7 +241,8 @@ export async function listOwnedPrivateRepos({ signal } = {}) {
       && repo.owner?.login === me.login
       && repo.owner?.type === 'User'
       && repo.fork !== true
-      && repo.archived !== true)
+      && repo.archived !== true
+      && !excluded.has(repo.full_name?.toLowerCase()))
     .map(({ full_name, private: isPrivate, fork, archived }) => ({
       full_name,
       private: isPrivate,
