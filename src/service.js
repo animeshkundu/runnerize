@@ -282,7 +282,7 @@ function ensureWslNode({ distro, user, home }) {
     'rm -rf "$destination"',
     'mv "$staging" "$destination"',
   ].join('\n');
-  wslRun(distro, user, ['bash', '-c', script, 'runnerize-node-install', version, installDir, expectedHash.toLowerCase()]);
+  wslCapture(distro, user, ['bash', '-c', script, 'runnerize-node-install', version, installDir, expectedHash.toLowerCase()]);
   const verified = wslCapture(distro, user, [nodePath, '--version']);
   if (!validNodeVersion(verified)) throw new Error(`Installed Node at ${nodePath}, but version verification failed.`);
   return { path: nodePath, version: verified, downloaded: true };
