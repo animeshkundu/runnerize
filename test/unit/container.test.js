@@ -239,6 +239,15 @@ test('INNER_SCRIPT invariant: operates on a throwaway workdir, never the read-on
   assert.match(inner, /run\.sh --jitconfig "\$JITCFG"/, 'launches run.sh with the jit config from env');
 });
 
+test('mounted INNER_SCRIPT is readable by a non-owner container user', async () => {
+  const source = await readContainerSource();
+  assert.match(source, /chmod 644 "\$script"/, 'WSL script is world-readable');
+  assert.match(source, /writeFile\(mountedScript, INNER_SCRIPT, \{ mode: 0o644 \}\)/,
+    'native script is created world-readable');
+  assert.match(source, /chmod\(mountedScript, 0o644\)/,
+    'native script mode is not weakened by the host umask');
+});
+
 async function bashSupportsMvT() {
   // Requires POSIX bash, `mv -T`, and a filesystem that preserves the executable bit
   // (the staging script guards on `[[ -x run.sh ]]`). Git-bash on NTFS drops the bit,

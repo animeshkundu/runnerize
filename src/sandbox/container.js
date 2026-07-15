@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -131,7 +131,7 @@ async function createWslInnerScript(distro) {
 set -euo pipefail
 script="$(mktemp /tmp/runnerize-inner.XXXXXX)"
 printf '%s' "$1" | base64 -d > "$script"
-chmod 700 "$script"
+chmod 644 "$script"
 printf '%s' "$script"
 `, [encoded]);
   return stdout;
@@ -224,7 +224,8 @@ export const linux = {
     } else {
       temporary = await mkdtemp(path.join(os.tmpdir(), 'runnerize-'));
       mountedScript = path.join(temporary, 'inner.sh');
-      await writeFile(mountedScript, INNER_SCRIPT, { mode: 0o700 });
+      await writeFile(mountedScript, INNER_SCRIPT, { mode: 0o644 });
+      await chmod(mountedScript, 0o644);
       mountedRunner = runnerDir;
     }
 
