@@ -116,6 +116,7 @@ export async function runDispatcher({
 
   const semaphore = new Semaphore(maxConcurrent);
   const launches = new Set();
+  const activeByFlavor = new Map();
   const unassignedByFlavor = new Map();
   const unassignedByRepoFlavor = new Map();
   const repoBackoffUntil = new Map();
@@ -201,7 +202,13 @@ export async function runDispatcher({
 
         const demand = perRepo.reduce((sum, entry) => sum + entry.queued, 0);
         const unassigned = unassignedByFlavor.get(flavor.key) ?? 0;
-        const toMint = Math.max(0, Math.min(demand - unassigned, semaphore.free()));
+        const flavorCap = flavor.maxConcurrent ?? Infinity;
+        const flavorActive = activeByFlavor.get(flavor.key) ?? 0;
+        const toMint = Math.max(0, Math.min(
+          demand - unassigned,
+          semaphore.free(),
+          flavorCap - flavorActive,
+        ));
         log('demand_counted', { flavor: flavor.key, demand, unassigned, toMint });
 
         for (let minted = 0; minted < toMint && !signal?.aborted; minted += 1) {
@@ -219,6 +226,7 @@ export async function runDispatcher({
 
           semaphore.acquire();
           incrementUnassigned(target.repo, flavor.key);
+          activeByFlavor.set(flavor.key, (activeByFlavor.get(flavor.key) ?? 0) + 1);
 
           let launchPromise;
           launchPromise = (async () => {
@@ -278,6 +286,9 @@ export async function runDispatcher({
               });
             } finally {
               decrementUnassignedOnce();
+              const flavorActive = Math.max(0, (activeByFlavor.get(flavor.key) ?? 1) - 1);
+              if (flavorActive === 0) activeByFlavor.delete(flavor.key);
+              else activeByFlavor.set(flavor.key, flavorActive);
               semaphore.release();
               launches.delete(launchPromise);
             }

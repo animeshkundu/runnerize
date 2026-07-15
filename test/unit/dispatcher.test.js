@@ -102,6 +102,44 @@ test('mints toMint = min(demand - unassigned, free): capped by the semaphore', a
   });
 });
 
+test('per-flavor cap remains held after assignment until the launch exits', async () => {
+  const flavor = new FakeFlavor({ maxConcurrent: 1 });
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  await runSession({
+    flavor,
+    options: { maxConcurrent: 4 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/windows', private: true }],
+      runs: { 'me/windows': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: Array.from({ length: 3 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+    },
+  }, async ({ start, flavor }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 1), 'the first runner launches');
+    await tick(120);
+    assert.equal(flavor.launches.length, 1, 'assignment does not free the flavor slot');
+  });
+});
+
+test('a flavor without maxConcurrent remains limited only by the global semaphore', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  await runSession({
+    flavor,
+    options: { maxConcurrent: 3 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/uncapped', private: true }],
+      runs: { 'me/uncapped': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: Array.from({ length: 3 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+    },
+  }, async ({ start, flavor }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 3), 'all global slots remain usable');
+  });
+});
+
 test('is count-based, never job-pinned: mints one runner per unit of demand, no job id in the request', async () => {
   const flavor = new FakeFlavor();
   flavor.behavior = holdingBehavior();

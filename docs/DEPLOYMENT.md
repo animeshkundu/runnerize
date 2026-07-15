@@ -13,12 +13,10 @@ flavor it offers, it mints an **ephemeral just-in-time runner**, runs that one j
 inside a **throwaway rootless container**, then destroys everything. Nothing is
 pre-registered; nothing persists between jobs.
 
-**Only the `linux` flavor is implemented.** It mints runners labelled
-`[self-hosted, linux, x64]` and runs jobs in a rootless **podman/docker** container.
-The `windows` (Windows Sandbox) and `macos` (tart VM) flavors are **stubs** —
-`src/sandbox/windows.js` and `src/sandbox/macos.js` exist but their `launch()`
-throws. So on *every* host today, runnerize serves **Linux-container jobs only**.
-Native Windows/macOS execution is a TODO (see "Enabling native flavors" below).
+The `linux` flavor mints runners labelled `[self-hosted, linux, x64]` and runs
+jobs in rootless **podman/docker** containers. On Windows 11 24H2+, the native
+`windows` flavor uses Windows Sandbox for disposable `[self-hosted, windows,
+x64]` runners. The `macos` (tart VM) flavor remains a stub.
 
 ## Prerequisites (any host)
 
@@ -59,7 +57,7 @@ Flags: `--max <n>` (concurrent runners, default 4), `--interval <ms>` (poll, def
 
 ## Windows host
 
-Two sub-cases; both run the **linux** flavor (Windows Sandbox is a stub).
+A Windows host can serve Linux jobs through WSL and native Windows jobs through Windows Sandbox.
 
 ### Runtime
 - Install **WSL2** with a distro, and **rootless podman inside WSL**
@@ -71,11 +69,20 @@ Two sub-cases; both run the **linux** flavor (Windows Sandbox is a stub).
   `MSYS2_ARG_CONV_EXCL='*'` so bash does not mangle WSL paths. (Not needed when
   Node is launched directly, e.g. from Task Scheduler or a Startup launcher.)
 
-### "Windows Sandbox enabled"
-Enabling the *Windows Sandbox* optional feature does **not** yet get you native
-Windows jobs — `windows.js.launch()` throws. It only matters once that backend is
-implemented. Until then a Sandbox-enabled Windows host behaves exactly like any
-other Windows host: it serves Linux-container jobs via WSL podman.
+### Native Windows jobs with Windows Sandbox
+
+The native `windows` flavor requires Windows 11 24H2 (build 26100+) with the
+Windows Sandbox optional feature enabled and `wsb.exe` available on PATH. A repo
+opts in with:
+
+```yaml
+runs-on: [self-hosted, windows, x64]
+```
+
+Windows Sandbox permits only one active instance, so runnerize runs at most one
+Windows job at a time on each host even when `--max` is higher. Every job gets a
+fresh sandbox that is stopped after the runner exits. Nested virtualization is not
+available inside Windows Sandbox, so Windows jobs cannot use Docker-in-Docker.
 
 ### Boot persistence on Windows
 
@@ -149,20 +156,17 @@ runnerize only claims a job when the job's `runs-on:` labels are a **subset** of
    `runnerize remove` once it's offline) so it stops competing for jobs.
 
 A **Windows** persistent runner (e.g. `runs-on: [self-hosted, Windows, X64, local]`)
-cannot move to runnerize until the job is made Linux-compatible *or* the native
-`windows` flavor is implemented — runnerize offers no Windows flavor today.
+can move to runnerize by dropping its custom label and using
+`runs-on: [self-hosted, windows, x64]` on a Windows Sandbox-capable host.
 
 ---
 
-## Enabling native flavors (future work)
+## Enabling native flavors
 
-- **Windows Sandbox** (`src/sandbox/windows.js`): implement `launch()` to generate a
-  one-job `.wsb` that copies in and runs an ephemeral JIT-configured runner in a
-  disposable Windows Sandbox, then have `available()` gate on the Sandbox feature.
-- **macOS / tart** (`src/sandbox/macos.js`): implement `launch()` to clone and boot a
+- **Windows Sandbox** (`src/sandbox/windows.js`) is implemented on Windows 11 24H2+
+  as described above. `available()` enables it automatically when `wsb.exe` responds.
+- **macOS / tart** (`src/sandbox/macos.js`) remains future work: clone and boot a
   throwaway `tart` VM for exactly one JIT-configured job (Apple hardware only).
-
-Both are marked `TODO` in the source and currently throw from `launch()`.
 
 ## Current live host (as of this handoff)
 
