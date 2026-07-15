@@ -33,6 +33,23 @@ function capture(command, args, options = {}) {
   return execFileSync(command, args, { encoding: 'utf8', windowsHide: true, ...options }).trim();
 }
 
+function captureResult(command, args, options = {}) {
+  try {
+    return {
+      status: 0,
+      stdout: execFileSync(command, args, { encoding: 'utf8', windowsHide: true, ...options }),
+      stderr: '',
+    };
+  } catch (error) {
+    return {
+      status: error.status ?? 1,
+      stdout: String(error.stdout ?? ''),
+      stderr: String(error.stderr ?? ''),
+      error,
+    };
+  }
+}
+
 function commandExists(command) {
   const probe = platform() === 'win32'
     ? spawnSync('where.exe', [command], { stdio: 'ignore' })
@@ -392,7 +409,7 @@ async function runElevated(operation, command) {
 
   try {
     const launchCommand = `Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',${powershellLiteral(`"${paths.script}"`)})`;
-    const launched = spawnSync('powershell.exe', [
+    const launched = captureResult('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', launchCommand,
     ], { encoding: 'utf8', windowsHide: true });
     if (launched.status !== 0 || launched.error) {
@@ -419,7 +436,7 @@ async function installLogonTrigger(distro, user, { noElevate = false } = {}) {
   const windowsUser = currentWindowsUser();
   const script = taskSchedulerScript(distro, user, windowsUser);
   console.log('Registering logon task...');
-  const result = spawnSync('powershell.exe', [
+  const result = captureResult('powershell.exe', [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
   ], { encoding: 'utf8', windowsHide: true });
   if (result.status === 0) {
@@ -500,7 +517,7 @@ async function uninstallWindows({ noElevate = false } = {}) {
   }
 
   const script = `Get-ScheduledTask -TaskName ${powershellLiteral(SERVICE_NAME)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
-  const taskRemoval = spawnSync('powershell.exe', [
+  const taskRemoval = captureResult('powershell.exe', [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
   ], { encoding: 'utf8', windowsHide: true });
   if (taskRemoval.status !== 0 && isAccessDenied(taskRemoval)) {

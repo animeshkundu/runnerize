@@ -31,6 +31,33 @@ function successfulHarness(options = {}) {
   let cachedNodeChecks = 0;
   const exec = (file, args, execOptions = {}) => {
     calls.push({ kind: 'exec', file, args, options: execOptions });
+    if (file === 'powershell.exe') {
+      const command = args.at(-1);
+      const elevatedLaunch = command.includes('Start-Process powershell.exe -Verb RunAs');
+      const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
+      if ((options.accessDenied && !elevatedLaunch) || (options.uninstallAccessDenied && unregister)) {
+        const error = new Error('Access is denied');
+        error.status = 1;
+        error.stderr = 'Access is denied';
+        error.stdout = '';
+        throw error;
+      }
+      if (elevatedLaunch) {
+        if (options.elevationDeclined) {
+          const error = new Error('The operation was canceled by the user. (1223)');
+          error.status = 1;
+          error.stderr = 'The operation was canceled by the user. (1223)';
+          error.stdout = '';
+          throw error;
+        }
+        const markerMatch = command.match(/-File','([^']+)'/);
+        assert.ok(markerMatch, 'elevated script path included');
+        const scriptPath = markerMatch[1].replace(/^"|"$/g, '');
+        const markerPath = scriptPath.replace(/elevate-(install|uninstall)\.ps1$/, 'elevate-$1-result.txt');
+        writeFileSync(markerPath, options.elevationError ?? 'OK');
+      }
+      return '';
+    }
     if (file !== 'wsl.exe') return '';
     if (args[0] === '--status') return options.status ?? 'Default Distribution: Ubuntu\r\n';
     if (args[0] === '-l') return options.distros ?? 'docker-desktop\0\r\nUbuntu\0\r\n';
@@ -65,23 +92,6 @@ function successfulHarness(options = {}) {
   const spawn = (file, args, spawnOptions = {}) => {
     calls.push({ kind: 'spawn', file, args, options: spawnOptions });
     if (file === 'whoami.exe') return { status: 0, stdout: 'DESKTOP\\ani\n', stderr: '' };
-    if (file === 'powershell.exe') {
-      const command = args.at(-1);
-      const elevatedLaunch = command.includes('Start-Process powershell.exe -Verb RunAs');
-      const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
-      if ((options.accessDenied && !elevatedLaunch) || (options.uninstallAccessDenied && unregister)) {
-        return { status: 1, stdout: '', stderr: 'Access is denied' };
-      }
-      if (elevatedLaunch) {
-        if (options.elevationDeclined) return { status: 1, stdout: '', stderr: 'The operation was canceled by the user. (1223)' };
-        const markerMatch = command.match(/-File','([^']+)'/);
-        assert.ok(markerMatch, 'elevated script path included');
-        const scriptPath = markerMatch[1].replace(/^"|"$/g, '');
-        const markerPath = scriptPath.replace(/elevate-(install|uninstall)\.ps1$/, 'elevate-$1-result.txt');
-        writeFileSync(markerPath, options.elevationError ?? 'OK');
-      }
-      return { status: 0, stdout: '', stderr: '' };
-    }
     return { status: 0, stdout: '', stderr: '' };
   };
   return { calls, exec, spawn };
@@ -136,6 +146,9 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     }));
     assert.ok(harness.calls.some((call) => commandOf(call).includes('enable-linger')));
     const task = harness.calls.find((call) => call.file === 'powershell.exe');
+    assert.equal(task.kind, 'exec', 'task registration output is captured and drained');
+    assert.equal(task.options.encoding, 'utf8');
+    assert.equal(task.options.windowsHide, true);
     assert.match(task.args.at(-1), /New-ScheduledTaskTrigger -AtLogOn/);
     assert.match(task.args.at(-1), /-d "Ubuntu" -u "ani"/);
     assert.match(task.args.at(-1), /systemctl --user start runnerize/);
@@ -216,6 +229,7 @@ test('Windows install uses Tier 1 Task Scheduler without elevation when registra
     await service.installService();
     const powershell = harness.calls.filter((call) => call.file === 'powershell.exe');
     assert.equal(powershell.length, 1);
+    assert.equal(powershell[0].kind, 'exec');
     assert.doesNotMatch(powershell[0].args.at(-1), /Start-Process/);
   });
 });
@@ -225,6 +239,9 @@ test('Windows install elevates Task Scheduler registration after Tier 1 access d
     await service.installService();
     const elevated = harness.calls.find((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('Start-Process'));
     assert.ok(elevated, 'UAC elevation attempted');
+    assert.equal(elevated.kind, 'exec', 'elevation launcher output is captured and drained');
+    assert.equal(elevated.options.encoding, 'utf8');
+    assert.equal(elevated.options.windowsHide, true);
     assert.doesNotMatch(elevated.args.at(-1), /-Wait/);
     assert.equal(existsSync(join(appData, 'elevate-install.ps1')), false, 'temporary elevation script cleaned up');
   });
@@ -260,6 +277,7 @@ test('Windows uninstall elevates task removal after non-elevated access denied',
     await service.uninstallService();
     const elevated = harness.calls.find((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('Start-Process'));
     assert.ok(elevated, 'elevated task removal attempted');
+    assert.equal(elevated.kind, 'exec', 'elevated removal output is captured and drained');
     assert.match(elevated.args.at(-1), /elevate-uninstall\.ps1/);
     assert.equal(existsSync(join(appData, 'elevate-uninstall.ps1')), false);
   });
