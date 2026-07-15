@@ -3,7 +3,7 @@
 This is the operational handoff for running the runnerize dispatcher on a machine
 so your private-repo CI runs on your own hardware. It covers the current live host,
 and how to bring up a fresh **Windows** or **macOS** host and pick up where this
-left off.
+left off. For a fast Windows setup, see [QUICKSTART-windows.md](QUICKSTART-windows.md).
 
 ## How runnerize works (the one thing to internalize)
 
