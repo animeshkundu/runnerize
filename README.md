@@ -34,6 +34,8 @@ dispatcher (one always-on process)
 
 ## Usage
 
+For a fresh Windows 11 setup, see [docs/QUICKSTART-windows.md](docs/QUICKSTART-windows.md).
+
 ```bash
 # from a checkout:
 node bin/runnerize.js run          # start the dispatcher (foreground)
