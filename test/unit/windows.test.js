@@ -105,6 +105,89 @@ test('windows.launch observes a job, calls onStarted once, and stops the sandbox
   });
 });
 
+test('windows.launch detects a job-start line split across log reads', async () => {
+  await withWindowsLaunch(async (windows) => {
+    let started = 0;
+    const stub = new SpawnStub((child) => {
+      if (child.args.includes('start')) {
+        const controlDir = controlDirFromStart(child);
+        void writeFile(path.join(controlDir, 'runner.log'), 'Running ').then(() => {
+          setTimeout(() => { void writeFile(path.join(controlDir, 'runner.log'), 'Running job: build\n'); }, 40);
+          setTimeout(() => { void writeFile(path.join(controlDir, 'runner.done'), '0\n'); }, 180);
+          child.close(0);
+        });
+      } else if (child.args.includes('list')) {
+        child.emitStdout('{"WindowsSandboxEnvironments":[]}');
+        child.close(0);
+      } else child.close(0);
+    }).install();
+    try {
+      const result = await withKeepAlive(windows.launch('cfg', {
+        idleTimeoutMs: 1000,
+        onStarted: () => { started += 1; },
+      }));
+      assert.deepEqual(result, { startedJob: true });
+      assert.equal(started, 1);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('windows.launch resolves after a post-start sandbox exit without runner.done', async () => {
+  await withWindowsLaunch(async (windows) => {
+    let sandboxId;
+    const stub = new SpawnStub((child) => {
+      if (child.args.includes('start')) {
+        sandboxId = child.args[child.args.indexOf('--id') + 1];
+        const controlDir = controlDirFromStart(child);
+        void writeFile(path.join(controlDir, 'runner.log'), 'Running job: build\n').then(() => child.close(0));
+      } else if (child.args.includes('list')) {
+        child.emitStdout('{"WindowsSandboxEnvironments":[]}');
+        child.close(0);
+      } else child.close(0);
+    }).install();
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => { now += 6000; return now; };
+    try {
+      const result = await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 20_000 }));
+      assert.deepEqual(result, { startedJob: true });
+      assert.ok(sandboxId, 'the sandbox started before its liveness was checked');
+    } finally {
+      Date.now = realNow;
+      stub.restore();
+    }
+  });
+});
+
+test('windows.launch stop polling normalizes IDs and waits for a lingering sandbox', async () => {
+  await withWindowsLaunch(async (windows) => {
+    let sandboxId;
+    let listCalls = 0;
+    const stub = new SpawnStub((child) => {
+      if (child.args.includes('start')) {
+        sandboxId = child.args[child.args.indexOf('--id') + 1];
+        child.close(0);
+      } else if (child.args.includes('list')) {
+        listCalls += 1;
+        const environments = listCalls < 3
+          ? [{ Id: `{${sandboxId.toUpperCase()}}` }]
+          : [];
+        child.emitStdout(JSON.stringify({ WindowsSandboxEnvironments: environments }));
+        child.close(0);
+      } else child.close(0);
+    }).install();
+    try {
+      const result = await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 30 }));
+      assert.deepEqual(result, { startedJob: false });
+      assert.equal(listCalls, 3, 'polls until the normalized sandbox ID disappears');
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
 test('windows.launch times out before assignment and stops the sandbox', async () => {
   await withWindowsLaunch(async (windows) => {
     const stub = new SpawnStub((child) => {

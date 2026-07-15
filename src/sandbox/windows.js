@@ -9,6 +9,7 @@ const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 const WSB_TIMEOUT_MS = 60_000;
 const STOP_TIMEOUT_MS = 10_000;
 const LOG_POLL_MS = 100;
+const SANDBOX_LIVENESS_POLL_MS = 5_000;
 
 function collect(command, args, { timeoutMs = WSB_TIMEOUT_MS, ...options } = {}) {
   return new Promise((resolve, reject) => {
@@ -90,35 +91,52 @@ function isJobStartLine(line) {
   return /\bRunning job(?:\s*:|\b)|\bJob\s+.+?\s+(?:started|running)\b/i.test(line);
 }
 
-async function runningSandboxIds() {
-  const { stdout } = await collect('wsb.exe', ['list', '--raw'], { timeoutMs: STOP_TIMEOUT_MS });
+function normalizeSandboxId(id) {
+  return String(id).trim().replace(/^\{(.*)\}$/, '$1').toLowerCase();
+}
+
+async function runningSandboxIds({ timeoutMs = STOP_TIMEOUT_MS } = {}) {
+  const { stdout } = await collect('wsb.exe', ['list', '--raw'], { timeoutMs });
   const parsed = JSON.parse(stdout);
-  return (parsed.WindowsSandboxEnvironments ?? []).map(({ Id }) => Id);
+  return (parsed.WindowsSandboxEnvironments ?? []).map(({ Id }) => normalizeSandboxId(Id));
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    timer.unref?.();
+  });
 }
 
 async function stopSandbox(id) {
-  let stopError;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await collect('wsb.exe', ['stop', '--id', id], { timeoutMs: STOP_TIMEOUT_MS });
-    } catch (error) {
-      stopError = error;
-    }
-    try {
-      if (!(await runningSandboxIds()).includes(id)) return;
-    } catch (error) {
-      stopError = error;
-    }
+  const normalizedId = normalizeSandboxId(id);
+  let lastError;
+  try {
+    await collect('wsb.exe', ['stop', '--id', id], { timeoutMs: STOP_TIMEOUT_MS });
+  } catch (error) {
+    lastError = error;
   }
-  throw stopError ?? new Error(`Windows Sandbox ${id} did not stop`);
+
+  const deadline = Date.now() + STOP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const remaining = Math.max(1, deadline - Date.now());
+      if (!(await runningSandboxIds({ timeoutMs: remaining })).includes(normalizedId)) return;
+      lastError = undefined;
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(Math.min(LOG_POLL_MS, Math.max(1, deadline - Date.now())));
+  }
+  throw lastError ?? new Error(`Windows Sandbox ${id} did not stop`);
 }
 
-async function observeRunner(controlDir, idleTimeoutMs, onStarted) {
+async function observeRunner(sandboxId, controlDir, idleTimeoutMs, onStarted) {
   const logFile = path.join(controlDir, 'runner.log');
   const doneFile = path.join(controlDir, 'runner.done');
   const deadline = Date.now() + idleTimeoutMs;
+  let nextLivenessCheck = Date.now() + SANDBOX_LIVENESS_POLL_MS;
   let startedJob = false;
-  let observedLength = 0;
 
   while (true) {
     let log = '';
@@ -127,13 +145,9 @@ async function observeRunner(controlDir, idleTimeoutMs, onStarted) {
     } catch {
       // The mapped log is not visible until the wrapper creates it.
     }
-    if (log.length > observedLength) {
-      const added = log.slice(observedLength);
-      observedLength = log.length;
-      if (!startedJob && added.split(/\r?\n/).some(isJobStartLine)) {
-        startedJob = true;
-        onStarted?.();
-      }
+    if (!startedJob && log.split(/\r?\n/).some(isJobStartLine)) {
+      startedJob = true;
+      onStarted?.();
     }
 
     try {
@@ -143,11 +157,18 @@ async function observeRunner(controlDir, idleTimeoutMs, onStarted) {
       // The wrapper is still running.
     }
 
-    if (!startedJob && Date.now() >= deadline) return { startedJob: false };
-    await new Promise((resolve) => {
-      const timer = setTimeout(resolve, LOG_POLL_MS);
-      timer.unref?.();
-    });
+    const now = Date.now();
+    if (!startedJob && now >= deadline) return { startedJob: false };
+    if (now >= nextLivenessCheck) {
+      try {
+        const ids = await runningSandboxIds();
+        if (!ids.includes(normalizeSandboxId(sandboxId))) return { startedJob };
+      } catch {
+        // A transient list failure must not terminate a live runner.
+      }
+      nextLivenessCheck = Date.now() + SANDBOX_LIVENESS_POLL_MS;
+    }
+    await delay(LOG_POLL_MS);
   }
 }
 
@@ -185,7 +206,7 @@ export const windows = {
       await writeFile(path.join(controlDir, 'runner.log'), '', { mode: 0o600 });
       const config = sandboxConfig(runnerDir, controlDir);
       await collect('wsb.exe', ['start', '--id', sandboxId, '--config', config]);
-      return await observeRunner(controlDir, idleTimeoutMs, onStarted);
+      return await observeRunner(sandboxId, controlDir, idleTimeoutMs, onStarted);
     } finally {
       try {
         await stopSandbox(sandboxId);
