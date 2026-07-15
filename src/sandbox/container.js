@@ -5,7 +5,10 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ensureImage, ensureRunnerBinary } from '../runner.js';
 
-const DEFAULT_IMAGE = 'catthehacker/ubuntu:full-latest';
+// Fully qualified so rootless podman resolves it without needing an
+// unqualified-search-registries entry in registries.conf (podman errors 125 on a
+// bare short name; docker is lenient, so this stays correct there too).
+const DEFAULT_IMAGE = 'docker.io/catthehacker/ubuntu:full-latest';
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const KILL_GRACE_MS = 1_000;
