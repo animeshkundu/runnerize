@@ -8,7 +8,7 @@ must not break see [`../AGENTS.md`](../AGENTS.md).
 
 | | Requirement |
 |---|---|
-| Runtime | **Node.js ≥ 18** (built-in `fetch`; no npm deps to install) |
+| Runtime | **Node.js ≥ 20** (built-in `fetch`; no npm deps to install) |
 | Container runtime (linux flavor) | `podman` (preferred) or `docker` |
 | Token | `$GH_TOKEN` / `$GITHUB_TOKEN`, or a logged-in `gh` CLI |
 

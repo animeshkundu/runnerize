@@ -11,7 +11,7 @@ quick-start.
 
 You need:
 
-- **Node.js ≥ 18** (runnerize uses the built-in `fetch`; there are no npm deps to
+- **Node.js ≥ 20** (runnerize uses the built-in `fetch`; there are no npm deps to
   install, so `npm install` does effectively nothing but is harmless).
 - For anything touching the `linux` sandbox: a container runtime — **`podman`**
   (preferred) or **`docker`** — native on Linux, or inside a **WSL2** distro on

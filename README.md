@@ -25,7 +25,7 @@ dispatcher (one always-on process)
 
 ## Requirements
 
-- **Node.js ≥ 18** (uses built-in `fetch`; zero npm dependencies).
+- **Node.js ≥ 20** (uses built-in `fetch`; zero npm dependencies).
 - A **container runtime** for the default linux flavor:
   - **Linux:** `podman` (preferred) or `docker`, native.
   - **Windows:** WSL2 with `podman`/`docker` inside a distro (no Docker Desktop needed).

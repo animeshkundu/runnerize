@@ -5,8 +5,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVICE_NAME = 'runnerize';
-const DEFAULT_WSL_NODE_VERSION = 'v20.18.1';
-const DEFAULT_WSL_NODE_SHA256 = 'c6fa75c841cbffac851678a472f2a5bd612fff8308ef39236190e1f8dbb0e567';
+const DEFAULT_WSL_NODE_VERSION = 'v24.18.0';
+const DEFAULT_WSL_NODE_SHA256 = '55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742';
 const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
 const packageRoot = dirname(dirname(binPath));
 
@@ -233,7 +233,7 @@ function validNodeVersion(output) {
 
 function ensureWslNode({ distro, user, home }) {
   const requestedVersion = process.env.RUNNERIZE_WSL_NODE_VERSION || DEFAULT_WSL_NODE_VERSION;
-  if (!/^v\d+\.\d+\.\d+$/.test(requestedVersion)) throw new Error('RUNNERIZE_WSL_NODE_VERSION must look like v20.18.1.');
+  if (!/^v\d+\.\d+\.\d+$/.test(requestedVersion)) throw new Error('RUNNERIZE_WSL_NODE_VERSION must look like v24.18.0.');
   const installDir = `${home}/.cache/runnerize/node/${requestedVersion}`;
   const cachedNodePath = `${installDir}/bin/node`;
   try {
@@ -256,7 +256,7 @@ function ensureWslNode({ distro, user, home }) {
   }
 
   const version = requestedVersion;
-  if (!/^v\d+\.\d+\.\d+$/.test(version)) throw new Error('RUNNERIZE_WSL_NODE_VERSION must look like v20.18.1.');
+  if (!/^v\d+\.\d+\.\d+$/.test(version)) throw new Error('RUNNERIZE_WSL_NODE_VERSION must look like v24.18.0.');
   const expectedHash = version === DEFAULT_WSL_NODE_VERSION
     ? DEFAULT_WSL_NODE_SHA256
     : process.env.RUNNERIZE_WSL_NODE_SHA256;

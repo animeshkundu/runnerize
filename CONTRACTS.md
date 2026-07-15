@@ -1,6 +1,6 @@
 # runnerize — frozen build contracts (v0.1)
 
-Zero-dependency **Node ESM** (`type:module`, Node ≥18). No npm deps — use built-in `fetch`, `node:crypto`, `node:child_process`, `node:fs`, `node:os`, `node:readline`, `node:util`. Wraps the official `actions/runner` via **JIT** runners. Architecture: one always-on **dispatcher** + ephemeral one-job runners in throwaway sandboxes. **COUNT-BASED, never job-pinned.**
+Zero-dependency **Node ESM** (`type:module`, Node ≥20). No npm deps — use built-in `fetch`, `node:crypto`, `node:child_process`, `node:fs`, `node:os`, `node:readline`, `node:util`. Wraps the official `actions/runner` via **JIT** runners. Architecture: one always-on **dispatcher** + ephemeral one-job runners in throwaway sandboxes. **COUNT-BASED, never job-pinned.**
 
 These contracts are FROZEN. Implement to these signatures exactly so modules integrate. Do not invent new cross-module APIs.
 
