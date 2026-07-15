@@ -232,6 +232,19 @@ function validNodeVersion(output) {
 }
 
 function ensureWslNode({ distro, user, home }) {
+  const requestedVersion = process.env.RUNNERIZE_WSL_NODE_VERSION || DEFAULT_WSL_NODE_VERSION;
+  if (!/^v\d+\.\d+\.\d+$/.test(requestedVersion)) throw new Error('RUNNERIZE_WSL_NODE_VERSION must look like v20.18.1.');
+  const installDir = `${home}/.cache/runnerize/node/${requestedVersion}`;
+  const cachedNodePath = `${installDir}/bin/node`;
+  try {
+    const cachedVersion = wslCapture(distro, user, [cachedNodePath, '--version']);
+    if (cachedVersion === requestedVersion && validNodeVersion(cachedVersion)) {
+      return { path: cachedNodePath, version: cachedVersion, downloaded: false };
+    }
+  } catch {
+    // Fall through to PATH probing or installation.
+  }
+
   try {
     const output = wslCapture(distro, user, ['sh', '-c', 'command -v node && node --version']);
     const lines = output.split('\n').map((line) => line.trim()).filter(Boolean);
@@ -242,7 +255,7 @@ function ensureWslNode({ distro, user, home }) {
     // Install the pinned runnerize-owned Node below.
   }
 
-  const version = process.env.RUNNERIZE_WSL_NODE_VERSION || DEFAULT_WSL_NODE_VERSION;
+  const version = requestedVersion;
   if (!/^v\d+\.\d+\.\d+$/.test(version)) throw new Error('RUNNERIZE_WSL_NODE_VERSION must look like v20.18.1.');
   const expectedHash = version === DEFAULT_WSL_NODE_VERSION
     ? DEFAULT_WSL_NODE_SHA256
@@ -250,8 +263,7 @@ function ensureWslNode({ distro, user, home }) {
   if (!/^[a-fA-F0-9]{64}$/.test(expectedHash || '')) {
     throw new Error('Custom RUNNERIZE_WSL_NODE_VERSION requires RUNNERIZE_WSL_NODE_SHA256.');
   }
-  const installDir = `${home}/.cache/runnerize/node/${version}`;
-  const nodePath = `${installDir}/bin/node`;
+  const nodePath = cachedNodePath;
   const script = [
     'set -eu',
     'version="$1"',

@@ -28,6 +28,7 @@ function installStubs({ exec, spawn }) {
 
 function successfulHarness(options = {}) {
   const calls = [];
+  let cachedNodeChecks = 0;
   const exec = (file, args, execOptions = {}) => {
     calls.push({ kind: 'exec', file, args, options: execOptions });
     if (file !== 'wsl.exe') return '';
@@ -54,7 +55,11 @@ function successfulHarness(options = {}) {
       return 'Logged in';
     }
     if (command[0] === 'wslpath') return '/mnt/c/Users/Ani/runnerize';
-    if (command[0]?.endsWith('/bin/node') && command[1] === '--version') return 'v20.18.1';
+    if (command[0]?.endsWith('/bin/node') && command[1] === '--version') {
+      cachedNodeChecks += 1;
+      if (options.cachedNode === false && cachedNodeChecks === 1) throw new Error('cached node missing');
+      return 'v20.18.1';
+    }
     return '';
   };
   const spawn = (file, args, spawnOptions = {}) => {
@@ -95,8 +100,8 @@ function commandOf(call) {
   return call.args.slice(call.args.indexOf('-e') + 1);
 }
 
-test('Windows install skips docker-desktop, reuses Linux Node, and delegates service install', async () => {
-  await withWindowsService({}, async (service, harness) => {
+test('Windows install skips docker-desktop, reuses PATH Node, and delegates service install', async () => {
+  await withWindowsService({ cachedNode: false }, async (service, harness) => {
     await service.installService();
     const whoami = harness.calls.find((call) => commandOf(call)[0] === 'whoami');
     assert.ok(whoami.args.includes('Ubuntu'));
@@ -127,8 +132,21 @@ test('Windows install fails when WSL GitHub auth and token are unavailable', asy
   });
 });
 
+test('Windows install reuses the cached Node without downloading on reinstall', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    assert.ok(harness.calls.some((call) => {
+      const command = commandOf(call);
+      return command[0] === '/home/ani/.cache/runnerize/node/v20.18.1/bin/node'
+        && command[1] === '--version';
+    }));
+    assert.ok(!harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
+    assert.ok(harness.calls.some((call) => commandOf(call).includes('/home/ani/.cache/runnerize/node/v20.18.1/bin/node')));
+  });
+});
+
 test('Windows install persists a Windows token and downloads pinned Node when absent', async () => {
-  await withWindowsService({ noGh: true, token: 'test-token', nodeAbsent: true }, async (service, harness) => {
+  await withWindowsService({ noGh: true, token: 'test-token', nodeAbsent: true, cachedNode: false }, async (service, harness) => {
     await service.installService();
     const tokenWrite = harness.calls.find((call) => {
       const command = commandOf(call);
@@ -146,7 +164,7 @@ test('Windows install persists a Windows token and downloads pinned Node when ab
 });
 
 test('Windows install downloads Node when PATH points to Node 16 even if its path says v20', async () => {
-  await withWindowsService({ nodeOutput: '/opt/node-v20/bin/node\nv16.20.2\n' }, async (service, harness) => {
+  await withWindowsService({ nodeOutput: '/opt/node-v20/bin/node\nv16.20.2\n', cachedNode: false }, async (service, harness) => {
     await service.installService();
     assert.ok(harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
   });
