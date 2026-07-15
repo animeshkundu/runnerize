@@ -70,19 +70,18 @@ implemented. Until then a Sandbox-enabled Windows host behaves exactly like any
 other Windows host: it serves Linux-container jobs via WSL podman.
 
 ### Boot persistence on Windows
-- **With admin:** `runnerize service install` uses **NSSM** (`nssm.exe` must be on
-  PATH). It registers an auto-start Windows service. You must also give the service
-  a credential (`nssm set runnerize AppEnvironmentExtra GH_TOKEN=...`) since a
-  service account has no `gh` keyring, and it must run as a user with WSL access.
-- **Without admin (corporate-locked host):** Task Scheduler and service creation are
-  elevation-gated (`schtasks /Create` -> "Access is denied"). Use the **user Startup
-  folder** instead (this is how the current live host is set up):
-  - `%LOCALAPPDATA%\runnerize\runnerize-launch.cmd` — cd to the checkout and run
-    `node bin\runnerize.js run --max 4`, appending to `runnerize.log`.
-  - `...\Start Menu\Programs\Startup\runnerize.vbs` — `WScript.Shell.Run` the .cmd
-    with window-style `0` (hidden) so it relaunches, console-free, at each logon.
-  - Ceiling: starts **at logon** (not before-login) and does **not** auto-restart on
-    crash. That is the realistic max without elevation on a managed machine.
+Run `runnerize service install`. It registers and immediately starts a hidden
+**Task Scheduler** task in the current user's interactive session, where WSL2 and
+the user's `gh auth token` credential are available. The task starts at logon and
+restarts the dispatcher after failures; no separate service manager or embedded
+token is required.
+
+If a locked-down host denies non-elevated Task Scheduler registration, installation
+automatically falls back to a hidden launcher in the **user Startup folder**. This
+fallback needs no admin access. Its ceiling is that it starts only at logon and does
+not automatically restart after a crash. In either case, logs are appended to
+`%LOCALAPPDATA%\runnerize\runnerize.log`; remove the installed persistence with
+`runnerize service uninstall`.
 
 ---
 

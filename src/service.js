@@ -107,34 +107,124 @@ function uninstallLaunchd() {
   console.log(`Removed ${agentPath}`);
 }
 
+function powershellLiteral(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function cmdQuoted(value) {
+  return `"${value.replaceAll('%', '%%')}"`;
+}
+
+function windowsPaths() {
+  const installDir = join(process.env.LOCALAPPDATA ?? homedir(), SERVICE_NAME);
+  const startupDir = join(
+    process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'),
+    'Microsoft',
+    'Windows',
+    'Start Menu',
+    'Programs',
+    'Startup',
+  );
+  return {
+    installDir,
+    launcherPath: join(installDir, 'runnerize-launch.cmd'),
+    logPath: join(installDir, 'runnerize.log'),
+    startupDir,
+    startupPath: join(startupDir, 'runnerize.vbs'),
+  };
+}
+
+function writeWindowsLauncher(paths) {
+  mkdirSync(paths.installDir, { recursive: true });
+  const repoPath = dirname(dirname(binPath));
+  writeFileSync(paths.launcherPath, `@echo off\r\ncd /d ${cmdQuoted(repoPath)}\r\n${cmdQuoted(process.execPath)} ${cmdQuoted(binPath)} run >> ${cmdQuoted(paths.logPath)} 2>&1\r\n`);
+}
+
+function currentWindowsUser() {
+  const result = spawnSync('whoami.exe', [], { encoding: 'utf8', windowsHide: true });
+  const detected = result.status === 0 ? result.stdout?.trim() : '';
+  if (detected) return detected;
+  const username = process.env.USERNAME;
+  if (!username) throw new Error('Unable to determine the current Windows user.');
+  return process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${username}` : username;
+}
+
+function taskSchedulerScript(launcherPath, user) {
+  const taskName = powershellLiteral(SERVICE_NAME);
+  const actionCommand = `& '${launcherPath.replaceAll("'", "''")}'; exit $LASTEXITCODE`;
+  const actionArguments = `-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "${actionCommand}"`;
+  return [
+    `$taskName = ${taskName}`,
+    `$user = ${powershellLiteral(user)}`,
+    `$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${powershellLiteral(actionArguments)}`,
+    '$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user',
+    '$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited',
+    '$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 10 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
+    'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false',
+    'Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null',
+    'Start-ScheduledTask -TaskName $taskName -ErrorAction Stop',
+  ].join('; ');
+}
+
+function isAccessDenied(result) {
+  const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}\n${result.error?.message ?? ''}`;
+  return /access (?:is )?denied|unauthorizedaccess|insufficient privilege|privilege.*not held|requires elevation|permission denied|0x80070005/i.test(output);
+}
+
+function writeStartupLauncher(paths) {
+  mkdirSync(paths.startupDir, { recursive: true });
+  const launcher = paths.launcherPath.replaceAll('"', '""');
+  writeFileSync(
+    paths.startupPath,
+    `CreateObject("WScript.Shell").Run """${launcher}""", 0, False\r\n`,
+  );
+}
+
 function installWindows() {
-  if (!commandExists('nssm.exe')) {
-    throw new Error(
-      'Windows service installation requires nssm.exe on PATH. Install NSSM, then rerun `runnerize service install`.',
-    );
+  const paths = windowsPaths();
+  writeWindowsLauncher(paths);
+
+  const user = currentWindowsUser();
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerScript(paths.launcherPath, user)],
+    { encoding: 'utf8', windowsHide: true },
+  );
+
+  if (result.status === 0) {
+    rmSync(paths.startupPath, { force: true });
+    console.log(`Installed and started Task Scheduler task ${SERVICE_NAME} for ${user}.`);
+    console.log(`Verify: Get-ScheduledTask -TaskName ${SERVICE_NAME}`);
+    console.log('Uninstall: runnerize service uninstall');
+    console.log(`Logs: ${paths.logPath}`);
+    return;
   }
 
-  const logDir = join(process.env.LOCALAPPDATA ?? homedir(), 'runnerize');
-  mkdirSync(logDir, { recursive: true });
-  spawnSync('nssm.exe', ['stop', SERVICE_NAME], { stdio: 'ignore' });
-  spawnSync('nssm.exe', ['remove', SERVICE_NAME, 'confirm'], { stdio: 'ignore' });
-  run('nssm.exe', ['install', SERVICE_NAME, process.execPath, `"${binPath}" run`]);
-  run('nssm.exe', ['set', SERVICE_NAME, 'Start', 'SERVICE_AUTO_START']);
-  run('nssm.exe', ['set', SERVICE_NAME, 'AppExit', 'Default', 'Restart']);
-  run('nssm.exe', ['set', SERVICE_NAME, 'AppStdout', join(logDir, 'runnerize.log')]);
-  run('nssm.exe', ['set', SERVICE_NAME, 'AppStderr', join(logDir, 'runnerize.log')]);
-  run('nssm.exe', ['start', SERVICE_NAME]);
-  console.log(`Installed and started Windows service ${SERVICE_NAME}.`);
-  console.log(`View status: sc.exe query ${SERVICE_NAME}`);
+  if (!isAccessDenied(result)) {
+    const detail = result.stderr?.trim() || result.stdout?.trim() || result.error?.message || `exit code ${result.status}`;
+    throw new Error(`Failed to register Task Scheduler task ${SERVICE_NAME}: ${detail}`);
+  }
+
+  writeStartupLauncher(paths);
+  console.log('Task Scheduler registration was denied; installed the user Startup-folder fallback.');
+  console.log('It starts at logon and does not automatically restart after a crash.');
+  console.log(`Verify: ${paths.startupPath}`);
+  console.log('Uninstall: runnerize service uninstall');
+  console.log(`Logs: ${paths.logPath}`);
 }
 
 function uninstallWindows() {
-  if (!commandExists('nssm.exe')) {
-    throw new Error('Uninstall requires nssm.exe on PATH (the same tool used to install the service).');
-  }
-  spawnSync('nssm.exe', ['stop', SERVICE_NAME], { stdio: 'inherit' });
-  run('nssm.exe', ['remove', SERVICE_NAME, 'confirm']);
-  console.log(`Removed Windows service ${SERVICE_NAME}.`);
+  const paths = windowsPaths();
+  const taskName = powershellLiteral(SERVICE_NAME);
+  const script = `Get-ScheduledTask -TaskName ${taskName} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false`;
+  spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    { stdio: 'ignore', windowsHide: true },
+  );
+  rmSync(paths.startupPath, { force: true });
+  rmSync(paths.launcherPath, { force: true });
+  console.log(`Removed Task Scheduler task and Startup launcher for ${SERVICE_NAME} (when present).`);
 }
 
 export async function installService() {
