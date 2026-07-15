@@ -80,6 +80,26 @@ test('listOwnedPrivateRepos filters to private, owned, User, non-fork, non-archi
   });
 });
 
+test('listOwnedPrivateRepos honors RUNNERIZE_EXCLUDE_REPOS (case-insensitive, comma/space)', async () => {
+  const prior = process.env.RUNNERIZE_EXCLUDE_REPOS;
+  process.env.RUNNERIZE_EXCLUDE_REPOS = 'Alice/KEEP2  alice/absent';
+  try {
+    await withGithub({
+      user: { login: 'alice', type: 'User' },
+      repos: [
+        { full_name: 'alice/keep', private: true },
+        { full_name: 'alice/keep2', private: true },
+      ],
+    }, async (gh) => {
+      const repos = await gh.listOwnedPrivateRepos();
+      assert.deepEqual(repos.map((r) => r.full_name), ['alice/keep'], 'excluded repo dropped case-insensitively');
+    });
+  } finally {
+    if (prior === undefined) delete process.env.RUNNERIZE_EXCLUDE_REPOS;
+    else process.env.RUNNERIZE_EXCLUDE_REPOS = prior;
+  }
+});
+
 test('listOwnedPrivateRepos paginates across 100-item pages', async () => {
   const repos = Array.from({ length: 150 }, (_, i) => ({ full_name: `alice/repo-${i}`, private: true }));
   await withGithub({ user: { login: 'alice', type: 'User' }, repos }, async (gh, stub) => {
