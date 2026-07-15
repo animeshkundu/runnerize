@@ -35,6 +35,22 @@ function successfulHarness(options = {}) {
       const command = args.at(-1);
       if (command.includes('WindowsIdentity]::GetCurrent().User.Value')) return 'S-1-5-21-1234\n';
       const elevatedLaunch = command.includes('Start-Process -FilePath');
+      const confirmation = command.includes('[Console]::Out.Write($task.Principal.UserId)');
+      if (confirmation) {
+        if (options.taskMissing) {
+          const error = new Error('task missing');
+          error.status = 1;
+          error.stdout = '';
+          error.stderr = '';
+          throw error;
+        }
+        if (options.taskStillPresent || !options.uninstallAccessDenied) return 'S-1-5-21-1234';
+        const error = new Error('task missing');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = '';
+        throw error;
+      }
       const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
       if ((options.accessDenied && !elevatedLaunch) || (options.uninstallAccessDenied && unregister)) {
         const error = new Error(options.localizedDenied ? 'Zugriff verweigert' : 'Access is denied');
@@ -46,6 +62,7 @@ function successfulHarness(options = {}) {
       if (elevatedLaunch) {
         assert.match(command, /-ErrorAction Stop/);
         assert.match(command, /-Wait -PassThru/);
+        assert.match(command, /\$null -eq \$p -or \$null -eq \$p\.ExitCode/);
         assert.match(command, /exit \$p\.ExitCode/);
         assert.match(command, /catch \{ Write-Error \$_; exit 1 \}/);
         const error = new Error(options.elevationDeclined
@@ -53,9 +70,9 @@ function successfulHarness(options = {}) {
           : options.elevationTimeout
             ? 'elevation prompt timed out'
             : 'elevated operation failed');
-        if (options.elevationDeclined || options.elevationError || options.elevationTimeout) {
-          error.status = options.elevationError ? 1 : null;
-          error.stderr = options.elevationError ? 'elevated operation failed' : '';
+        if (options.elevationDeclined || options.elevationError || options.elevationTimeout || options.nullExitCode) {
+          error.status = options.elevationError || options.nullExitCode ? 1 : null;
+          error.stderr = options.nullExitCode ? 'elevated process exit code unavailable' : options.elevationError ? 'elevated operation failed' : '';
           error.stdout = '';
           if (options.elevationTimeout) {
             error.code = 'ETIMEDOUT';
@@ -275,6 +292,21 @@ test('Windows install falls back promptly when elevation is declined', async () 
   });
 });
 
+test('Windows install falls back when the elevated exit code is unavailable', async () => {
+  await withWindowsService({ accessDenied: true, nullExitCode: true }, async (service, _harness, appData) => {
+    await service.installService();
+    assert.match(readFileSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs'), 'utf8'), /wsl\.exe/);
+  });
+});
+
+test('Windows install falls back when elevated success cannot be confirmed', async () => {
+  await withWindowsService({ accessDenied: true, taskMissing: true }, async (service, _harness, appData) => {
+    const startup = join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs');
+    await service.installService();
+    assert.match(readFileSync(startup, 'utf8'), /wsl\.exe/);
+  });
+});
+
 test('Windows install falls back when the elevated command exits nonzero', async () => {
   await withWindowsService({ accessDenied: true, elevationError: true }, async (service, _harness, appData) => {
     await service.installService();
@@ -325,6 +357,21 @@ test('Windows uninstall elevates task removal after non-elevated access denied',
     assert.match(elevated.args.at(-1), /-EncodedCommand/);
     assert.doesNotMatch(elevated.args.at(-1), /-File(?:\s|')/);
     assert.equal(existsSync(join(appData, 'runnerize')), false, 'elevated removal creates no marker files');
+  });
+});
+
+test('Windows uninstall warns when elevated removal cannot be confirmed', async () => {
+  await withWindowsService({ uninstallAccessDenied: true, taskStillPresent: true }, async (service, harness) => {
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (message) => warnings.push(message);
+    try {
+      await service.uninstallService();
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.ok(harness.calls.some((call) => call.args.at(-1)?.includes('[Console]::Out.Write($task.Principal.UserId)')));
+    assert.ok(warnings.some((message) => /removal could not be confirmed/.test(message)));
   });
 });
 

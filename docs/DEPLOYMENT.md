@@ -78,9 +78,12 @@ other Windows host: it serves Linux-container jobs via WSL podman.
 2. If registration is access-denied, it requests one UAC approval and registers the
    same task elevated. The prompt and elevated command share a 55-second timeout;
    success or failure is reported through the elevated process exit code.
-3. If elevation is declined, unavailable, or times out, it writes a hidden
-   `...\Start Menu\Programs\Startup\runnerize.vbs` launcher for the current user.
-   This fallback starts only at login and cannot automatically restart after a crash.
+3. If elevation is declined, unavailable, times out, or cannot be verified, it writes
+   a hidden `...\Start Menu\Programs\Startup\runnerize.vbs` launcher for the current
+   user. This fallback starts only at login and cannot automatically restart after a
+   crash. Approval at the timeout boundary can leave both triggers if the detached
+   elevated child finishes late; both only issue the idempotent `systemctl --user
+   start runnerize`, so the overlap is harmless.
 
 Pass `--no-elevate`, or set `RUNNERIZE_NO_ELEVATE` to any non-empty value, to skip
 Tier 2 for scripted installs and managed machines. Either setting is sufficient:

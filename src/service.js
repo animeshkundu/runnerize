@@ -400,18 +400,28 @@ async function runElevated(operation, command, { timeoutMs = ELEVATION_TIMEOUT_M
     '}',
   ].join('\r\n');
   const encodedCommand = Buffer.from(elevatedScript, 'utf16le').toString('base64');
-  const startProcess = `$p = Start-Process -FilePath ${powershellLiteral(powershellPath)} -Verb RunAs -Wait -PassThru -ErrorAction Stop -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',${powershellLiteral(encodedCommand)}); exit $p.ExitCode`;
+  const startProcess = `$p = Start-Process -FilePath ${powershellLiteral(powershellPath)} -Verb RunAs -Wait -PassThru -ErrorAction Stop -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',${powershellLiteral(encodedCommand)}); if ($null -eq $p -or $null -eq $p.ExitCode) { Write-Error 'elevated process exit code unavailable'; exit 1 }; exit $p.ExitCode`;
   const launchCommand = `try { ${startProcess} } catch { Write-Error $_; exit 1 }`;
   const launched = captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', launchCommand,
   ], { encoding: 'utf8', windowsHide: true, timeout: timeoutMs });
   if (launched.error?.code === 'ETIMEDOUT' || launched.error?.killed || launched.error?.signal) {
+    // If approval lands at the timeout boundary, Windows may let the detached elevated
+    // child finish after fallback. Both triggers only start the idempotent systemd unit.
     return { ok: false, reason: 'elevation prompt was not answered' };
   }
   if (launched.status !== 0 || launched.error) {
     return { ok: false, reason: launched.stderr?.trim() || launched.stdout?.trim() || launched.error?.message || `elevated ${operation} failed` };
   }
   return { ok: true };
+}
+
+function scheduledTaskPrincipal() {
+  const script = `$task = Get-ScheduledTask -TaskName ${powershellLiteral(SERVICE_NAME)} -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 1 }; [Console]::Out.Write($task.Principal.UserId)`;
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ]);
+  return result.status === 0 ? result.stdout.trim() : null;
 }
 
 async function installLogonTrigger(distro, user, { noElevate = false, elevationTimeoutMs } = {}) {
@@ -435,11 +445,16 @@ async function installLogonTrigger(distro, user, { noElevate = false, elevationT
     console.log('Task registration needs administrator access — requesting elevation (decline to use a login-only Startup entry)...');
     const elevated = await runElevated('install', script, { timeoutMs: elevationTimeoutMs });
     if (elevated.ok) {
-      rmSync(windowsStartupPath(), { force: true });
-      console.log('Registered auto-start task (elevated).');
-      return { kind: 'Task Scheduler (elevated)', detail: `task ${SERVICE_NAME} for ${windowsUser}` };
+      const principal = scheduledTaskPrincipal();
+      if (principal?.toLowerCase() === windowsUser.toLowerCase()) {
+        rmSync(windowsStartupPath(), { force: true });
+        console.log('Registered auto-start task (elevated).');
+        return { kind: 'Task Scheduler (elevated)', detail: `task ${SERVICE_NAME} for ${windowsUser}` };
+      }
+      console.warn(`Elevated task registration could not be confirmed${principal ? ` for ${windowsUser}` : ''}.`);
+    } else {
+      console.warn(`Elevated task registration did not complete: ${elevated.reason}`);
     }
-    console.warn(`Elevated task registration did not complete: ${elevated.reason}`);
   }
 
   console.log('Falling back to a Startup-folder entry (login-only, no auto-restart).');
@@ -510,8 +525,10 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs } = {}) 
       const elevated = await runElevated('uninstall', script, { timeoutMs: elevationTimeoutMs });
       if (!elevated.ok) {
         console.warn(`Could not remove the elevated ${SERVICE_NAME} task: ${elevated.reason}. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
-      } else {
+      } else if (scheduledTaskPrincipal() === null) {
         console.log('Removed auto-start task (elevated).');
+      } else {
+        console.warn(`Elevated ${SERVICE_NAME} task removal could not be confirmed. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
       }
     }
   } else if (taskRemoval.status !== 0) {
