@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const SERVICE_NAME = 'runnerize';
@@ -336,11 +337,12 @@ function windowsStartupPath() {
 }
 
 function currentWindowsUser() {
-  const result = spawnSync('whoami.exe', [], { encoding: 'utf8', windowsHide: true });
-  const detected = result.status === 0 ? result.stdout?.trim() : '';
-  if (detected) return detected;
-  if (!process.env.USERNAME) throw new Error('Unable to determine the current Windows user.');
-  return process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME;
+  const result = captureResult('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command', '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+  ]);
+  const sid = result.status === 0 ? result.stdout?.trim() : '';
+  if (sid) return sid;
+  throw new Error('Unable to determine the current Windows user SID.');
 }
 
 function windowsCommandLineArg(value) {
@@ -360,12 +362,17 @@ function taskSchedulerScript(distro, wslUser, windowsUser) {
     '$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user',
     '$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited',
     '$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 10 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
-    'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false',
+    'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop',
     'Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null',
   ].join('; ');
 }
 
+function taskSchedulerAttemptScript(command) {
+  return `$ErrorActionPreference = 'Stop'; try { ${command} } catch { $codes = @($_.Exception.HResult, $_.Exception.ErrorCode, $_.Exception.NativeErrorCode, $_.Exception.InnerException.HResult); if ($codes -contains -2147024891 -or $_.CategoryInfo.Category -eq 'PermissionDenied') { exit 77 }; throw }`;
+}
+
 function isAccessDenied(result) {
+  if (result.status === 77) return true;
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}\n${result.error?.message ?? ''}`;
   return /access (?:is )?denied|unauthorizedaccess|insufficient privilege|privilege.*not held|requires elevation|permission denied|0x80070005/i.test(output);
 }
@@ -378,37 +385,45 @@ function writeStartupLauncher(distro, user) {
   return startupPath;
 }
 
-function elevationPaths(operation) {
-  const directory = join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), SERVICE_NAME);
-  return {
-    directory,
-    script: join(directory, `elevate-${operation}.ps1`),
-    marker: join(directory, `elevate-${operation}-result.txt`),
-  };
+function elevationMarkerPath(operation, nonce) {
+  return join(
+    process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'),
+    SERVICE_NAME,
+    `elevate-${operation}-${nonce}-result.txt`,
+  );
 }
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function runElevated(operation, command) {
-  const paths = elevationPaths(operation);
-  mkdirSync(paths.directory, { recursive: true });
-  rmSync(paths.marker, { force: true });
+async function runElevated(operation, command, { timeoutMs = ELEVATION_TIMEOUT_MS } = {}) {
+  const nonce = randomBytes(16).toString('hex');
+  const marker = elevationMarkerPath(operation, nonce);
+  mkdirSync(dirname(marker), { recursive: true });
+  rmSync(marker, { force: true });
   const elevatedScript = [
     "$ErrorActionPreference = 'Stop'",
     'try {',
     command,
-    `Set-Content -LiteralPath ${powershellLiteral(paths.marker)} -Value 'OK' -Encoding ASCII`,
+    `Set-Content -LiteralPath ${powershellLiteral(marker)} -Value ${powershellLiteral(`OK:${nonce}`)} -Encoding ASCII`,
     '} catch {',
-    `Set-Content -LiteralPath ${powershellLiteral(paths.marker)} -Value ('ERROR: ' + $_.Exception.Message) -Encoding UTF8`,
+    `Set-Content -LiteralPath ${powershellLiteral(marker)} -Value (${powershellLiteral(`ERROR:${nonce}:`)} + $_.Exception.Message) -Encoding UTF8`,
     'exit 1',
     '}',
   ].join('\r\n');
-  writeFileSync(paths.script, elevatedScript);
+  const encodedCommand = Buffer.from(elevatedScript, 'utf16le').toString('base64');
+  const readMarker = () => {
+    if (!existsSync(marker)) return null;
+    const result = readFileSync(marker, 'utf8').trim();
+    if (result === `OK:${nonce}`) return { ok: true };
+    if (result.startsWith(`ERROR:${nonce}:`)) return { ok: false, reason: `ERROR: ${result.slice(`ERROR:${nonce}:`.length)}` };
+    return null;
+  };
 
   try {
-    const launchCommand = `Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',${powershellLiteral(`"${paths.script}"`)})`;
+    const startProcess = `Start-Process powershell.exe -Verb RunAs -ErrorAction Stop -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',${powershellLiteral(encodedCommand)})`;
+    const launchCommand = `try { ${startProcess} } catch { Write-Error $_; exit 1 }`;
     const launched = captureResult('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', launchCommand,
     ], { encoding: 'utf8', windowsHide: true });
@@ -416,28 +431,25 @@ async function runElevated(operation, command) {
       return { ok: false, reason: launched.stderr?.trim() || launched.stdout?.trim() || launched.error?.message || 'elevation was declined or unavailable' };
     }
 
-    const deadline = Date.now() + ELEVATION_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (existsSync(paths.marker)) {
-        const marker = readFileSync(paths.marker, 'utf8').trim();
-        if (marker === 'OK') return { ok: true };
-        if (marker.startsWith('ERROR:')) return { ok: false, reason: marker };
-      }
-      await sleep(ELEVATION_POLL_MS);
+      const result = readMarker();
+      if (result) return result;
+      await sleep(Math.min(ELEVATION_POLL_MS, Math.max(1, deadline - Date.now())));
     }
-    return { ok: false, reason: `timed out after ${Math.round(ELEVATION_TIMEOUT_MS / 1000)} seconds` };
+    const finalResult = readMarker();
+    return finalResult ?? { ok: false, reason: `timed out after ${Math.round(timeoutMs / 1000)} seconds` };
   } finally {
-    rmSync(paths.script, { force: true });
-    rmSync(paths.marker, { force: true });
+    rmSync(marker, { force: true });
   }
 }
 
-async function installLogonTrigger(distro, user, { noElevate = false } = {}) {
+async function installLogonTrigger(distro, user, { noElevate = false, elevationTimeoutMs } = {}) {
   const windowsUser = currentWindowsUser();
   const script = taskSchedulerScript(distro, user, windowsUser);
   console.log('Registering logon task...');
   const result = captureResult('powershell.exe', [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
   ], { encoding: 'utf8', windowsHide: true });
   if (result.status === 0) {
     rmSync(windowsStartupPath(), { force: true });
@@ -451,7 +463,7 @@ async function installLogonTrigger(distro, user, { noElevate = false } = {}) {
 
   if (!noElevate) {
     console.log('Task registration needs administrator access — requesting elevation (decline to use a login-only Startup entry)...');
-    const elevated = await runElevated('install', script);
+    const elevated = await runElevated('install', script, { timeoutMs: elevationTimeoutMs });
     if (elevated.ok) {
       rmSync(windowsStartupPath(), { force: true });
       console.log('Registered auto-start task (elevated).');
@@ -464,7 +476,7 @@ async function installLogonTrigger(distro, user, { noElevate = false } = {}) {
   return { kind: 'Startup folder fallback', detail: writeStartupLauncher(distro, user) };
 }
 
-async function installWindows({ noElevate = false } = {}) {
+async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
   const context = resolveWslContext();
   console.log(`WSL distro: ${context.distro} (user ${context.user})`);
   const preflight = preflightWsl(context);
@@ -483,7 +495,7 @@ async function installWindows({ noElevate = false } = {}) {
     : [node.path, installation.bin, 'service', 'install'];
   wslRun(context.distro, context.user, systemdWslArgs(installCommand));
   console.log('systemd user service: installed and enabled');
-  const trigger = await installLogonTrigger(context.distro, context.user, { noElevate });
+  const trigger = await installLogonTrigger(context.distro, context.user, { noElevate, elevationTimeoutMs });
   console.log(`Windows logon trigger: ${trigger.kind} (${trigger.detail})`);
   console.log(`View logs: wsl.exe -d ${context.distro} -u ${context.user} -e journalctl --user -u runnerize -f`);
   console.log('Uninstall: runnerize service uninstall');
@@ -493,7 +505,7 @@ function bestEffort(command, args) {
   spawnSync(command, args, { stdio: 'ignore', windowsHide: true });
 }
 
-async function uninstallWindows({ noElevate = false } = {}) {
+async function uninstallWindows({ noElevate = false, elevationTimeoutMs } = {}) {
   let context;
   try {
     context = resolveWslContext();
@@ -518,14 +530,14 @@ async function uninstallWindows({ noElevate = false } = {}) {
 
   const script = `Get-ScheduledTask -TaskName ${powershellLiteral(SERVICE_NAME)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
   const taskRemoval = captureResult('powershell.exe', [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
   ], { encoding: 'utf8', windowsHide: true });
   if (taskRemoval.status !== 0 && isAccessDenied(taskRemoval)) {
     if (noElevate) {
       console.warn(`Could not remove the elevated ${SERVICE_NAME} task without administrator access. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
     } else {
       console.log('Task removal needs administrator access — requesting elevation...');
-      const elevated = await runElevated('uninstall', script);
+      const elevated = await runElevated('uninstall', script, { timeoutMs: elevationTimeoutMs });
       if (!elevated.ok) {
         console.warn(`Could not remove the elevated ${SERVICE_NAME} task: ${elevated.reason}. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
       } else {
@@ -546,7 +558,7 @@ function elevationDisabled(options) {
 
 export async function installService(options = {}) {
   if (platform() === 'darwin') return installLaunchd();
-  if (platform() === 'win32') return installWindows({ noElevate: elevationDisabled(options) });
+  if (platform() === 'win32') return installWindows({ noElevate: elevationDisabled(options), elevationTimeoutMs: options.elevationTimeoutMs });
   if (!commandExists('systemctl')) {
     throw new Error('systemd is required to install runnerize as a Linux/WSL service.');
   }
@@ -555,6 +567,6 @@ export async function installService(options = {}) {
 
 export async function uninstallService(options = {}) {
   if (platform() === 'darwin') return uninstallLaunchd();
-  if (platform() === 'win32') return uninstallWindows({ noElevate: elevationDisabled(options) });
+  if (platform() === 'win32') return uninstallWindows({ noElevate: elevationDisabled(options), elevationTimeoutMs: options.elevationTimeoutMs });
   return uninstallSystemd();
 }

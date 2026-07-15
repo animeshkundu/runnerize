@@ -33,16 +33,19 @@ function successfulHarness(options = {}) {
     calls.push({ kind: 'exec', file, args, options: execOptions });
     if (file === 'powershell.exe') {
       const command = args.at(-1);
+      if (command.includes('WindowsIdentity]::GetCurrent().User.Value')) return 'S-1-5-21-1234\n';
       const elevatedLaunch = command.includes('Start-Process powershell.exe -Verb RunAs');
       const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
       if ((options.accessDenied && !elevatedLaunch) || (options.uninstallAccessDenied && unregister)) {
-        const error = new Error('Access is denied');
-        error.status = 1;
-        error.stderr = 'Access is denied';
+        const error = new Error(options.localizedDenied ? 'Zugriff verweigert' : 'Access is denied');
+        error.status = options.localizedDenied ? 77 : 1;
+        error.stderr = error.message;
         error.stdout = '';
         throw error;
       }
       if (elevatedLaunch) {
+        assert.match(command, /-ErrorAction Stop/);
+        assert.match(command, /catch \{ Write-Error \$_; exit 1 \}/);
         if (options.elevationDeclined) {
           const error = new Error('The operation was canceled by the user. (1223)');
           error.status = 1;
@@ -50,11 +53,14 @@ function successfulHarness(options = {}) {
           error.stdout = '';
           throw error;
         }
-        const markerMatch = command.match(/-File','([^']+)'/);
-        assert.ok(markerMatch, 'elevated script path included');
-        const scriptPath = markerMatch[1].replace(/^"|"$/g, '');
-        const markerPath = scriptPath.replace(/elevate-(install|uninstall)\.ps1$/, 'elevate-$1-result.txt');
-        writeFileSync(markerPath, options.elevationError ?? 'OK');
+        const encodedMatch = command.match(/-EncodedCommand','([^']+)'/);
+        assert.ok(encodedMatch, 'elevated payload passed as an encoded command');
+        const elevatedScript = Buffer.from(encodedMatch[1], 'base64').toString('utf16le');
+        const markerMatch = elevatedScript.match(/Set-Content -LiteralPath '([^']+elevate-(install|uninstall)-([a-f0-9]+)-result\.txt)'/);
+        assert.ok(markerMatch, 'elevated payload writes a per-run result marker');
+        const nonce = markerMatch[3];
+        const markerValue = options.elevationError ? `ERROR:${nonce}:registration failed` : `OK:${nonce}`;
+        if (!options.elevationTimeout) writeFileSync(markerMatch[1], markerValue);
       }
       return '';
     }
@@ -145,7 +151,7 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
         && command.includes('install');
     }));
     assert.ok(harness.calls.some((call) => commandOf(call).includes('enable-linger')));
-    const task = harness.calls.find((call) => call.file === 'powershell.exe');
+    const task = harness.calls.find((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
     assert.equal(task.kind, 'exec', 'task registration output is captured and drained');
     assert.equal(task.options.encoding, 'utf8');
     assert.equal(task.options.windowsHide, true);
@@ -227,7 +233,7 @@ test('Windows install fails actionably when systemd is unavailable', async () =>
 test('Windows install uses Tier 1 Task Scheduler without elevation when registration succeeds', async () => {
   await withWindowsService({}, async (service, harness) => {
     await service.installService();
-    const powershell = harness.calls.filter((call) => call.file === 'powershell.exe');
+    const powershell = harness.calls.filter((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
     assert.equal(powershell.length, 1);
     assert.equal(powershell[0].kind, 'exec');
     assert.doesNotMatch(powershell[0].args.at(-1), /Start-Process/);
@@ -243,17 +249,44 @@ test('Windows install elevates Task Scheduler registration after Tier 1 access d
     assert.equal(elevated.options.encoding, 'utf8');
     assert.equal(elevated.options.windowsHide, true);
     assert.doesNotMatch(elevated.args.at(-1), /-Wait/);
-    assert.equal(existsSync(join(appData, 'elevate-install.ps1')), false, 'temporary elevation script cleaned up');
+    assert.doesNotMatch(elevated.args.at(-1), /-File/);
+    assert.match(elevated.args.at(-1), /-EncodedCommand/);
+    assert.equal(existsSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs')), false, 'Startup fallback was not written');
   });
 });
 
-test('Windows install falls back to a hidden Startup launcher when elevation is declined', async () => {
+test('Windows install falls back promptly when elevation is declined', async () => {
   await withWindowsService({ accessDenied: true, elevationDeclined: true }, async (service, _harness, appData) => {
+    const started = Date.now();
     await service.installService();
+    assert.ok(Date.now() - started < 1_000, 'decline does not enter marker polling');
     const startup = join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs');
     const launcher = readFileSync(startup, 'utf8');
     assert.match(launcher, /wsl\.exe/);
     assert.match(launcher, /systemctl --user start runnerize/);
+  });
+});
+
+test('Windows install falls back when the elevated command writes an ERROR marker', async () => {
+  await withWindowsService({ accessDenied: true, elevationError: 'ERROR: registration failed' }, async (service, _harness, appData) => {
+    await service.installService();
+    assert.match(readFileSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs'), 'utf8'), /wsl\.exe/);
+  });
+});
+
+test('Windows install falls back after the elevated marker timeout', async () => {
+  await withWindowsService({ accessDenied: true, elevationTimeout: true }, async (service, _harness, appData) => {
+    const started = Date.now();
+    await service.installService({ elevationTimeoutMs: 10 });
+    assert.ok(Date.now() - started < 1_000, 'test timeout remains bounded');
+    assert.match(readFileSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs'), 'utf8'), /wsl\.exe/);
+  });
+});
+
+test('Windows install recognizes localized access denied by its stable exit code', async () => {
+  await withWindowsService({ accessDenied: true, localizedDenied: true }, async (service, harness) => {
+    await service.installService({ noElevate: true });
+    assert.ok(!harness.calls.some((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('Start-Process')));
   });
 });
 
@@ -278,8 +311,9 @@ test('Windows uninstall elevates task removal after non-elevated access denied',
     const elevated = harness.calls.find((call) => call.file === 'powershell.exe' && call.args.at(-1).includes('Start-Process'));
     assert.ok(elevated, 'elevated task removal attempted');
     assert.equal(elevated.kind, 'exec', 'elevated removal output is captured and drained');
-    assert.match(elevated.args.at(-1), /elevate-uninstall\.ps1/);
-    assert.equal(existsSync(join(appData, 'elevate-uninstall.ps1')), false);
+    assert.match(elevated.args.at(-1), /-EncodedCommand/);
+    assert.doesNotMatch(elevated.args.at(-1), /-File/);
+    assert.equal(existsSync(join(appData, 'runnerize')), true, 'marker directory may remain, but the per-run marker is removed');
   });
 });
 
