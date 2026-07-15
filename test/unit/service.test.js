@@ -96,13 +96,18 @@ function successfulHarness(options = {}) {
     if (command[0] === 'whoami') return 'ani\n';
     if (command[0] === 'ps') return options.noSystemd ? 'init' : 'systemd';
     if (command[0] === 'sh' && command.includes('printf %s "$HOME"')) return '/home/ani';
+    if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('/etc/os-release')) return options.osRelease ?? 'ubuntu debian';
     if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('command -v node')) {
       if (options.nodeAbsent) throw new Error('node missing');
       return options.nodeOutput ?? '/usr/bin/node\nv24.18.0\n';
     }
+    if (command[0] === 'bash' && command[1] === '-lc' && command[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman') {
+      if (options.podmanInstallFails) throw new Error('sudo: a password is required');
+      return '';
+    }
     if (command[0] === 'podman') {
-      if (options.noRuntime) throw new Error('podman missing');
-      return 'host: podman';
+      if (options.noRuntime && !(options.podmanInstallSucceeds && command[1] === '--version')) throw new Error('podman missing');
+      return command[1] === '--version' ? 'podman version 4.9.3' : 'host: podman';
     }
     if (command[0] === 'docker') {
       if (options.noRuntime) throw new Error('docker missing');
@@ -110,7 +115,7 @@ function successfulHarness(options = {}) {
     }
     if (command[0] === 'gh') {
       if (options.noGh) throw new Error('not authenticated');
-      return 'Logged in';
+      return command[2] === 'token' ? 'test-gh-token' : 'Logged in';
     }
     if (command[0] === 'wslpath') return '/mnt/c/Users/Ani/runnerize';
     if (command[0]?.endsWith('/bin/node') && command[1] === '--version') {
@@ -186,15 +191,38 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
   });
 });
 
-test('Windows install fails when WSL has no container runtime', async () => {
-  await withWindowsService({ noRuntime: true }, async (service) => {
-    await assert.rejects(service.installService(), /Install rootless Podman inside WSL/);
+test('Windows install skips Podman installation when a runtime is present', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    assert.ok(!harness.calls.some((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman'));
   });
 });
 
-test('Windows install fails when WSL GitHub auth and token are unavailable', async () => {
+test('Windows install installs and re-probes Podman non-interactively when absent', async () => {
+  await withWindowsService({ noRuntime: true, podmanInstallSucceeds: true }, async (service, harness) => {
+    await service.installService();
+    assert.ok(harness.calls.some((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman'));
+    assert.ok(harness.calls.some((call) => commandOf(call)[0] === 'podman' && commandOf(call)[1] === '--version'));
+  });
+});
+
+test('Windows install guides a manual Podman install when non-interactive sudo fails', async () => {
+  await withWindowsService({ noRuntime: true, podmanInstallFails: true }, async (service, harness) => {
+    await assert.rejects(service.installService(), /sudo -n apt-get update && sudo -n apt-get install -y podman/);
+    const install = harness.calls.find((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman');
+    assert.equal(install.options.timeout, 120_000);
+  });
+});
+
+test('Windows install guides GitHub login when no credential is available', async () => {
   await withWindowsService({ noGh: true }, async (service) => {
-    await assert.rejects(service.installService(), /gh auth login/);
+    await assert.rejects(service.installService(), /Run: gh auth login[\s\S]*Administration, Actions, and Metadata/);
+  });
+});
+
+test('Windows install guides WSL installation when no distro exists', async () => {
+  await withWindowsService({ distros: '' }, async (service) => {
+    await assert.rejects(service.installService(), /elevated PowerShell: wsl --install -d Ubuntu/);
   });
 });
 

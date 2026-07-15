@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { getToken } from './github.js';
 
 const SERVICE_NAME = 'runnerize';
 const DEFAULT_WSL_NODE_VERSION = 'v24.18.0';
@@ -10,6 +11,10 @@ const DEFAULT_WSL_NODE_SHA256 = '55aa7153f9d88f28d765fcdad5ae6945b5c0f98a3688170
 const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
 const packageRoot = dirname(dirname(binPath));
 const ELEVATION_TIMEOUT_MS = 55_000;
+const PROBE_TIMEOUT_MS = 10_000;
+const INSTALL_TIMEOUT_MS = 120_000;
+const WSL_INSTALL_GUIDANCE = 'In an elevated PowerShell: wsl --install -d Ubuntu\nThen restart Windows if prompted and rerun this command.';
+const GITHUB_AUTH_GUIDANCE = 'Run: gh auth login\nOr set GH_TOKEN/GITHUB_TOKEN. The credential needs Administration, Actions, and Metadata access across all owned private repositories.';
 const windowsPowerShellPath = join(
   process.env.SystemRoot || 'C:\\Windows',
   'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
@@ -63,7 +68,8 @@ function commandExists(command) {
   return probe.status === 0;
 }
 
-function installSystemd() {
+async function installSystemd() {
+  await preflightRun();
   const unitPath = join(homedir(), '.config', 'systemd', 'user', `${SERVICE_NAME}.service`);
   const environmentFile = process.env.RUNNERIZE_SYSTEMD_ENV_FILE
     ? `EnvironmentFile=-${process.env.RUNNERIZE_SYSTEMD_ENV_FILE}\n`
@@ -105,7 +111,8 @@ function uninstallSystemd() {
   console.log(`Removed ${unitPath}`);
 }
 
-function installLaunchd() {
+async function installLaunchd() {
+  await preflightRun();
   const agentPath = join(homedir(), 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist');
   mkdirSync(dirname(agentPath), { recursive: true });
   writeFileSync(agentPath, `<?xml version="1.0" encoding="UTF-8"?>
@@ -163,16 +170,16 @@ function wslRun(distro, user, args, options = {}) {
 function resolveWslDistro() {
   let status = '';
   try {
-    status = cleanWslOutput(capture('wsl.exe', ['--status']));
+    status = cleanWslOutput(capture('wsl.exe', ['--status'], { timeout: PROBE_TIMEOUT_MS }));
   } catch {
     // Some older WSL versions do not support --status; listing distros remains authoritative.
   }
 
   let output;
   try {
-    output = cleanWslOutput(capture('wsl.exe', ['-l', '-q']));
+    output = cleanWslOutput(capture('wsl.exe', ['-l', '-q'], { timeout: PROBE_TIMEOUT_MS }));
   } catch (error) {
-    throw new Error(`WSL is required. Install WSL and a Linux distro, then rerun this command. (${error.message})`);
+    throw new Error(`WSL2 and a working Linux distro are required.\n${WSL_INSTALL_GUIDANCE}\n(${error.message})`);
   }
 
   const available = output.split('\n').map((line) => line.replace(/^[﻿�]+/, '').trim()).filter(Boolean);
@@ -188,7 +195,7 @@ function resolveWslDistro() {
     ? available.find((name) => name.toLowerCase() === defaultName.toLowerCase())
     : null;
   const distro = preferred || available.find((name) => !/^docker-desktop(?:-data)?$/i.test(name));
-  if (!distro) throw new Error('No usable WSL distro was found. Install Ubuntu or set RUNNERIZE_WSL_DISTRO.');
+  if (!distro) throw new Error(`No usable WSL distro was found.\n${WSL_INSTALL_GUIDANCE}`);
   return distro;
 }
 
@@ -197,8 +204,8 @@ function resolveWslContext() {
   let user;
   let home;
   try {
-    user = wslCapture(distro, null, ['whoami']);
-    home = wslCapture(distro, user, ['sh', '-c', 'printf %s "$HOME"']);
+    user = wslCapture(distro, null, ['whoami'], { timeout: PROBE_TIMEOUT_MS });
+    home = wslCapture(distro, user, ['sh', '-c', 'printf %s "$HOME"'], { timeout: PROBE_TIMEOUT_MS });
   } catch (error) {
     throw new Error(`Could not start WSL distro ${distro}: ${error.message}`);
   }
@@ -206,34 +213,87 @@ function resolveWslContext() {
   return { distro, user, home };
 }
 
-function preflightWsl({ distro, user }) {
-  const init = wslCapture(distro, user, ['ps', '-p', '1', '-o', 'comm=']);
-  if (init !== 'systemd') {
-    throw new Error(`systemd is not running in WSL distro ${distro}. Enable it in /etc/wsl.conf, run \`wsl.exe --shutdown\`, then retry.`);
-  }
-
-  let runtime;
+function ensureWslRuntime({ distro, user }) {
   for (const candidate of ['podman', 'docker']) {
     try {
-      wslCapture(distro, user, [candidate, 'info']);
-      runtime = candidate;
-      break;
+      wslCapture(distro, user, [candidate, 'info'], { timeout: PROBE_TIMEOUT_MS });
+      return candidate;
     } catch {
-      // Try the other supported runtime.
+      // Try the other supported runtime before installing anything.
     }
   }
-  if (!runtime) {
-    throw new Error(`No working container runtime was found in WSL distro ${distro}. Install rootless Podman inside WSL, verify \`podman info\`, then rerun this command.`);
+
+  let debianLike = false;
+  try {
+    const family = wslCapture(distro, user, ['sh', '-c', '. /etc/os-release; printf "%s %s" "$ID" "$ID_LIKE"'], { timeout: PROBE_TIMEOUT_MS });
+    debianLike = /(?:^|\s)(?:debian|ubuntu)(?:\s|$)/i.test(family);
+  } catch {
+    // Give manual guidance when the distro cannot be identified.
+  }
+
+  const installCommand = 'sudo -n apt-get update && sudo -n apt-get install -y podman';
+  if (debianLike) {
+    console.log(`Podman was not found in WSL distro ${distro}; attempting a non-interactive install...`);
+    try {
+      wslCapture(distro, user, ['bash', '-lc', installCommand], { timeout: INSTALL_TIMEOUT_MS });
+      wslCapture(distro, user, ['podman', '--version'], { timeout: PROBE_TIMEOUT_MS });
+      return 'podman';
+    } catch {
+      throw new Error(`Podman could not be installed non-interactively in WSL distro ${distro}. Run this inside that distro:\n${installCommand}\nThen verify \`podman info\` and rerun this command.`);
+    }
+  }
+
+  throw new Error(`No working container runtime was found in WSL distro ${distro}. Install rootless Podman, verify \`podman info\`, then rerun this command. On Debian/Ubuntu run:\n${installCommand}`);
+}
+
+function preflightWsl(context, { requireSystemd = true } = {}) {
+  const runtime = ensureWslRuntime(context);
+
+  if (requireSystemd) {
+    const init = wslCapture(context.distro, context.user, ['ps', '-p', '1', '-o', 'comm='], { timeout: PROBE_TIMEOUT_MS });
+    if (init !== 'systemd') {
+      throw new Error(`systemd is not running in WSL distro ${context.distro}. Enable it in /etc/wsl.conf, run \`wsl.exe --shutdown\`, then retry.`);
+    }
   }
 
   try {
-    wslCapture(distro, user, ['gh', 'auth', 'status']);
+    const token = wslCapture(context.distro, context.user, ['gh', 'auth', 'token'], { timeout: PROBE_TIMEOUT_MS });
+    if (!token) throw new Error('gh returned an empty token');
     return { runtime, token: null };
   } catch {
     const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
     if (token) return { runtime, token };
-    throw new Error(`GitHub authentication is not available in WSL distro ${distro}. Run \`gh auth login\` inside that distro, or set GH_TOKEN/GITHUB_TOKEN, then retry.`);
+    throw new Error(`GitHub authentication is not available in WSL distro ${context.distro}.\n${GITHUB_AUTH_GUIDANCE}`);
   }
+}
+
+function nativeRuntime() {
+  for (const candidate of ['podman', 'docker']) {
+    const probe = spawnSync(candidate, ['info'], { stdio: 'ignore', timeout: PROBE_TIMEOUT_MS, windowsHide: true });
+    if (probe.status === 0) return candidate;
+  }
+  return null;
+}
+
+export async function preflightRun() {
+  let runtime;
+  if (platform() === 'win32') {
+    const context = resolveWslContext();
+    runtime = ensureWslRuntime(context);
+  } else {
+    runtime = nativeRuntime();
+    if (!runtime) {
+      throw new Error('No working rootless Podman or Docker runtime was found. Install Podman, verify `podman info`, then rerun this command.');
+    }
+  }
+
+  try {
+    await getToken();
+  } catch {
+    throw new Error(`GitHub authentication is not available.\n${GITHUB_AUTH_GUIDANCE}`);
+  }
+  console.log(`Prerequisites ready: container runtime ${runtime}; GitHub credential available.`);
+  return { runtime };
 }
 
 function persistWslToken({ distro, user, home }, token) {
@@ -464,15 +524,15 @@ async function installLogonTrigger(distro, user, { noElevate = false, elevationT
 async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
   const context = resolveWslContext();
   console.log(`WSL distro: ${context.distro} (user ${context.user})`);
+  const node = ensureWslNode(context);
+  console.log(`Linux Node: ${node.path} (${node.version}${node.downloaded ? ', installed and checksum-verified' : ', reused'})`);
   const preflight = preflightWsl(context);
   console.log(`Container runtime: ${preflight.runtime}`);
   const persistedToken = persistWslToken(context, preflight.token);
   console.log(`GitHub authentication: ${persistedToken ? 'Windows token persisted for the service' : 'WSL gh credential store'}`);
-  const linger = spawnSync('wsl.exe', wslArgs(context.distro, context.user, ['loginctl', 'enable-linger', context.user]), { encoding: 'utf8', windowsHide: true });
+  const linger = spawnSync('wsl.exe', wslArgs(context.distro, context.user, ['loginctl', 'enable-linger', context.user]), { encoding: 'utf8', windowsHide: true, timeout: PROBE_TIMEOUT_MS });
   if (linger.status === 0) console.log(`User lingering: enabled for ${context.user}`);
   else console.warn(`Could not enable user lingering for ${context.user}; run \`sudo loginctl enable-linger ${context.user}\` inside WSL.`);
-  const node = ensureWslNode(context);
-  console.log(`Linux Node: ${node.path} (${node.version}${node.downloaded ? ', installed and checksum-verified' : ', reused'})`);
   const installation = materializeRunnerize(context);
   console.log(`runnerize package: ${installation.root}`);
   const installCommand = preflight.token

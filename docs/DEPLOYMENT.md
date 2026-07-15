@@ -34,6 +34,14 @@ Native Windows/macOS execution is a TODO (see "Enabling native flavors" below).
     A classic token / gh OAuth token with the `repo` scope covers all of it; a
     fine-grained PAT must target *All repositories* with those three permissions.
 
+## Automatic prerequisite preflight
+
+`runnerize run`, `runnerize run --dry-run`, and `runnerize service install` verify the container runtime and GitHub credential before doing work. On Windows, runnerize selects a working WSL distro and, when Podman is absent in Debian/Ubuntu, tries `sudo -n apt-get update && sudo -n apt-get install -y podman`. The non-interactive sudo flag and bounded probes prevent password or consent hangs. Everything already present is a fast no-op.
+
+Prerequisites that require a person remain guided rather than silently attempted. With no working WSL distro, run `wsl --install -d Ubuntu` in an elevated PowerShell. With no GitHub credential, run `gh auth login` or set `GH_TOKEN`/`GITHUB_TOKEN`; the credential needs Administration, Actions, and Metadata access across all owned private repositories. If Podman installation needs sudo authentication, runnerize prints the exact install command to run inside the selected distro.
+
+On native Linux and macOS, the same commands verify a working rootless Podman/Docker runtime and GitHub credential, then print platform-appropriate installation guidance when one is absent.
+
 ## Quick start (any host)
 
 ```sh
