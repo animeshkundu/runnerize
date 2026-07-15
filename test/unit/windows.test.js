@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { overrideProcess } from '../helpers/platform-override.js';
@@ -16,7 +16,7 @@ async function withWindowsLaunch(fn) {
   await writeFile(path.join(runnerDir, 'run.cmd'), '@exit /b 0\r\n');
   try {
     const { windows } = await freshImport('../../src/sandbox/windows.js');
-    return await fn(windows);
+    return await fn(windows, path.resolve(runnerDir));
   } finally {
     if (previous === undefined) delete process.env.RUNNERIZE_RUNNER_DIR;
     else process.env.RUNNERIZE_RUNNER_DIR = previous;
@@ -25,15 +25,34 @@ async function withWindowsLaunch(fn) {
   }
 }
 
-function controlDirFromStart(child) {
-  const config = child.args[child.args.indexOf('--config') + 1];
-  const mapped = [...config.matchAll(/<HostFolder>(.*?)<\/HostFolder>/g)];
-  return mapped[1][1]
-    .replaceAll('&apos;', "'")
-    .replaceAll('&quot;', '"')
-    .replaceAll('&gt;', '>')
-    .replaceAll('&lt;', '<')
-    .replaceAll('&amp;', '&');
+function commandOf(child) {
+  return child.args[child.args.indexOf('--command') + 1];
+}
+
+function createLaunchStub({ onRunnerExec } = {}) {
+  let controlDir;
+  const stub = new SpawnStub((child) => {
+    if (child.args.includes('list')) {
+      child.emitStdout('{"WindowsSandboxEnvironments":[]}');
+      child.close(0);
+    } else if (child.args.includes('share')) {
+      if (child.args.includes('C:\\runnerize\\control')) {
+        controlDir = child.args[child.args.indexOf('--host-path') + 1];
+      }
+      child.close(0);
+    } else if (child.args.includes('exec') && commandOf(child) === 'cmd.exe /c exit 0') {
+      child.close(0);
+    } else if (child.args.includes('exec')) {
+      onRunnerExec?.(child, controlDir);
+    } else {
+      child.close(0);
+    }
+  }).install();
+  return stub;
+}
+
+async function assertMissing(file) {
+  await assert.rejects(() => access(file), { code: 'ENOENT' });
 }
 
 test('windows.available returns false outside Windows without spawning', async () => {
@@ -73,21 +92,17 @@ test('windows.launch validates inputs before spawning', async () => {
   await assert.rejects(() => windows.launch('cfg', { idleTimeoutMs: Infinity }), RangeError);
 });
 
-test('windows.launch observes a job, calls onStarted once, and stops the sandbox', async () => {
-  await withWindowsLaunch(async (windows) => {
+test('windows.launch shares folders, observes a job once, and cleans up', async () => {
+  await withWindowsLaunch(async (windows, runnerDir) => {
     let started = 0;
-    const stub = new SpawnStub((child) => {
-      if (child.args.includes('start')) {
-        const controlDir = controlDirFromStart(child);
-        void Promise.all([
-          writeFile(path.join(controlDir, 'runner.log'), 'Running job: build\nRunning job: duplicate\n'),
-          writeFile(path.join(controlDir, 'runner.done'), '0\n'),
-        ]).then(() => child.close(0));
-      } else if (child.args.includes('list')) {
-        child.emitStdout('{"WindowsSandboxEnvironments":[]}');
-        child.close(0);
-      } else child.close(0);
-    }).install();
+    let controlDir;
+    const stub = createLaunchStub({
+      onRunnerExec(child, dir) {
+        controlDir = dir;
+        void writeFile(path.join(dir, 'runner.log'), 'Running job: build\nRunning job: duplicate\n')
+          .then(() => child.close(0));
+      },
+    });
     try {
       const result = await withKeepAlive(windows.launch('deadbeef', {
         idleTimeoutMs: 5000,
@@ -95,67 +110,76 @@ test('windows.launch observes a job, calls onStarted once, and stops the sandbox
       }));
       assert.deepEqual(result, { startedJob: true });
       assert.equal(started, 1);
-      assert.ok(stub.find('stop'), 'the sandbox is stopped in finally');
+
       const start = stub.find('start');
+      assert.deepEqual(start.args.slice(0, 3), ['start', '--id', start.args[2]]);
+      assert.ok(!start.args.includes('--config'));
       assert.ok(!start.args.includes('deadbeef'), 'the JIT config is not exposed on argv');
-      assert.match(start.args[start.args.indexOf('--config') + 1], /run-runner\.ps1/);
+
+      const readiness = stub.children.find((child) => child.args.includes('exec')
+        && commandOf(child) === 'cmd.exe /c exit 0');
+      const runnerExec = stub.children.find((child) => child.args.includes('exec')
+        && commandOf(child)?.startsWith('powershell.exe'));
+      assert.ok(readiness.args.includes('System'));
+      assert.ok(runnerExec.args.includes('System'));
+
+      const runnerShare = stub.children.find((child) => child.args.includes('share')
+        && child.args.includes('C:\\runnerize\\runner'));
+      const controlShare = stub.children.find((child) => child.args.includes('share')
+        && child.args.includes('C:\\runnerize\\control'));
+      assert.equal(runnerShare.args[runnerShare.args.indexOf('--host-path') + 1], runnerDir);
+      assert.ok(!runnerShare.args.includes('--allow-write'));
+      assert.ok(controlShare.args.includes('--allow-write'));
+      assert.ok(stub.find('stop'), 'the sandbox is stopped in finally');
+      await assertMissing(controlDir);
     } finally {
       stub.restore();
     }
   });
 });
 
-test('windows.launch detects a job-start line split across log reads', async () => {
+test('windows.launch times out before assignment, stops, and removes control files', async () => {
   await withWindowsLaunch(async (windows) => {
-    let started = 0;
-    const stub = new SpawnStub((child) => {
-      if (child.args.includes('start')) {
-        const controlDir = controlDirFromStart(child);
-        void writeFile(path.join(controlDir, 'runner.log'), 'Running ').then(() => {
-          setTimeout(() => { void writeFile(path.join(controlDir, 'runner.log'), 'Running job: build\n'); }, 40);
-          setTimeout(() => { void writeFile(path.join(controlDir, 'runner.done'), '0\n'); }, 180);
-          child.close(0);
-        });
-      } else if (child.args.includes('list')) {
-        child.emitStdout('{"WindowsSandboxEnvironments":[]}');
-        child.close(0);
-      } else child.close(0);
-    }).install();
+    let controlDir;
+    const stub = createLaunchStub({ onRunnerExec(_child, dir) { controlDir = dir; } });
     try {
-      const result = await withKeepAlive(windows.launch('cfg', {
-        idleTimeoutMs: 1000,
-        onStarted: () => { started += 1; },
-      }));
-      assert.deepEqual(result, { startedJob: true });
-      assert.equal(started, 1);
+      const result = await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 30 }));
+      assert.deepEqual(result, { startedJob: false });
+      assert.ok(stub.find('stop'), 'idle timeout tears the sandbox down');
+      await assertMissing(controlDir);
     } finally {
       stub.restore();
     }
   });
 });
 
-test('windows.launch resolves after a post-start sandbox exit without runner.done', async () => {
+test('windows.launch surfaces an exec failure before a job starts', async () => {
   await withWindowsLaunch(async (windows) => {
-    let sandboxId;
-    const stub = new SpawnStub((child) => {
-      if (child.args.includes('start')) {
-        sandboxId = child.args[child.args.indexOf('--id') + 1];
-        const controlDir = controlDirFromStart(child);
-        void writeFile(path.join(controlDir, 'runner.log'), 'Running job: build\n').then(() => child.close(0));
-      } else if (child.args.includes('list')) {
-        child.emitStdout('{"WindowsSandboxEnvironments":[]}');
-        child.close(0);
-      } else child.close(0);
-    }).install();
-    const realNow = Date.now;
-    let now = realNow();
-    Date.now = () => { now += 6000; return now; };
+    const stub = createLaunchStub({ onRunnerExec(child) { child.emitStderr('runner failed'); child.close(1); } });
     try {
-      const result = await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 20_000 }));
-      assert.deepEqual(result, { startedJob: true });
-      assert.ok(sandboxId, 'the sandbox started before its liveness was checked');
+      await assert.rejects(
+        withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 1000 })),
+        (error) => {
+          assert.equal(error.message, 'windows runner exited before starting a job');
+          assert.match(error.cause?.message, /runner failed/);
+          return true;
+        },
+      );
+      assert.ok(stub.find('stop'));
     } finally {
-      Date.now = realNow;
+      stub.restore();
+    }
+  });
+});
+
+test('windows.launch resolves false when exec exits cleanly before a job starts', async () => {
+  await withWindowsLaunch(async (windows) => {
+    const stub = createLaunchStub({ onRunnerExec(child) { child.close(0); } });
+    try {
+      assert.deepEqual(await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 1000 })), {
+        startedJob: false,
+      });
+    } finally {
       stub.restore();
     }
   });
@@ -169,35 +193,24 @@ test('windows.launch stop polling normalizes IDs and waits for a lingering sandb
       if (child.args.includes('start')) {
         sandboxId = child.args[child.args.indexOf('--id') + 1];
         child.close(0);
+      } else if (child.args.includes('exec') && commandOf(child) === 'cmd.exe /c exit 0') {
+        child.close(0);
+      } else if (child.args.includes('share')) {
+        child.close(0);
+      } else if (child.args.includes('exec')) {
+        child.close(0);
       } else if (child.args.includes('list')) {
         listCalls += 1;
-        const environments = listCalls < 3
-          ? [{ Id: `{${sandboxId.toUpperCase()}}` }]
-          : [];
+        const environments = listCalls < 3 ? [{ Id: `{${sandboxId.toUpperCase()}}` }] : [];
         child.emitStdout(JSON.stringify({ WindowsSandboxEnvironments: environments }));
         child.close(0);
       } else child.close(0);
     }).install();
     try {
-      const result = await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 30 }));
-      assert.deepEqual(result, { startedJob: false });
+      assert.deepEqual(await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 1000 })), {
+        startedJob: false,
+      });
       assert.equal(listCalls, 3, 'polls until the normalized sandbox ID disappears');
-    } finally {
-      stub.restore();
-    }
-  });
-});
-
-test('windows.launch times out before assignment and stops the sandbox', async () => {
-  await withWindowsLaunch(async (windows) => {
-    const stub = new SpawnStub((child) => {
-      if (child.args.includes('list')) child.emitStdout('{"WindowsSandboxEnvironments":[]}');
-      child.close(0);
-    }).install();
-    try {
-      const result = await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 30 }));
-      assert.deepEqual(result, { startedJob: false });
-      assert.ok(stub.find('stop'), 'idle timeout tears the sandbox down');
     } finally {
       stub.restore();
     }

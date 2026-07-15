@@ -81,7 +81,10 @@ runs-on: [self-hosted, windows, x64]
 
 Windows Sandbox permits only one active instance, so runnerize runs at most one
 Windows job at a time on each host even when `--max` is higher. Every job gets a
-fresh sandbox that is stopped after the runner exits. Nested virtualization is not
+fresh sandbox. runnerize waits for `wsb exec` readiness, shares the runner read-only
+and a writable control folder with `wsb share`, and runs the JIT wrapper with
+`wsb exec --run-as System` (`ExistingLogin` is unavailable before an interactive
+login). The sandbox is stopped after the runner exits. Nested virtualization is not
 available inside Windows Sandbox, so Windows jobs cannot use Docker-in-Docker.
 
 ### Boot persistence on Windows
