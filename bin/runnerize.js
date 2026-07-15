@@ -9,7 +9,7 @@ import {
 } from '../src/github.js';
 import { runDispatcher } from '../src/dispatcher.js';
 import { detectFlavors } from '../src/sandbox/index.js';
-import { installService, uninstallService } from '../src/service.js';
+import { installService, preflightRun, uninstallService } from '../src/service.js';
 
 const HELP = `runnerize - on-demand ephemeral GitHub Actions runners
 
@@ -144,6 +144,7 @@ async function remove() {
 
 async function runForeground(args) {
   const { options, dryRun: shouldDryRun } = parseRunFlags(args);
+  await preflightRun({ install: !shouldDryRun });
   if (shouldDryRun) return dryRun();
 
   const controller = new AbortController();

@@ -4,9 +4,11 @@ For operational details and other hosts, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Prerequisites
 
-These must be installed before runnerize can set itself up:
+`runnerize run` (including `--dry-run`) and `runnerize service install` now preflight their prerequisites. They reuse an existing container runtime. Full runs and service installs attempt to install Podman on Debian/Ubuntu WSL with the bounded, non-interactive command `sudo -n apt-get update && sudo -n apt-get install -y podman`; dry runs only probe and print that command as guidance. This never waits for a password. If non-interactive sudo is unavailable, runnerize prints the exact command for you to run manually.
 
-1. **WSL2 and a Linux distro with systemd enabled.** Inside the distro, add:
+The remaining interactive or administrator prerequisites are:
+
+1. **WSL2 and a Linux distro with systemd enabled.** If no working distro exists, runnerize prints the copy-pasteable elevated PowerShell command `wsl --install -d Ubuntu`. Inside the distro, add:
 
    ```ini
    # /etc/wsl.conf
@@ -22,14 +24,7 @@ These must be installed before runnerize can set itself up:
 
    The command must print `systemd`.
 
-2. **Rootless Podman inside WSL.** For an Ubuntu or Debian distro:
-
-   ```bash
-   sudo apt-get update && sudo apt-get install -y podman
-   podman info
-   ```
-
-3. **GitHub CLI authentication inside WSL.** Authenticate as the personal account that owns the private repositories runnerize will serve:
+2. **GitHub CLI authentication.** Authenticate as the personal account that owns the private repositories runnerize will serve:
 
    ```bash
    gh auth login
@@ -38,7 +33,7 @@ These must be installed before runnerize can set itself up:
 
    The token needs access to all those private repositories. A classic token with `repo` scope covers the required repository, Actions, and runner-administration APIs. An enterprise-managed-user identity cannot own personal repositories. Alternatively, set `GH_TOKEN` or `GITHUB_TOKEN` in Windows before installation; runnerize persists it for the WSL service.
 
-4. **Node.js 20 or newer on Windows**, so `npx` can run. Node does not need to be preinstalled in WSL: runnerize reuses a suitable WSL Node if present, otherwise downloads its checksum-verified pinned version (`v24.18.0`) into its own cache.
+3. **Node.js 20 or newer on Windows**, so `npx` can run. Node does not need to be preinstalled in WSL: runnerize reuses a suitable WSL Node if present, otherwise downloads its checksum-verified pinned version (`v24.18.0`) into its own cache.
 
 ## Install
 
