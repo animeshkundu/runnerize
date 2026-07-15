@@ -15,7 +15,8 @@ Research (validated end to end on a Windows 11 build 26200 host) found that Wind
 Implement the `windows` flavor (`src/sandbox/windows.js`) on the `wsb.exe` CLI, mirroring the `linux` flavor's `launch()` contract: `launch(encodedJitConfig, { idleTimeoutMs, onStarted }) -> { startedJob }`.
 
 - `available()` gates on `process.platform === 'win32'` AND the `wsb.exe` CLI being resolvable and responsive (Windows 11 24H2 / build 26100+). It never throws.
-- `launch()` stages the Windows runner binary, writes a per-job control folder (JIT config + a runner wrapper script + a mapped log), generates a one-job `.wsb` mapping those in and running the wrapper, `wsb start`s the sandbox, tails the mapped log for the job-start line to fire `onStarted()`, enforces `idleTimeoutMs` (tear down + `{ startedJob: false }` if no job starts), and `wsb stop`s in `finally`.
+- `launch()` stages the Windows runner binary and writes a per-job control folder (JIT config + runner wrapper). It boots a default sandbox with `wsb start --id`, polls `wsb exec` until the sandbox is ready, shares the runner read-only and the control folder writable with `wsb share`, then starts the wrapper with a blocking `wsb exec` while tailing the shared log for the job-start line. It fires `onStarted()` once, enforces `idleTimeoutMs` (tear down + `{ startedJob: false }` if no job starts), and `wsb stop`s in `finally`.
+- Every `wsb exec` uses `--run-as System`. `ExistingLogin` is unavailable before an interactive sandbox login and fails with "logon session does not exist" on the validated host.
 
 The single-instance limit is a hard constraint: a second `wsb start` fails with `CO_E_APPSINGLEUSE`. The dispatcher gains a per-flavor in-flight concurrency cap; `windows` declares `maxConcurrent: 1`. The global `--max` semaphore still applies on top.
 
