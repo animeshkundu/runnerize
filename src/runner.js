@@ -93,6 +93,17 @@ async function exists(file) {
   }
 }
 
+// Windows' System32 tar.exe is bsdtar (libarchive): it extracts both .zip and .tar.gz and
+// handles drive-letter paths. A git-provided MSYS/GNU tar earlier on PATH would misread a
+// "C:\..." archive path as a remote "host:path" and cannot read the .zip runner asset, so
+// pin the system bsdtar by absolute path on Windows. Other hosts use tar from PATH.
+export function extractionCommand(hostPlatform = process.platform) {
+  if (hostPlatform === 'win32') {
+    return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+  }
+  return 'tar';
+}
+
 export async function ensureRunnerBinary({ os: osName, arch }) {
   if (arch !== 'x64' && arch !== 'arm64') throw new Error(`unsupported runner architecture: ${arch}`);
   const release = await releaseMetadata();
@@ -120,7 +131,7 @@ export async function ensureRunnerBinary({ os: osName, arch }) {
     const actual = createHash('sha256').update(await readFile(archive)).digest('hex');
     if (actual !== expected) throw new Error(`SHA-256 verification failed for ${assetName}`);
 
-    await run('tar', ['-xf', archive, '-C', extracted]);
+    await run(extractionCommand(), ['-xf', archive, '-C', extracted]);
     if (osName === 'darwin') await run('xattr', ['-c', '-r', extracted]);
     if (!(await exists(path.join(extracted, osName === 'win32' ? 'run.cmd' : 'run.sh')))) {
       throw new Error('extracted actions runner is missing its run script');
