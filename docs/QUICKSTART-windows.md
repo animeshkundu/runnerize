@@ -55,7 +55,18 @@ npm i -g runnerize
 runnerize service install
 ```
 
-The installer checks WSL, systemd, the container runtime, and GitHub authentication; prepares Node and runnerize inside WSL; installs a restarting systemd user service; enables user lingering where permitted; and adds a Windows logon trigger. It prefers Task Scheduler and falls back to the current user's Startup folder when task registration is access-denied.
+The installer checks WSL, systemd, the container runtime, and GitHub authentication; prepares Node and runnerize inside WSL; installs a restarting systemd user service; enables user lingering where permitted; and adds a Windows logon trigger. It first registers the per-user Task Scheduler task without elevation. If Windows requires administrator access, it requests one UAC approval and registers the same task elevated. The prompt and elevated command share a 55-second timeout and report success through the elevated process exit code. If elevation is declined, unavailable, fails, or times out, runnerize falls back to the current user's Startup folder (login-only, without automatic restart).
+
+For scripted installs or managed machines where you do not want a UAC prompt, pass `--no-elevate` or set `RUNNERIZE_NO_ELEVATE` to any non-empty value:
+
+```powershell
+npx runnerize service install --no-elevate
+# Equivalent:
+$env:RUNNERIZE_NO_ELEVATE = '1'
+npx runnerize service install
+```
+
+The flag and environment variable are additive: either one skips elevation and sends an access-denied Task Scheduler registration directly to the Startup-folder fallback. The same controls apply to uninstall; if an elevated task cannot be removed without UAC, runnerize prints manual removal instructions and continues cleaning up the other components.
 
 If you have multiple WSL distros, select one before installing:
 

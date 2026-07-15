@@ -70,19 +70,33 @@ implemented. Until then a Sandbox-enabled Windows host behaves exactly like any
 other Windows host: it serves Linux-container jobs via WSL podman.
 
 ### Boot persistence on Windows
-- **With admin:** `runnerize service install` uses **NSSM** (`nssm.exe` must be on
-  PATH). It registers an auto-start Windows service. You must also give the service
-  a credential (`nssm set runnerize AppEnvironmentExtra GH_TOKEN=...`) since a
-  service account has no `gh` keyring, and it must run as a user with WSL access.
-- **Without admin (corporate-locked host):** Task Scheduler and service creation are
-  elevation-gated (`schtasks /Create` -> "Access is denied"). Use the **user Startup
-  folder** instead (this is how the current live host is set up):
-  - `%LOCALAPPDATA%\runnerize\runnerize-launch.cmd` — cd to the checkout and run
-    `node bin\runnerize.js run --max 4`, appending to `runnerize.log`.
-  - `...\Start Menu\Programs\Startup\runnerize.vbs` — `WScript.Shell.Run` the .cmd
-    with window-style `0` (hidden) so it relaunches, console-free, at each logon.
-  - Ceiling: starts **at logon** (not before-login) and does **not** auto-restart on
-    crash. That is the realistic max without elevation on a managed machine.
+
+`runnerize service install` uses a three-tier Windows logon trigger:
+
+1. It first registers a hidden, per-user Task Scheduler task without elevation. The
+   task starts the WSL systemd user service at logon and restarts on failure.
+2. If registration is access-denied, it requests one UAC approval and registers the
+   same task elevated. The prompt and elevated command share a 55-second timeout;
+   success or failure is reported through the elevated process exit code.
+3. If elevation is declined, unavailable, times out, or cannot be verified, it writes
+   a hidden `...\Start Menu\Programs\Startup\runnerize.vbs` launcher for the current
+   user. This fallback starts only at login and cannot automatically restart after a
+   crash. Approval at the timeout boundary can leave both triggers if the detached
+   elevated child finishes late; both only issue the idempotent `systemctl --user
+   start runnerize`, so the overlap is harmless.
+
+Pass `--no-elevate`, or set `RUNNERIZE_NO_ELEVATE` to any non-empty value, to skip
+Tier 2 for scripted installs and managed machines. Either setting is sufficient:
+
+```powershell
+runnerize service install --no-elevate
+$env:RUNNERIZE_NO_ELEVATE = '1'; runnerize service install
+```
+
+Uninstall first removes the task without elevation. If an elevated task is
+access-denied, it uses the same bounded UAC flow unless elevation is disabled. When
+removal cannot be elevated, it prints manual Task Scheduler instructions and still
+removes the Startup entry and WSL materialized files where present.
 
 ---
 
