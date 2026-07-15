@@ -12,9 +12,10 @@ import { linux, windows, macos } from '../../src/sandbox/index.js';
  * concurrency and the unassigned/semaphore counters at precise moments.
  */
 export class FakeFlavor {
-  constructor({ key = 'linux', labels = ['self-hosted', 'linux', 'x64'] } = {}) {
+  constructor({ key = 'linux', labels = ['self-hosted', 'linux', 'x64'], maxConcurrent } = {}) {
     this.key = key;
     this.labels = labels;
+    this.maxConcurrent = maxConcurrent;
     this.launches = [];
     this.available = async () => true;
     // Default behavior: report a started job, then settle successfully on next tick.
@@ -48,7 +49,12 @@ export class FakeFlavor {
  */
 export function installFakeFlavor(fake) {
   const saved = {
-    linux: { available: linux.available, launch: linux.launch, labels: linux.labels },
+    linux: {
+      available: linux.available,
+      launch: linux.launch,
+      labels: linux.labels,
+      maxConcurrent: linux.maxConcurrent,
+    },
     windows: windows.available,
     macos: macos.available,
   };
@@ -56,6 +62,7 @@ export function installFakeFlavor(fake) {
   linux.available = fake.available;
   linux.launch = fake.launch;
   linux.labels = fake.labels;
+  linux.maxConcurrent = fake.maxConcurrent;
   windows.available = async () => false;
   macos.available = async () => false;
 
@@ -63,6 +70,8 @@ export function installFakeFlavor(fake) {
     linux.available = saved.linux.available;
     linux.launch = saved.linux.launch;
     linux.labels = saved.linux.labels;
+    if (saved.linux.maxConcurrent === undefined) delete linux.maxConcurrent;
+    else linux.maxConcurrent = saved.linux.maxConcurrent;
     windows.available = saved.windows;
     macos.available = saved.macos;
   };
