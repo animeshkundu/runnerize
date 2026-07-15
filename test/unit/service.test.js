@@ -159,6 +159,9 @@ test('Windows install persists a Windows token and downloads pinned Node when ab
       return command[0] === 'bash' && command[1] === '-c' && command[2].includes('sha256sum -c');
     });
     assert.ok(download, 'pinned Node download script invoked');
+    assert.equal(download.kind, 'exec', 'download child output is captured and drained before continuing');
+    assert.equal(download.options.encoding, 'utf8');
+    assert.equal(download.options.windowsHide, true);
     assert.ok(download.args.includes('55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742'));
   });
 });
