@@ -213,7 +213,7 @@ function resolveWslContext() {
   return { distro, user, home };
 }
 
-function ensureWslRuntime({ distro, user }) {
+function ensureWslRuntime({ distro, user }, { install = true } = {}) {
   for (const candidate of ['podman', 'docker']) {
     try {
       wslCapture(distro, user, [candidate, 'info'], { timeout: PROBE_TIMEOUT_MS });
@@ -232,6 +232,9 @@ function ensureWslRuntime({ distro, user }) {
   }
 
   const installCommand = 'sudo -n apt-get update && sudo -n apt-get install -y podman';
+  if (!install) {
+    throw new Error(`No working container runtime was found in WSL distro ${distro}. Run this inside that distro:\n${installCommand}\nThen verify \`podman info\` and rerun this command.`);
+  }
   if (debianLike) {
     console.log(`Podman was not found in WSL distro ${distro}; attempting a non-interactive install...`);
     try {
@@ -247,8 +250,6 @@ function ensureWslRuntime({ distro, user }) {
 }
 
 function preflightWsl(context, { requireSystemd = true } = {}) {
-  const runtime = ensureWslRuntime(context);
-
   if (requireSystemd) {
     const init = wslCapture(context.distro, context.user, ['ps', '-p', '1', '-o', 'comm='], { timeout: PROBE_TIMEOUT_MS });
     if (init !== 'systemd') {
@@ -256,9 +257,10 @@ function preflightWsl(context, { requireSystemd = true } = {}) {
     }
   }
 
+  const runtime = ensureWslRuntime(context);
+
   try {
-    const token = wslCapture(context.distro, context.user, ['gh', 'auth', 'token'], { timeout: PROBE_TIMEOUT_MS });
-    if (!token) throw new Error('gh returned an empty token');
+    wslCapture(context.distro, context.user, ['gh', 'auth', 'status'], { timeout: PROBE_TIMEOUT_MS });
     return { runtime, token: null };
   } catch {
     const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
@@ -275,11 +277,11 @@ function nativeRuntime() {
   return null;
 }
 
-export async function preflightRun() {
+export async function preflightRun({ install = true } = {}) {
   let runtime;
   if (platform() === 'win32') {
     const context = resolveWslContext();
-    runtime = ensureWslRuntime(context);
+    runtime = ensureWslRuntime(context, { install });
   } else {
     runtime = nativeRuntime();
     if (!runtime) {
@@ -524,10 +526,10 @@ async function installLogonTrigger(distro, user, { noElevate = false, elevationT
 async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
   const context = resolveWslContext();
   console.log(`WSL distro: ${context.distro} (user ${context.user})`);
-  const node = ensureWslNode(context);
-  console.log(`Linux Node: ${node.path} (${node.version}${node.downloaded ? ', installed and checksum-verified' : ', reused'})`);
   const preflight = preflightWsl(context);
   console.log(`Container runtime: ${preflight.runtime}`);
+  const node = ensureWslNode(context);
+  console.log(`Linux Node: ${node.path} (${node.version}${node.downloaded ? ', installed and checksum-verified' : ', reused'})`);
   const persistedToken = persistWslToken(context, preflight.token);
   console.log(`GitHub authentication: ${persistedToken ? 'Windows token persisted for the service' : 'WSL gh credential store'}`);
   const linger = spawnSync('wsl.exe', wslArgs(context.distro, context.user, ['loginctl', 'enable-linger', context.user]), { encoding: 'utf8', windowsHide: true, timeout: PROBE_TIMEOUT_MS });

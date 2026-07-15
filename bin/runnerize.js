@@ -144,7 +144,7 @@ async function remove() {
 
 async function runForeground(args) {
   const { options, dryRun: shouldDryRun } = parseRunFlags(args);
-  await preflightRun();
+  await preflightRun({ install: !shouldDryRun });
   if (shouldDryRun) return dryRun();
 
   const controller = new AbortController();

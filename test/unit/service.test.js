@@ -198,6 +198,13 @@ test('Windows install skips Podman installation when a runtime is present', asyn
   });
 });
 
+test('Windows dry-run preflight never installs a missing Podman runtime', async () => {
+  await withWindowsService({ noRuntime: true }, async (service, harness) => {
+    await assert.rejects(service.preflightRun({ install: false }), /sudo -n apt-get update && sudo -n apt-get install -y podman/);
+    assert.ok(!harness.calls.some((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman'));
+  });
+});
+
 test('Windows install installs and re-probes Podman non-interactively when absent', async () => {
   await withWindowsService({ noRuntime: true, podmanInstallSucceeds: true }, async (service, harness) => {
     await service.installService();
@@ -277,9 +284,17 @@ test('Windows install strips a BOM and prefers the WSL default distro', async ()
   });
 });
 
-test('Windows install fails actionably when systemd is unavailable', async () => {
-  await withWindowsService({ noSystemd: true }, async (service) => {
+test('Windows install fails actionably before runtime installation when systemd is unavailable', async () => {
+  await withWindowsService({ noSystemd: true, noRuntime: true }, async (service, harness) => {
     await assert.rejects(service.installService(), /Enable it in \/etc\/wsl\.conf/);
+    assert.ok(!harness.calls.some((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman'));
+  });
+});
+
+test('Windows install completes preflight before probing or installing Node', async () => {
+  await withWindowsService({ noGh: true, nodeAbsent: true, cachedNode: false }, async (service, harness) => {
+    await assert.rejects(service.installService(), /Run: gh auth login/);
+    assert.ok(!harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
   });
 });
 

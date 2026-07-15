@@ -4,7 +4,7 @@ For operational details and other hosts, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Prerequisites
 
-`runnerize run` (including `--dry-run`) and `runnerize service install` now preflight their prerequisites. They reuse an existing container runtime, and on Debian/Ubuntu WSL they attempt to install Podman with the bounded, non-interactive command `sudo -n apt-get update && sudo -n apt-get install -y podman`. This never waits for a password. If non-interactive sudo is unavailable, runnerize prints that exact command for you to run manually.
+`runnerize run` (including `--dry-run`) and `runnerize service install` now preflight their prerequisites. They reuse an existing container runtime. Full runs and service installs attempt to install Podman on Debian/Ubuntu WSL with the bounded, non-interactive command `sudo -n apt-get update && sudo -n apt-get install -y podman`; dry runs only probe and print that command as guidance. This never waits for a password. If non-interactive sudo is unavailable, runnerize prints the exact command for you to run manually.
 
 The remaining interactive or administrator prerequisites are:
 
