@@ -87,3 +87,12 @@ test('ensureImage validates its argument', async () => {
   await assert.rejects(() => runner.ensureImage(''), TypeError);
   await assert.rejects(() => runner.ensureImage(null), TypeError);
 });
+
+test('extractionCommand pins System32 bsdtar on Windows and plain tar elsewhere', async () => {
+  const runner = await freshImport('../../src/runner.js');
+  const win = runner.extractionCommand('win32');
+  assert.match(win, /System32[\\/]tar\.exe$/i, 'uses the absolute System32 tar on Windows');
+  assert.ok(win.includes(':'), 'is an absolute drive-qualified path (bsdtar handles .zip and C:\\ paths)');
+  assert.equal(runner.extractionCommand('linux'), 'tar');
+  assert.equal(runner.extractionCommand('darwin'), 'tar');
+});
