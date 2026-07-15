@@ -31,15 +31,19 @@ function successfulHarness(options = {}) {
   const exec = (file, args, execOptions = {}) => {
     calls.push({ kind: 'exec', file, args, options: execOptions });
     if (file !== 'wsl.exe') return '';
-    if (args[0] === '--status') return 'Default Distribution: Ubuntu\r\n';
+    if (args[0] === '--status') return options.status ?? 'Default Distribution: Ubuntu\r\n';
     if (args[0] === '-l') return options.distros ?? 'docker-desktop\0\r\nUbuntu\0\r\n';
     const command = args.slice(args.indexOf('-e') + 1);
     if (command[0] === 'whoami') return 'ani\n';
+    if (command[0] === 'ps') return options.noSystemd ? 'init' : 'systemd';
     if (command[0] === 'sh' && command.includes('printf %s "$HOME"')) return '/home/ani';
-    if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('command -v node')) return command.at(-1);
+    if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('command -v node')) {
+      if (options.nodeAbsent) throw new Error('node missing');
+      return options.nodeOutput ?? '/usr/bin/node\nv20.18.1\n';
+    }
     if (command[0] === 'podman') {
       if (options.noRuntime) throw new Error('podman missing');
-      return 'podman version 4.9.3';
+      return 'host: podman';
     }
     if (command[0] === 'docker') {
       if (options.noRuntime) throw new Error('docker missing');
@@ -48,10 +52,6 @@ function successfulHarness(options = {}) {
     if (command[0] === 'gh') {
       if (options.noGh) throw new Error('not authenticated');
       return 'Logged in';
-    }
-    if (command[0] === 'bash' && command[1] === '-lc') {
-      if (options.nodeAbsent) throw new Error('node missing');
-      return '/usr/bin/node\nv20.18.1\n';
     }
     if (command[0] === 'wslpath') return '/mnt/c/Users/Ani/runnerize';
     if (command[0]?.endsWith('/bin/node') && command[1] === '--version') return 'v20.18.1';
@@ -102,13 +102,15 @@ test('Windows install skips docker-desktop, reuses Linux Node, and delegates ser
     assert.ok(whoami.args.includes('Ubuntu'));
     assert.ok(harness.calls.some((call) => {
       const command = commandOf(call);
-      return command[0] === '/usr/bin/node'
-        && command[1] === '/home/ani/.local/share/runnerize/bin/runnerize.js'
-        && command[2] === 'service' && command[3] === 'install';
+      return command[0] === 'bash' && command[1] === '-lc'
+        && command.includes('/usr/bin/node')
+        && command.includes('/home/ani/.local/share/runnerize/bin/runnerize.js')
+        && command.includes('install');
     }));
     assert.ok(harness.calls.some((call) => commandOf(call).includes('enable-linger')));
     const task = harness.calls.find((call) => call.file === 'powershell.exe');
     assert.match(task.args.at(-1), /New-ScheduledTaskTrigger -AtLogOn/);
+    assert.match(task.args.at(-1), /-d "Ubuntu" -u "ani"/);
     assert.match(task.args.at(-1), /systemctl --user start runnerize/);
   });
 });
@@ -125,15 +127,45 @@ test('Windows install fails when WSL GitHub auth and token are unavailable', asy
   });
 });
 
-test('Windows install accepts a token and downloads checksum-verified Node when absent', async () => {
+test('Windows install persists a Windows token and downloads pinned Node when absent', async () => {
   await withWindowsService({ noGh: true, token: 'test-token', nodeAbsent: true }, async (service, harness) => {
     await service.installService();
+    const tokenWrite = harness.calls.find((call) => {
+      const command = commandOf(call);
+      return command[0] === 'sh' && command[2]?.includes('GH_TOKEN=%s');
+    });
+    assert.ok(tokenWrite, 'token persisted into the WSL service environment file');
+    assert.equal(tokenWrite.options.env.GH_TOKEN, 'test-token');
     const download = harness.calls.find((call) => {
       const command = commandOf(call);
-      return command[0] === 'bash' && command[1] === '-c' && command[2].includes('SHASUMS256.txt');
+      return command[0] === 'bash' && command[1] === '-c' && command[2].includes('sha256sum -c');
     });
     assert.ok(download, 'pinned Node download script invoked');
-    assert.ok(download.args.includes('v20.18.1'));
+    assert.ok(download.args.includes('c6fa75c841cbffac851678a472f2a5bd612fff8308ef39236190e1f8dbb0e567'));
+  });
+});
+
+test('Windows install downloads Node when PATH points to Node 16 even if its path says v20', async () => {
+  await withWindowsService({ nodeOutput: '/opt/node-v20/bin/node\nv16.20.2\n' }, async (service, harness) => {
+    await service.installService();
+    assert.ok(harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
+  });
+});
+
+test('Windows install strips a BOM and prefers the WSL default distro', async () => {
+  await withWindowsService({
+    status: 'Default Distribution: Debian\r\n',
+    distros: '﻿docker-desktop\0\r\nUbuntu\0\r\nDebian\0\r\n',
+  }, async (service, harness) => {
+    await service.installService();
+    const whoami = harness.calls.find((call) => commandOf(call)[0] === 'whoami');
+    assert.ok(whoami.args.includes('Debian'));
+  });
+});
+
+test('Windows install fails actionably when systemd is unavailable', async () => {
+  await withWindowsService({ noSystemd: true }, async (service) => {
+    await assert.rejects(service.installService(), /Enable it in \/etc\/wsl\.conf/);
   });
 });
 
@@ -152,8 +184,10 @@ test('Windows uninstall removes the WSL service, task, package, and cache', asyn
     await service.uninstallService();
     assert.ok(harness.calls.some((call) => {
       const command = commandOf(call);
-      return command.includes('service') && command.includes('uninstall');
+      return command.includes('service') && command.includes('uninstall')
+        && command[2]?.includes('XDG_RUNTIME_DIR');
     }));
+    assert.ok(harness.calls.some((call) => commandOf(call).includes('disable-linger')));
     assert.ok(harness.calls.some((call) => {
       const command = commandOf(call);
       return command[0] === 'rm' && command.includes('/home/ani/.local/share/runnerize');
