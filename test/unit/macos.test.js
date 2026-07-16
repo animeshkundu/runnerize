@@ -172,6 +172,11 @@ test('macos.launch observes a job once, keeps the config off argv, and deletes t
       assert.ok(!ssh.args.join(' ').includes('secret-jit-config'));
       assert.ok(ssh.args.includes('ServerAliveInterval=15'));
       assert.ok(ssh.args.includes('ServerAliveCountMax=3'));
+      const destination = ssh.args.indexOf('admin@192.0.2.10');
+      assert.equal(ssh.args[destination - 1], '--');
+
+      const tartRun = stub.find('run', '--no-graphics', '--no-audio', vmName);
+      assert.deepEqual(tartRun.options.stdio, ['ignore', 'ignore', 'pipe']);
     } finally {
       stub.restore();
     }
@@ -248,6 +253,42 @@ test('macos.launch surfaces SSH failure before a job and still deletes the VM', 
       const vmName = stub.find('clone').args[2];
       assert.ok(stub.find('delete', vmName));
     } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('macos.launch warns with a manual remedy when VM deletion fails', async () => {
+  await withMacos(async (macos) => {
+    let vmName;
+    const stub = new SpawnStub((child) => {
+      if (child.command === 'tart' && child.args[0] === 'clone') {
+        vmName = child.args[2];
+        child.close(0);
+      } else if (child.command === 'tart' && child.args[0] === 'run') return;
+      else if (child.command === 'tart' && child.args[0] === 'ip') {
+        child.emitStdout('192.0.2.10\n');
+        child.close(0);
+      } else if (child.command === 'ssh' && child.args.at(-1) === 'true') child.close(0);
+      else if (child.command === 'ssh' && child.args.at(-1) === 'bash -s') child.close(0);
+      else if (child.command === 'tart' && child.args[0] === 'delete') {
+        child.emitStderr('busy');
+        child.close(1);
+      } else child.close(0);
+    }).install();
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (message) => warnings.push(message);
+    try {
+      assert.deepEqual(await withKeepAlive(macos.launch('cfg', { idleTimeoutMs: 1000 })), {
+        startedJob: false,
+      });
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], new RegExp(`Failed to delete tart VM ${vmName}`));
+      assert.match(warnings[0], new RegExp(`tart delete ${vmName}`));
+      assert.match(warnings[0], /busy/);
+    } finally {
+      console.warn = originalWarn;
       stub.restore();
     }
   });

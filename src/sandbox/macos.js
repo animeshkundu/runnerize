@@ -57,13 +57,13 @@ function sshArgs(user, ip) {
   ];
   const key = process.env.RUNNERIZE_MACOS_SSH_KEY;
   if (key) args.push('-i', key);
-  args.push(`${user}@${ip}`);
+  args.push('--', `${user}@${ip}`);
   return args;
 }
 
 function startTartVm(vmName) {
   const child = spawn('tart', ['run', '--no-graphics', '--no-audio', vmName], {
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'ignore', 'pipe'],
   });
   let stderr = '';
   let outcome;
@@ -264,8 +264,8 @@ export const macos = {
       await stop();
       try {
         await collect('tart', ['delete', vmName], { timeoutMs: CLEANUP_TIMEOUT_MS });
-      } catch {
-        // Cleanup is best effort so it does not hide the runner outcome.
+      } catch (error) {
+        console.warn(`Failed to delete tart VM ${vmName}; remove it manually with \`tart delete ${vmName}\`. ${error.message}`);
       }
       tartRun?.child.kill('SIGTERM');
     }
