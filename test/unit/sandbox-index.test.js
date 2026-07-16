@@ -32,10 +32,9 @@ test('stub flavors expose the frozen FLAVOR shape', () => {
   assert.equal(macos.key, 'macos');
 });
 
-test('macos stub remains unavailable and throws a clear opt-in message on launch', async () => {
+test('native VM flavors expose their host concurrency caps', async () => {
   assert.equal(windows.maxConcurrent, 1, 'Windows Sandbox has a single-instance cap');
-  assert.equal(await macos.available(), false);
-  await assert.rejects(() => macos.launch('cfg', {}), /macos flavor is a v1\.x opt-in/);
+  assert.equal(macos.maxConcurrent, 2, 'macOS licensing permits two concurrent guests');
 });
 
 test('detectFlavors returns only available flavors, by reference', async () => {

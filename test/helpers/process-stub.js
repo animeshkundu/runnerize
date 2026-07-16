@@ -20,6 +20,12 @@ export class FakeChild extends EventEmitter {
     this.command = command;
     this.args = args ?? [];
     this.options = options ?? {};
+    this.stdin = new EventEmitter();
+    this.stdin.chunks = [];
+    this.stdin.end = (chunk) => {
+      if (chunk !== undefined) this.stdin.chunks.push(Buffer.from(chunk));
+      this.stdin.emit('finish');
+    };
     this.stdout = new EventEmitter();
     this.stderr = new EventEmitter();
     this.signals = [];
