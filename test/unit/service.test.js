@@ -35,6 +35,7 @@ function successfulHarness(options = {}) {
     if (file.toLowerCase().endsWith('powershell.exe')) {
       const command = args.at(-1);
       if (command.includes('WindowsIdentity]::GetCurrent().User.Value')) return 'S-1-5-21-1234\n';
+      if (command.includes('[System.Environment]::OSVersion.Version.Build')) return `${options.windowsBuild ?? (options.noWsb ? 26000 : 26100)}\n`;
       const elevatedLaunch = command.includes('Start-Process -FilePath');
       const confirmation = command.includes('[Console]::Out.Write($task.Principal.UserId)');
       const specMatch = command.includes('$a = $task.Actions | Select-Object -First 1');
@@ -318,9 +319,77 @@ test('Windows install guides GitHub login when no credential is available', asyn
   });
 });
 
-test('Windows install guides WSL installation when no distro exists', async () => {
-  await withWindowsService({ distros: '', noWsb: true }, async (service) => {
-    await assert.rejects(service.installService(), /elevated PowerShell: wsl --install -d Ubuntu/);
+test('Windows install auto-installs WSL and stops cleanly for a restart when no distro exists', async () => {
+  await withWindowsService({ distros: '', noWsb: true }, async (service, harness) => {
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message = '') => logs.push(message);
+    try {
+      await service.installService();
+    } finally {
+      console.log = originalLog;
+    }
+    const elevated = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe')
+      && call.args.at(-1).includes('Start-Process'));
+    const encoded = elevated.args.at(-1).match(/-EncodedCommand','([^']+)'/)[1];
+    assert.match(Buffer.from(encoded, 'base64').toString('utf16le'), /wsl --install -d Ubuntu/);
+    assert.ok(logs.some((line) => /Administrator access is needed to install WSL2 and Ubuntu/.test(line)));
+    assert.ok(logs.some((line) => /A UAC prompt will appear/.test(line)));
+    assert.ok(logs.some((line) => line.trim() === 'Restart required'));
+    assert.ok(logs.some((line) => /npx runnerize service install/.test(line)));
+    assert.ok(!harness.calls.some((call) => call.args.at(-1)?.includes('Register-ScheduledTask')));
+  });
+});
+
+test('Windows install auto-enables Sandbox on Windows 11 24H2 and stops for a restart', async () => {
+  await withWindowsService({ noWsb: true, windowsBuild: 26100 }, async (service, harness) => {
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message = '') => logs.push(message);
+    try {
+      await service.installService();
+    } finally {
+      console.log = originalLog;
+    }
+    const elevated = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe')
+      && call.args.at(-1).includes('Start-Process'));
+    const encoded = elevated.args.at(-1).match(/-EncodedCommand','([^']+)'/)[1];
+    assert.match(Buffer.from(encoded, 'base64').toString('utf16le'), /Enable-WindowsOptionalFeature[^\r\n]+Containers-DisposableClientVM/);
+    assert.ok(logs.some((line) => /Administrator access is needed to enable the Windows Sandbox feature/.test(line)));
+    assert.ok(logs.some((line) => /A UAC prompt will appear/.test(line)));
+    assert.ok(logs.some((line) => line.trim() === 'Restart required'));
+    assert.ok(!harness.calls.some((call) => call.args.at(-1)?.includes('Register-ScheduledTask')));
+  });
+});
+
+test('Windows install keeps Linux available when Sandbox needs a newer Windows build', async () => {
+  await withWindowsService({ noWsb: true, windowsBuild: 26000 }, async (service, harness) => {
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message = '') => logs.push(message);
+    try {
+      await service.installService();
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(logs.some((line) => /requires Windows 11 24H2 \(build 26100\)/.test(line)));
+    assert.ok(harness.calls.some((call) => call.args.at(-1)?.includes("$taskName = 'runnerize'")));
+    assert.ok(!harness.calls.some((call) => call.args.at(-1)?.includes('Enable-WindowsOptionalFeature')));
+  });
+});
+
+test('Windows install prints an ordered GitHub login fallback when no native credential exists', async () => {
+  await withWindowsService({ noGh: true, noWsb: true }, async (service) => {
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message = '') => logs.push(message);
+    try {
+      await assert.rejects(service.installService(), /GitHub authentication is not available/);
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(logs.some((line) => line.trim() === 'Manual steps'));
+    assert.ok(logs.some((line) => line === '   gh auth login'));
   });
 });
 
