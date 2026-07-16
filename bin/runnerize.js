@@ -8,13 +8,13 @@ import {
   listRunners,
 } from '../src/github.js';
 import { runDispatcher } from '../src/dispatcher.js';
-import { detectFlavors } from '../src/sandbox/index.js';
+import { detectFlavors, FLAVOR_KEYS } from '../src/sandbox/index.js';
 import { installService, preflightRun, uninstallService } from '../src/service.js';
 
 const HELP = `runnerize - on-demand ephemeral GitHub Actions runners
 
 Usage:
-  runnerize run [--max <n>] [--interval <ms>] [--idle-timeout <ms>] [--dry-run]
+  runnerize run [--max <n>] [--interval <ms>] [--idle-timeout <ms>] [--only <csv>] [--no-keep-awake] [--dry-run]
   runnerize status
   runnerize remove
   runnerize service install|uninstall [--no-elevate]
@@ -24,6 +24,8 @@ Options:
   --max <n>              Maximum concurrent runners (default: 4)
   --interval <ms>        Poll interval in milliseconds (default: 15000)
   --idle-timeout <ms>    Kill an unclaimed runner after this time (default: 120000)
+  --only <csv>           Serve only these flavors: linux, windows, macos
+  --no-keep-awake        Allow the host to sleep while the dispatcher runs
   --dry-run              Count and display demand without minting runners
   --no-elevate           Never prompt for administrator access during service setup
   -h, --help             Show this help
@@ -37,7 +39,7 @@ function positiveInteger(raw, flag) {
 }
 
 function parseRunFlags(args) {
-  const options = {};
+  const options = { keepAwake: true };
   let dryRun = false;
 
   for (let index = 0; index < args.length; index += 1) {
@@ -51,6 +53,19 @@ function parseRunFlags(args) {
         break;
       case '--idle-timeout':
         options.idleTimeoutMs = positiveInteger(args[++index], flag);
+        break;
+      case '--only': {
+        const raw = args[++index];
+        if (!raw) throw new Error('--only requires a non-empty comma-separated flavor list');
+        const keys = raw.split(',').map((key) => key.trim()).filter(Boolean);
+        if (keys.length === 0) throw new Error('--only requires a non-empty comma-separated flavor list');
+        const invalid = keys.filter((key) => !FLAVOR_KEYS.has(key));
+        if (invalid.length) throw new Error(`Unknown flavor(s) for --only: ${invalid.join(', ')}`);
+        options.only = new Set(keys);
+        break;
+      }
+      case '--no-keep-awake':
+        options.keepAwake = false;
         break;
       case '--dry-run':
         dryRun = true;
@@ -68,11 +83,11 @@ function parseRunFlags(args) {
   return { options, dryRun };
 }
 
-async function collectState({ includeDemand = false } = {}) {
+async function collectState({ includeDemand = false, only } = {}) {
   const [user, repos, flavors] = await Promise.all([
     getUser(),
     listOwnedPrivateRepos(),
-    detectFlavors(),
+    detectFlavors(only),
   ]);
 
   const repositoryState = [];
@@ -90,8 +105,11 @@ async function collectState({ includeDemand = false } = {}) {
   return { user, repos, flavors, repositoryState };
 }
 
-async function dryRun() {
-  const state = await collectState({ includeDemand: true });
+async function dryRun(only) {
+  const state = await collectState({ includeDemand: true, only });
+  if (only && state.flavors.length === 0) {
+    console.warn(`No requested flavors are available: ${[...only].join(', ')}`);
+  }
   console.log(`Authenticated as ${state.user.login} (${state.user.type})`);
   console.log(`Owned private repositories: ${state.repos.length}`);
   console.log(`Available flavors: ${state.flavors.map((flavor) => flavor.key).join(', ') || 'none'}`);
@@ -144,8 +162,12 @@ async function remove() {
 
 async function runForeground(args) {
   const { options, dryRun: shouldDryRun } = parseRunFlags(args);
-  await preflightRun({ install: !shouldDryRun });
-  if (shouldDryRun) return dryRun();
+  await preflightRun({ install: !shouldDryRun, only: options.only });
+  if (shouldDryRun) return dryRun(options.only);
+
+  if (options.only && (await detectFlavors(options.only)).length === 0) {
+    console.warn(`No requested flavors are available: ${[...options.only].join(', ')}`);
+  }
 
   const controller = new AbortController();
   let stopping = false;

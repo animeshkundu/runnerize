@@ -29,6 +29,7 @@ function installStubs({ exec, spawn }) {
 function successfulHarness(options = {}) {
   const calls = [];
   let cachedNodeChecks = 0;
+  const registeredActions = new Map();
   const exec = (file, args, execOptions = {}) => {
     calls.push({ kind: 'exec', file, args, options: execOptions });
     if (file.toLowerCase().endsWith('powershell.exe')) {
@@ -36,8 +37,32 @@ function successfulHarness(options = {}) {
       if (command.includes('WindowsIdentity]::GetCurrent().User.Value')) return 'S-1-5-21-1234\n';
       const elevatedLaunch = command.includes('Start-Process -FilePath');
       const confirmation = command.includes('[Console]::Out.Write($task.Principal.UserId)');
+      const specMatch = command.includes('$a = $task.Actions | Select-Object -First 1');
+      if (specMatch) {
+        const taskNameMatch = command.match(/-TaskName '([^']*)'/);
+        const taskName = taskNameMatch?.[1];
+        // A genuinely-failed registration (as opposed to a powershell.exe crash-after-success)
+        // must not be resurrected by the post-failure confirmation check: the task was never
+        // actually registered, so this must report a mismatch/absence for that specific task.
+        if (options.windowsTaskFails && taskName === 'runnerize-windows') {
+          const error = new Error('no match');
+          error.status = 1;
+          error.stdout = '';
+          error.stderr = '';
+          throw error;
+        }
+        if (registeredActions.get(taskName) === true) return '';
+        const error = new Error('no match');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = '';
+        throw error;
+      }
       if (confirmation) {
-        if (options.taskMissing) {
+        if (options.taskMissing || (options.accessDenied && (
+
+          options.noElevateExpected || options.elevationDeclined || options.elevationError || options.elevationTimeout || options.nullExitCode
+        ))) {
           const error = new Error('task missing');
           error.status = 1;
           error.stdout = '';
@@ -49,6 +74,16 @@ function successfulHarness(options = {}) {
         error.status = 1;
         error.stdout = '';
         error.stderr = '';
+        throw error;
+      }
+      if ((options.windowsTaskFails || options.registrationCrashesAfterSuccess) && command.includes("$taskName = 'runnerize-windows'") && command.includes('Register-ScheduledTask')) {
+        // Simulates the powershell.exe child that dies at teardown (signal-less, empty
+        // stdout/stderr) right after the CIM cmdlets already registered the task successfully.
+        if (options.registrationCrashesAfterSuccess) registeredActions.set('runnerize-windows', true);
+        const error = new Error('windows task registration failed');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = options.registrationCrashesAfterSuccess ? '' : error.message;
         throw error;
       }
       const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
@@ -86,7 +121,11 @@ function successfulHarness(options = {}) {
         assert.doesNotMatch(elevatedScript, /Set-Content/);
         assert.match(elevatedScript, /exit 0/);
         assert.match(elevatedScript, /exit 1/);
+        const elevatedTaskNameMatch = elevatedScript.match(/\$taskName = '([^']*)'/);
+        if (elevatedTaskNameMatch && !options.taskMissing) registeredActions.set(elevatedTaskNameMatch[1], true);
       }
+      const registerMatch = !elevatedLaunch && command.includes('Register-ScheduledTask') && command.match(/\$taskName = '([^']*)'/);
+      if (registerMatch) registeredActions.set(registerMatch[1], true);
       return '';
     }
     if (file !== 'wsl.exe') return '';
@@ -128,6 +167,9 @@ function successfulHarness(options = {}) {
   const spawn = (file, args, spawnOptions = {}) => {
     calls.push({ kind: 'spawn', file, args, options: spawnOptions });
     if (file === 'whoami.exe') return { status: 0, stdout: 'DESKTOP\\ani\n', stderr: '' };
+    if (file === 'where.exe' && args[0] === 'wsb.exe') {
+      return { status: options.noWsb ? 1 : 0, stdout: options.noWsb ? '' : 'C:\\Windows\\System32\\wsb.exe\n', stderr: '' };
+    }
     return { status: 0, stdout: '', stderr: '' };
   };
   return { calls, exec, spawn };
@@ -138,13 +180,16 @@ async function withWindowsService(options, action) {
   const appData = mkdtempSync(join(tmpdir(), 'runnerize-service-'));
   const oldAppData = process.env.APPDATA;
   const oldToken = process.env.GH_TOKEN;
+  const oldGitHubToken = process.env.GITHUB_TOKEN;
   const oldLocalAppData = process.env.LOCALAPPDATA;
   const oldNoElevate = process.env.RUNNERIZE_NO_ELEVATE;
   process.env.APPDATA = appData;
   process.env.LOCALAPPDATA = appData;
   if (options.noElevateEnv) process.env.RUNNERIZE_NO_ELEVATE = options.noElevateEnv;
   else delete process.env.RUNNERIZE_NO_ELEVATE;
+  delete process.env.GITHUB_TOKEN;
   if (options.token) process.env.GH_TOKEN = options.token;
+  else if (!options.noWsb && !options.noNativeToken) process.env.GH_TOKEN = 'test-native-token';
   else delete process.env.GH_TOKEN;
   const restore = installStubs(harness);
   try {
@@ -157,6 +202,8 @@ async function withWindowsService(options, action) {
     else process.env.APPDATA = oldAppData;
     if (oldToken === undefined) delete process.env.GH_TOKEN;
     else process.env.GH_TOKEN = oldToken;
+    if (oldGitHubToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = oldGitHubToken;
     if (oldLocalAppData === undefined) delete process.env.LOCALAPPDATA;
     else process.env.LOCALAPPDATA = oldLocalAppData;
     if (oldNoElevate === undefined) delete process.env.RUNNERIZE_NO_ELEVATE;
@@ -169,7 +216,7 @@ function commandOf(call) {
 }
 
 test('Windows install skips docker-desktop, reuses PATH Node, and delegates service install', async () => {
-  await withWindowsService({ cachedNode: false }, async (service, harness) => {
+  await withWindowsService({ cachedNode: false }, async (service, harness, appData) => {
     await service.installService();
     const whoami = harness.calls.find((call) => commandOf(call)[0] === 'whoami');
     assert.ok(whoami.args.includes('Ubuntu'));
@@ -188,6 +235,50 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     assert.match(task.args.at(-1), /New-ScheduledTaskTrigger -AtLogOn/);
     assert.match(task.args.at(-1), /-d "Ubuntu" -u "ani"/);
     assert.match(task.args.at(-1), /systemctl --user start runnerize/);
+    assert.ok(harness.calls.some((call) => commandOf(call).includes('RUNNERIZE_SERVICE_RUN_ONLY=linux')));
+    const tasks = harness.calls.filter((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
+    assert.equal(tasks.length, 2);
+    assert.ok(tasks.some((call) => call.args.at(-1).includes("$taskName = 'runnerize-windows'")));
+    for (const call of tasks) {
+      // A trailing Remove-Item run in the same powershell.exe process right after the
+      // ScheduledTasks module's CIM cmdlets (Get-/Register-ScheduledTask) reliably crashes
+      // that process on exit, even though the registration itself already succeeded. Startup
+      // fallback cleanup is done from Node (rmSync) instead — the script must stay clear of it.
+      assert.doesNotMatch(call.args.at(-1), /Remove-Item/);
+    }
+    const launcher = readFileSync(join(appData, 'runnerize', 'runnerize-windows.ps1'), 'utf8');
+    assert.match(launcher, /Local\\runnerize-windows/);
+    // A raw 0x80000001 literal parses as a negative Int32 in PowerShell (high bit set), which
+    // then fails to bind to the uint esFlags P/Invoke parameter — Convert.ToUInt32 avoids that.
+    assert.match(launcher, /SetThreadExecutionState\(\[Convert\]::ToUInt32\('80000001', 16\)\)/);
+    assert.match(launcher, /run --only windows/);
+    assert.match(launcher, /runnerize-windows\.log/);
+    assert.ok(existsSync(join(appData, 'runnerize', 'app', 'bin', 'runnerize.js')));
+  });
+});
+
+test('Windows install adds the WSL keep-awake holder when the Windows backend fails', async () => {
+  await withWindowsService({ windowsTaskFails: true }, async (service, harness, appData) => {
+    await service.installService();
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    assert.ok(taskCommands.some((command) => command.includes("$taskName = 'runnerize-wsl-keepawake'")));
+    assert.ok(existsSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1')));
+  });
+});
+
+test('Windows install treats a post-success powershell.exe crash as registered, not failed', async () => {
+  await withWindowsService({ registrationCrashesAfterSuccess: true }, async (service, harness, appData) => {
+    await service.installService();
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    // No UAC elevation, no wsl-keepawake fallback, and no Startup-folder fallback: the
+    // registration is confirmed via Get-ScheduledTask and treated as a success outright.
+    assert.ok(!taskCommands.some((command) => command.includes('Start-Process')));
+    assert.ok(!taskCommands.some((command) => command.includes("$taskName = 'runnerize-wsl-keepawake'")));
+    assert.equal(existsSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize-windows.vbs')), false);
   });
 });
 
@@ -214,7 +305,7 @@ test('Windows install installs and re-probes Podman non-interactively when absen
 });
 
 test('Windows install guides a manual Podman install when non-interactive sudo fails', async () => {
-  await withWindowsService({ noRuntime: true, podmanInstallFails: true }, async (service, harness) => {
+  await withWindowsService({ noRuntime: true, podmanInstallFails: true, noWsb: true }, async (service, harness) => {
     await assert.rejects(service.installService(), /sudo -n apt-get update && sudo -n apt-get install -y podman/);
     const install = harness.calls.find((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman');
     assert.equal(install.options.timeout, 120_000);
@@ -222,13 +313,13 @@ test('Windows install guides a manual Podman install when non-interactive sudo f
 });
 
 test('Windows install guides GitHub login when no credential is available', async () => {
-  await withWindowsService({ noGh: true }, async (service) => {
+  await withWindowsService({ noGh: true, noWsb: true }, async (service) => {
     await assert.rejects(service.installService(), /Run: gh auth login[\s\S]*Administration, Actions, and Metadata/);
   });
 });
 
 test('Windows install guides WSL installation when no distro exists', async () => {
-  await withWindowsService({ distros: '' }, async (service) => {
+  await withWindowsService({ distros: '', noWsb: true }, async (service) => {
     await assert.rejects(service.installService(), /elevated PowerShell: wsl --install -d Ubuntu/);
   });
 });
@@ -263,6 +354,9 @@ test('Windows install persists a Windows token and downloads pinned Node when ab
     assert.equal(download.options.encoding, 'utf8');
     assert.equal(download.options.windowsHide, true);
     assert.ok(download.args.includes('55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742'));
+    const protect = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe')
+      && call.args.at(-1).includes('RUNNERIZE_INSTALL_TOKEN'));
+    assert.match(protect.args.at(-1), /^\$ErrorActionPreference = 'Stop';/);
   });
 });
 
@@ -285,14 +379,14 @@ test('Windows install strips a BOM and prefers the WSL default distro', async ()
 });
 
 test('Windows install fails actionably before runtime installation when systemd is unavailable', async () => {
-  await withWindowsService({ noSystemd: true, noRuntime: true }, async (service, harness) => {
+  await withWindowsService({ noSystemd: true, noRuntime: true, noWsb: true }, async (service, harness) => {
     await assert.rejects(service.installService(), /Enable it in \/etc\/wsl\.conf/);
     assert.ok(!harness.calls.some((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman'));
   });
 });
 
 test('Windows install completes preflight before probing or installing Node', async () => {
-  await withWindowsService({ noGh: true, nodeAbsent: true, cachedNode: false }, async (service, harness) => {
+  await withWindowsService({ noGh: true, nodeAbsent: true, cachedNode: false, noWsb: true }, async (service, harness) => {
     await assert.rejects(service.installService(), /Run: gh auth login/);
     assert.ok(!harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
   });
@@ -302,7 +396,7 @@ test('Windows install uses Tier 1 Task Scheduler without elevation when registra
   await withWindowsService({}, async (service, harness) => {
     await service.installService();
     const powershell = harness.calls.filter((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
-    assert.equal(powershell.length, 1);
+    assert.equal(powershell.length, 2);
     assert.equal(powershell[0].kind, 'exec');
     assert.doesNotMatch(powershell[0].args.at(-1), /Start-Process/);
   });
@@ -354,18 +448,21 @@ test('Windows install falls back when the elevated command exits nonzero', async
   await withWindowsService({ accessDenied: true, elevationError: true }, async (service, _harness, appData) => {
     await service.installService();
     assert.match(readFileSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs'), 'utf8'), /wsl\.exe/);
-    assert.equal(existsSync(join(appData, 'runnerize')), false, 'elevation does not create marker files');
+    assert.equal(existsSync(join(appData, 'runnerize', 'elevation-marker')), false, 'elevation does not create marker files');
   });
 });
 
-test('Windows install falls back after the elevation launch timeout', async () => {
+test('Windows install writes no fallback when elevated registration times out', async () => {
   await withWindowsService({ accessDenied: true, elevationTimeout: true }, async (service, harness, appData) => {
     const started = Date.now();
-    await service.installService({ elevationTimeoutMs: 10 });
+    await assert.rejects(
+      service.installService({ elevationTimeoutMs: 10 }),
+      /no Startup fallback was written because the elevated task may still complete/,
+    );
     assert.ok(Date.now() - started < 1_000, 'test timeout remains bounded');
     const elevated = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('Start-Process'));
     assert.equal(elevated.options.timeout, 10);
-    assert.match(readFileSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs'), 'utf8'), /wsl\.exe/);
+    assert.equal(existsSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs')), false);
   });
 });
 
@@ -377,7 +474,7 @@ test('Windows install recognizes localized access denied by its stable exit code
 });
 
 test('Windows install skips elevation when --no-elevate is set', async () => {
-  await withWindowsService({ accessDenied: true }, async (service, harness, appData) => {
+  await withWindowsService({ accessDenied: true, noElevateExpected: true }, async (service, harness, appData) => {
     await service.installService({ noElevate: true });
     assert.ok(!harness.calls.some((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('Start-Process')));
     assert.match(readFileSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs'), 'utf8'), /wsl\.exe/);
@@ -399,7 +496,7 @@ test('Windows uninstall elevates task removal after non-elevated access denied',
     assert.equal(elevated.kind, 'exec', 'elevated removal output is captured and drained');
     assert.match(elevated.args.at(-1), /-EncodedCommand/);
     assert.doesNotMatch(elevated.args.at(-1), /-File(?:\s|')/);
-    assert.equal(existsSync(join(appData, 'runnerize')), false, 'elevated removal creates no marker files');
+    assert.equal(existsSync(join(appData, 'runnerize', 'elevation-marker')), false, 'elevated removal creates no marker files');
   });
 });
 

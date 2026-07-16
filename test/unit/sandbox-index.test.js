@@ -51,6 +51,18 @@ test('detectFlavors returns only available flavors, by reference', async () => {
   });
 });
 
+test('detectFlavors filters candidates before probing availability', async () => {
+  let linuxProbes = 0;
+  await withAvailability({
+    linux: async () => { linuxProbes += 1; return true; },
+    windows: async () => true,
+    macos: async () => true,
+  }, async () => {
+    assert.deepEqual((await detectFlavors(new Set(['windows']))).map((flavor) => flavor.key), ['windows']);
+    assert.equal(linuxProbes, 0);
+  });
+});
+
 test('detectFlavors treats a throwing available() as unavailable', async () => {
   await withAvailability({
     linux: async () => { throw new Error('runtime probe blew up'); },
