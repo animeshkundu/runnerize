@@ -15,6 +15,16 @@ const PROBE_TIMEOUT_MS = 10_000;
 const INSTALL_TIMEOUT_MS = 120_000;
 const WSL_INSTALL_GUIDANCE = 'In an elevated PowerShell: wsl --install -d Ubuntu\nThen restart Windows if prompted and rerun this command.';
 const GITHUB_AUTH_GUIDANCE = 'Run: gh auth login\nOr set GH_TOKEN/GITHUB_TOKEN. The credential needs Administration, Actions, and Metadata access across all owned private repositories.';
+const DEFAULT_MACOS_IMAGE = 'ghcr.io/cirruslabs/macos-sequoia-base:latest';
+const HOMEBREW_INSTALL_COMMAND = '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"';
+const TART_INSTALL_COMMAND = 'brew install cirruslabs/cli/tart';
+const MACOS_ENVIRONMENT_KEYS = [
+  'RUNNERIZE_MACOS_IMAGE',
+  'RUNNERIZE_MACOS_SSH_USER',
+  'RUNNERIZE_MACOS_SSH_KEY',
+  'RUNNERIZE_MACOS_RUNNER_DIR',
+  'RUNNERIZE_MACOS_RUNNER_VERSION',
+];
 const windowsPowerShellPath = join(
   process.env.SystemRoot || 'C:\\Windows',
   'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
@@ -142,8 +152,101 @@ function uninstallSystemd() {
   console.log(`Removed ${unitPath}`);
 }
 
+function tartImageAvailable(image) {
+  if (!image) return false;
+  const result = captureResult('tart', ['list', '--format', 'json'], { timeout: PROBE_TIMEOUT_MS });
+  if (result.status !== 0) return false;
+  try {
+    const listed = JSON.parse(result.stdout);
+    const images = Array.isArray(listed) ? listed : listed.vms ?? listed.VMs ?? [];
+    return images.some((entry) => (typeof entry === 'string' ? entry : entry.name) === image);
+  } catch {
+    return result.stdout.split(/\r?\n/).some((line) => line.trim().split(/\s+/)[0] === image);
+  }
+}
+
+async function auditMacosPrerequisites() {
+  const manualSteps = [];
+  let tartReady = process.arch === 'arm64';
+
+  if (!tartReady) {
+    manualSteps.push({
+      why: 'The native macOS backend requires Apple Silicon; this Mac can still serve Linux-container jobs.',
+      command: 'uname -m  # tart requires arm64',
+    });
+  } else if (!commandExists('tart')) {
+    if (commandExists('brew')) {
+      console.log('tart was not found; installing it with Homebrew...');
+      try {
+        run('brew', ['install', 'cirruslabs/cli/tart'], { timeout: INSTALL_TIMEOUT_MS });
+        tartReady = commandExists('tart');
+      } catch (error) {
+        tartReady = false;
+        console.warn(`tart could not be installed automatically: ${error.message}`);
+      }
+    } else {
+      tartReady = false;
+      manualSteps.push({
+        why: 'Install Homebrew; runnerize uses it to install tart without sudo.',
+        command: HOMEBREW_INSTALL_COMMAND,
+      });
+    }
+    if (!tartReady) {
+      manualSteps.push({
+        why: 'Install the tart CLI for disposable macOS virtual machines.',
+        command: TART_INSTALL_COMMAND,
+      });
+    }
+  }
+
+  const image = process.env.RUNNERIZE_MACOS_IMAGE;
+  const imageReady = Boolean(image && tartReady && tartImageAvailable(image));
+  if (!imageReady) {
+    const selected = image || DEFAULT_MACOS_IMAGE;
+    manualSteps.push({
+      why: 'Choose and pull a tart base image. This is a large one-time download; baking actions-runner into it makes jobs faster.',
+      command: `export RUNNERIZE_MACOS_IMAGE=${selected} && tart pull "$RUNNERIZE_MACOS_IMAGE"`,
+    });
+  }
+  manualSteps.push({
+    why: 'Confirm the base image accepts SSH and configure non-default credentials when needed.',
+    command: 'export RUNNERIZE_MACOS_SSH_USER=admin  # optionally export RUNNERIZE_MACOS_SSH_KEY=~/.ssh/id_ed25519',
+  });
+  if (!nativeGitHubCredentialAvailable()) {
+    manualSteps.push({
+      why: 'Authenticate the GitHub CLI interactively, or set GH_TOKEN/GITHUB_TOKEN.',
+      command: 'gh auth login',
+    });
+  }
+
+  printManualSteps('macOS setup steps', manualSteps);
+  return { tartReady, imageReady };
+}
+
+function launchdEnvironmentXml() {
+  const entries = MACOS_ENVIRONMENT_KEYS
+    .filter((key) => process.env[key])
+    .map((key) => `    <key>${key}</key><string>${xmlEscape(process.env[key])}</string>`);
+  if (!entries.length) return '';
+  return `  <key>EnvironmentVariables</key>\n  <dict>\n${entries.join('\n')}\n  </dict>\n`;
+}
+
 async function installLaunchd() {
-  await preflightRun();
+  const audit = await auditMacosPrerequisites();
+  let runnable = false;
+  try {
+    await preflightRun();
+    runnable = true;
+  } catch (error) {
+    if (audit.tartReady && audit.imageReady) {
+      if (!nativeGitHubCredentialAvailable()) throw error;
+      runnable = true;
+      console.warn(`Linux backend unavailable: ${error.message}`);
+    } else {
+      throw error;
+    }
+  }
+  if (!runnable) throw new Error('No runnerize backend is available on this macOS host.');
   const agentPath = join(homedir(), 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist');
   mkdirSync(dirname(agentPath), { recursive: true });
   writeFileSync(agentPath, `<?xml version="1.0" encoding="UTF-8"?>
@@ -155,7 +258,7 @@ async function installLaunchd() {
   <array><string>${xmlEscape(process.execPath)}</string><string>${xmlEscape(binPath)}</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
+${launchdEnvironmentXml()}  <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${xmlEscape(join(homedir(), 'Library', 'Logs', 'runnerize.log'))}</string>
   <key>StandardErrorPath</key><string>${xmlEscape(join(homedir(), 'Library', 'Logs', 'runnerize.log'))}</string>
 </dict>

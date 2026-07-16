@@ -152,12 +152,21 @@ A repo opts in with:
 runs-on: [self-hosted, macos, arm64]
 ```
 
+`npx runnerize service install` audits the Mac first. On Apple Silicon it installs
+tart automatically through Homebrew when possible, without sudo. It does not pull
+a base image automatically because macOS images are tens of gigabytes; instead it
+prints numbered copy-paste commands for Homebrew/tart gaps, the one-time image
+pull, SSH credentials, and GitHub login. The launchd agent is still installed when
+another backend is usable, so completing a guided step later enables the macOS
+flavor without reinstalling.
+
 Set `RUNNERIZE_MACOS_IMAGE` to a local tart VM name or remote image reference,
-for example `ghcr.io/cirruslabs/macos-sequoia-base:latest`. runnerize clones the
-image for every job, boots the clone without a graphical console, connects over
-SSH, runs one JIT-configured runner, then stops and deletes the clone. No runner
-workspace or registration state persists. The per-host cap is two concurrent
-macOS VMs, even when `--max` is higher.
+for example `ghcr.io/cirruslabs/macos-sequoia-base:latest`, then run `tart pull
+"$RUNNERIZE_MACOS_IMAGE"`. runnerize clones the image for every job, boots the
+clone without a graphical console, connects over SSH, runs one JIT-configured
+runner, then stops and deletes the clone. No runner workspace or registration
+state persists. The per-host cap is two concurrent macOS VMs, even when `--max`
+is higher.
 
 Configuration:
 
