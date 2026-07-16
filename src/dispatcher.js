@@ -69,7 +69,7 @@ function abortableDelay(milliseconds, signal) {
 }
 
 function labelsMatchFlavor(runnerLabels, flavors) {
-  if (flavors.length === 0) return true;
+  if (flavors.length === 0) return false;
   const labels = new Set(runnerLabels.map((label) =>
     String(typeof label === 'string' ? label : label.name).toLowerCase()));
   return flavors.some((flavor) => flavor.labels.every((label) => labels.has(label.toLowerCase())));

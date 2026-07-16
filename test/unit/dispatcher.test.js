@@ -334,7 +334,7 @@ test('re-checks privacy immediately before mint and fails closed (no mint, no JI
 
 test('reconcile deletes offline runnerize-* registrations but leaves foreign/online ones', async () => {
   const flavor = new FakeFlavor();
-  flavor.available = async () => false; // no flavor => pure reconcile behavior, no minting
+  flavor.available = async () => true;
   await runSession({
     flavor,
     options: { maxConcurrent: 2, reconcileMs: 10_000_000 },
@@ -355,6 +355,24 @@ test('reconcile deletes offline runnerize-* registrations but leaves foreign/onl
     assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/1$/), 1, 'the offline runnerize-* runner is removed');
     assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/2$/), 0, 'the online runnerize-* runner is kept');
     assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/3$/), 0, 'a foreign runner is never touched');
+  });
+});
+
+test('reconcile removes nothing when the requested flavor is unavailable', async () => {
+  const flavor = new FakeFlavor();
+  flavor.available = async () => false;
+  await runSession({
+    flavor,
+    options: { only: new Set(['linux']), reconcileMs: 10_000_000 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/recon-empty', private: true }],
+      runners: { 'me/recon-empty': [{ id: 7, name: 'runnerize-stale', status: 'offline', labels: ['self-hosted', 'linux', 'x64'] }] },
+    },
+  }, async ({ start, stub, events }) => {
+    start();
+    assert.ok(await waitFor(() => events('reconcile_complete').length >= 1));
+    assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/7$/), 0);
   });
 });
 
