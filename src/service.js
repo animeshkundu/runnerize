@@ -74,6 +74,31 @@ function commandExists(command) {
   return probe.status === 0;
 }
 
+function printManualSteps(title, steps) {
+  if (!steps.length) return;
+  console.log(`\n${title}`);
+  console.log('='.repeat(title.length));
+  steps.forEach((step, index) => {
+    console.log(`${index + 1}. ${step.why}`);
+    console.log(`   ${step.command}`);
+  });
+  console.log('');
+}
+
+function windowsBuildNumber() {
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write([System.Environment]::OSVersion.Version.Build)',
+  ], { timeout: PROBE_TIMEOUT_MS });
+  const build = Number.parseInt(result.stdout?.trim(), 10);
+  return result.status === 0 && Number.isInteger(build) ? build : null;
+}
+
+function nativeGitHubCredentialAvailable() {
+  if (process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim()) return true;
+  const result = captureResult('gh', ['auth', 'token'], { timeout: PROBE_TIMEOUT_MS });
+  return result.status === 0 && Boolean(result.stdout?.trim());
+}
+
 async function installSystemd() {
   await preflightRun();
   const unitPath = join(homedir(), '.config', 'systemd', 'user', `${SERVICE_NAME}.service`);
@@ -501,6 +526,98 @@ async function runElevated(operation, command, { timeoutMs = ELEVATION_TIMEOUT_M
   return { ok: true };
 }
 
+async function auditWindowsPrerequisites({ noElevate = false, elevationTimeoutMs } = {}) {
+  const manualSteps = [];
+  const enabled = [];
+  let rebootRequired = false;
+
+  if (!commandExists('wsb.exe')) {
+    const build = windowsBuildNumber();
+    if (build !== null && build >= 26100) {
+      const command = "Enable-WindowsOptionalFeature -Online -FeatureName 'Containers-DisposableClientVM' -All -NoRestart | Out-Null";
+      if (noElevate) {
+        manualSteps.push({
+          why: 'Enable Windows Sandbox from an Administrator PowerShell, then restart Windows.',
+          command,
+        });
+      } else {
+        console.log('Administrator access is needed to enable the Windows Sandbox feature.');
+        console.log('A UAC prompt will appear. Approve it to enable the native Windows backend.');
+        const result = await runElevated('enable Windows Sandbox', command, { timeoutMs: elevationTimeoutMs });
+        if (result.ok) {
+          enabled.push('Windows Sandbox');
+          rebootRequired = true;
+        } else {
+          console.warn(`Windows Sandbox could not be enabled automatically: ${result.reason}`);
+          manualSteps.push({
+            why: 'Enable Windows Sandbox from an Administrator PowerShell, then restart Windows.',
+            command,
+          });
+        }
+      }
+    } else {
+      manualSteps.push({
+        why: build === null
+          ? 'Windows Sandbox was not found and the Windows build could not be detected. The native backend requires Windows 11 24H2 or newer.'
+          : `The native backend requires Windows 11 24H2 (build 26100) or newer. This host is build ${build}.`,
+        command: 'Settings > Windows Update > Check for updates',
+      });
+    }
+  }
+
+  let wslAvailable = true;
+  try {
+    resolveWslDistro();
+  } catch {
+    wslAvailable = false;
+  }
+  if (!wslAvailable) {
+    const command = 'wsl --install -d Ubuntu';
+    if (noElevate) {
+      manualSteps.push({
+        why: 'Install WSL2 and Ubuntu from an Administrator PowerShell, then restart Windows.',
+        command,
+      });
+    } else {
+      console.log('Administrator access is needed to install WSL2 and Ubuntu.');
+      console.log('A UAC prompt will appear. Approve it to enable the Linux backend.');
+      const result = await runElevated('install WSL2 and Ubuntu', command, { timeoutMs: elevationTimeoutMs });
+      if (result.ok) {
+        enabled.push('WSL2 and Ubuntu');
+        rebootRequired = true;
+      } else {
+        console.warn(`WSL2 and Ubuntu could not be installed automatically: ${result.reason}`);
+        manualSteps.push({
+          why: 'Install WSL2 and Ubuntu from an Administrator PowerShell, then restart Windows.',
+          command,
+        });
+      }
+    }
+  }
+
+  if (!nativeGitHubCredentialAvailable()) {
+    manualSteps.push({
+      why: 'Authenticate the GitHub CLI interactively, or set GH_TOKEN/GITHUB_TOKEN, then rerun the installer.',
+      command: 'gh auth login',
+    });
+  }
+
+  printManualSteps('Manual steps', manualSteps);
+  if (rebootRequired) {
+    printManualSteps('Restart required', [
+      {
+        why: `Restart Windows to finish enabling ${enabled.join(' and ')}.`,
+        command: 'Restart-Computer',
+      },
+      {
+        why: 'Run the installer again after signing in to finish setup.',
+        command: 'npx runnerize service install',
+      },
+    ]);
+  }
+  return { rebootRequired };
+}
+
 function scheduledTaskPrincipal(taskName) {
   const script = `$task = Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 1 }; [Console]::Out.Write($task.Principal.UserId)`;
   const result = captureResult(powershellPath, [
@@ -559,7 +676,8 @@ async function installLogonTrigger(spec, { noElevate = false, elevationTimeoutMs
   }
 
   if (!noElevate) {
-    console.log('Task registration needs administrator access — requesting elevation (decline to use a login-only Startup entry)...');
+    console.log(`Administrator access is needed to register the ${spec.taskName} auto-start task.`);
+    console.log('A UAC prompt will appear. Approve it for Task Scheduler; declining uses a login-only Startup entry.');
     const elevated = await runElevated('install', script, { timeoutMs: elevationTimeoutMs });
     if (elevated.ok) {
       // Same action-content confirmation as above, for the same reasons.
@@ -574,6 +692,10 @@ async function installLogonTrigger(spec, { noElevate = false, elevationTimeoutMs
       if (elevated.reason === 'elevation prompt was not answered') {
         throw new Error(`Task registration for ${spec.taskName} timed out. Rerun the install after the elevation prompt closes; no Startup fallback was written because the elevated task may still complete.`);
       }
+      printManualSteps('Administrator step declined or unavailable', [{
+        why: 'The installer will use a login-only Startup entry. Rerun this command later to retry Task Scheduler registration.',
+        command: 'npx runnerize service install',
+      }]);
     }
   }
 
@@ -680,6 +802,9 @@ function wslKeepAwakeSpec(context) {
 }
 
 async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
+  const audit = await auditWindowsPrerequisites({ noElevate, elevationTimeoutMs });
+  if (audit.rebootRequired) return;
+
   const statuses = [];
   let context;
   let linuxInstalled = false;
