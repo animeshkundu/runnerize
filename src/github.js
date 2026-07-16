@@ -1,5 +1,8 @@
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -133,16 +136,34 @@ export async function getToken({ signal } = {}) {
     return cachedToken;
   }
 
-  const { stdout } = await execFileAsync('gh', ['auth', 'token'], {
-    encoding: 'utf8',
-    timeout: DEFAULT_TIMEOUT_MS,
-    windowsHide: true,
-    signal,
-  });
-  const token = stdout.trim();
-  if (!token) throw new Error('No GitHub token is available');
-  cachedToken = token;
-  return cachedToken;
+  try {
+    const { stdout } = await execFileAsync('gh', ['auth', 'token'], {
+      encoding: 'utf8',
+      timeout: DEFAULT_TIMEOUT_MS,
+      windowsHide: true,
+      signal,
+    });
+    const token = stdout.trim();
+    if (!token) throw new Error('No GitHub token is available');
+    cachedToken = token;
+    return cachedToken;
+  } catch (error) {
+    if (process.platform !== 'win32') throw error;
+    const tokenPath = join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'runnerize', 'windows.token');
+    if (!existsSync(tokenPath)) throw error;
+    try {
+      const script = `[Console]::Out.Write([System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath '${tokenPath.replaceAll("'", "''")}' | ConvertTo-SecureString)).Password)`;
+      const { stdout } = await execFileAsync('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command', script,
+      ], { encoding: 'utf8', timeout: DEFAULT_TIMEOUT_MS, windowsHide: true, signal });
+      const token = stdout.trim();
+      if (!token) throw new Error('decrypted token was empty');
+      cachedToken = token;
+      return cachedToken;
+    } catch (decryptError) {
+      throw new Error(`Could not decrypt the persisted Windows credential at ${tokenPath}`, { cause: decryptError });
+    }
+  }
 }
 
 export async function api(method, path, {

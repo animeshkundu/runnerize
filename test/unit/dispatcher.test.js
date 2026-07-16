@@ -334,7 +334,7 @@ test('re-checks privacy immediately before mint and fails closed (no mint, no JI
 
 test('reconcile deletes offline runnerize-* registrations but leaves foreign/online ones', async () => {
   const flavor = new FakeFlavor();
-  flavor.available = async () => false; // no flavor => pure reconcile behavior, no minting
+  flavor.available = async () => true; // active flavor scopes reconcile; there is no demand to mint
   await runSession({
     flavor,
     options: { maxConcurrent: 2, reconcileMs: 10_000_000 },
@@ -343,9 +343,9 @@ test('reconcile deletes offline runnerize-* registrations but leaves foreign/onl
       repos: [{ full_name: 'me/recon', private: true }],
       runners: {
         'me/recon': [
-          { id: 1, name: 'runnerize-stale', status: 'offline', labels: [] },
-          { id: 2, name: 'runnerize-live', status: 'online', labels: [] },
-          { id: 3, name: 'someones-runner', status: 'offline', labels: [] },
+          { id: 1, name: 'runnerize-stale', status: 'offline', labels: ['self-hosted', 'linux', 'x64'] },
+          { id: 2, name: 'runnerize-live', status: 'online', labels: ['self-hosted', 'linux', 'x64'] },
+          { id: 3, name: 'someones-runner', status: 'offline', labels: ['self-hosted', 'linux', 'x64'] },
         ],
       },
     },
@@ -355,6 +355,36 @@ test('reconcile deletes offline runnerize-* registrations but leaves foreign/onl
     assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/1$/), 1, 'the offline runnerize-* runner is removed');
     assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/2$/), 0, 'the online runnerize-* runner is kept');
     assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/3$/), 0, 'a foreign runner is never touched');
+  });
+});
+
+test('flavor-scoped dispatcher does not mint or reconcile another flavor', async () => {
+  const flavor = new FakeFlavor();
+  flavor.key = 'windows';
+  flavor.labels = ['self-hosted', 'windows', 'x64'];
+  await runSession({
+    flavor,
+    options: { only: new Set(['windows']) },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/scoped', private: true }],
+      runs: { 'me/scoped': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: [{ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] }] },
+      runners: {
+        'me/scoped': [{
+          id: 44,
+          name: 'runnerize-linux-stale',
+          status: 'offline',
+          labels: ['self-hosted', 'linux', 'x64'],
+        }],
+      },
+    },
+  }, async ({ start, stub, events }) => {
+    start();
+    assert.ok(await waitFor(() => events('reconcile_complete').length >= 1));
+    await tick(80);
+    assert.equal(flavor.launches.length, 0);
+    assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/44$/), 0);
   });
 });
 

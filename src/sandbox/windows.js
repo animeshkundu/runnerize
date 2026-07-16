@@ -97,6 +97,21 @@ async function stopSandbox(id) {
   throw lastError ?? new Error(`Windows Sandbox ${id} did not stop`);
 }
 
+async function clearStaleSandboxes() {
+  for (const id of await runningSandboxIds()) await stopSandbox(id);
+}
+
+async function startSandbox(sandboxId) {
+  await clearStaleSandboxes();
+  try {
+    await collect('wsb.exe', ['start', '--id', sandboxId]);
+  } catch (error) {
+    if (!/CO_E_APPSINGLEUSE|0x800401e5/i.test(error.message)) throw error;
+    await clearStaleSandboxes();
+    await collect('wsb.exe', ['start', '--id', sandboxId]);
+  }
+}
+
 async function waitForExec(sandboxId) {
   const deadline = Date.now() + EXEC_READY_TIMEOUT_MS;
   let lastError;
@@ -194,7 +209,7 @@ export const windows = {
     try {
       await writeFile(path.join(controlDir, 'jit-config.txt'), encodedJitConfig, { mode: 0o600 });
       await writeFile(path.join(controlDir, 'run-runner.ps1'), RUNNER_SCRIPT, { mode: 0o600 });
-      await collect('wsb.exe', ['start', '--id', sandboxId]);
+      await startSandbox(sandboxId);
       await waitForExec(sandboxId);
       await collect('wsb.exe', [
         'share', '--id', sandboxId, '--host-path', runnerDir,

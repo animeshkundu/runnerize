@@ -7,6 +7,7 @@ import {
   listRunners,
 } from './github.js';
 import { detectFlavors } from './sandbox/index.js';
+import { keepHostAwake } from './keepawake.js';
 
 const RUNNER_NAME_PREFIX = 'runnerize-';
 const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
@@ -67,7 +68,16 @@ function abortableDelay(milliseconds, signal) {
   });
 }
 
-async function reconcile(repos, signal) {
+function runnerLabels(runner) {
+  return new Set(runner.labels.map((label) => typeof label === 'string' ? label : label.name));
+}
+
+function belongsToFlavor(runner, flavors) {
+  const labels = runnerLabels(runner);
+  return flavors.some((flavor) => flavor.labels.every((label) => labels.has(label)));
+}
+
+async function reconcile(repos, flavors, signal) {
   let removed = 0;
 
   for (const repo of repos) {
@@ -76,7 +86,9 @@ async function reconcile(repos, signal) {
     try {
       const runners = await listRunners(repo.full_name, { signal });
       const stale = runners.filter(
-        (runner) => runner.status === 'offline' && runner.name.startsWith(RUNNER_NAME_PREFIX),
+        (runner) => runner.status === 'offline'
+          && runner.name.startsWith(RUNNER_NAME_PREFIX)
+          && belongsToFlavor(runner, flavors),
       );
 
       for (const runner of stale) {
@@ -106,6 +118,8 @@ export async function runDispatcher({
   pollIntervalMs = 15_000,
   idleTimeoutMs = 120_000,
   reconcileMs = 300_000,
+  only,
+  keepAwake = true,
   signal,
 } = {}) {
   for (const [name, value] of Object.entries({ pollIntervalMs, idleTimeoutMs, reconcileMs })) {
@@ -140,6 +154,7 @@ export async function runDispatcher({
     else unassignedByRepoFlavor.set(key, repoFlavorCount);
   };
 
+  const wakeLock = keepAwake ? keepHostAwake() : null;
   log('dispatcher_started', { maxConcurrent, pollIntervalMs, idleTimeoutMs });
 
   try {
@@ -154,21 +169,21 @@ export async function runDispatcher({
         continue;
       }
 
-      const now = Date.now();
-      if (lastReconcile === 0 || now - lastReconcile >= reconcileMs) {
-        await reconcile(repos, signal);
-        lastReconcile = Date.now();
-      }
-      if (signal?.aborted) break;
-
       let flavors;
       try {
-        flavors = await detectFlavors();
+        flavors = await detectFlavors(only);
       } catch (error) {
         log('flavor_detection_error', errorFields(error));
         await abortableDelay(pollDelay(pollIntervalMs, repos.length), signal);
         continue;
       }
+
+      const now = Date.now();
+      if (lastReconcile === 0 || now - lastReconcile >= reconcileMs) {
+        await reconcile(repos, flavors, signal);
+        lastReconcile = Date.now();
+      }
+      if (signal?.aborted) break;
 
       for (const flavor of flavors) {
         if (signal?.aborted || semaphore.free() === 0) break;
@@ -302,6 +317,7 @@ export async function runDispatcher({
   } finally {
     log('dispatcher_draining', { inflight: launches.size });
     await Promise.allSettled([...launches]);
+    wakeLock?.dispose();
     log('dispatcher_stopped');
   }
 }

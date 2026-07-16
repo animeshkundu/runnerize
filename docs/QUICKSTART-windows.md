@@ -50,7 +50,9 @@ npm i -g runnerize
 runnerize service install
 ```
 
-The installer checks WSL, systemd, the container runtime, and GitHub authentication; prepares Node and runnerize inside WSL; installs a restarting systemd user service; enables user lingering where permitted; and adds a Windows logon trigger. It first registers the per-user Task Scheduler task without elevation. If Windows requires administrator access, it requests one UAC approval and registers the same task elevated. The prompt and elevated command share a 55-second timeout and report success through the elevated process exit code. If elevation is declined, unavailable, fails, or times out, runnerize falls back to the current user's Startup folder (login-only, without automatic restart).
+The installer independently installs every available backend. WSL gets a restarting systemd user service pinned to `--only linux`; Windows Sandbox gets a native dispatcher pinned to `--only windows`. Each gets a distinct logon trigger. Task Scheduler is attempted without elevation, then with one bounded UAC request; only when the task is confirmed absent does runnerize create a Startup-folder fallback. The native dispatcher keeps the system awake without keeping the display on, allows one visible Windows Sandbox job at a time, and logs to `%LOCALAPPDATA%\runnerize\runnerize-windows.log`.
+
+Persistence begins at the next interactive logon. It does not provide pre-login unattended service, and Windows Sandbox is unsupported while the desktop is locked or an RDP session is disconnected. AutoLogon can make reboots unattended but stores reusable credentials and should be evaluated as a security trade-off.
 
 For scripted installs or managed machines where you do not want a UAC prompt, pass `--no-elevate` or set `RUNNERIZE_NO_ELEVATE` to any non-empty value:
 
@@ -72,16 +74,24 @@ npx runnerize service install
 
 ## Target runnerize from a workflow
 
-runnerize currently offers the Linux flavor with exactly these labels:
+Use `[self-hosted, linux, x64]` for a WSL container job or `[self-hosted,
+windows, x64]` for a Windows Sandbox job:
 
 ```yaml
 jobs:
-  build:
+  linux:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - run: echo "running in runnerize"
+  windows:
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - uses: actions/checkout@v4
 ```
+
+For foreground troubleshooting, `runnerize run --only windows` isolates one backend.
+Use `--no-keep-awake` if the host should be allowed to sleep. `runnerize status`
+always reports all available flavors.
 
 ## Tune the service
 

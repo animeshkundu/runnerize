@@ -51,7 +51,10 @@ runnerize remove            # clean up any offline ephemeral runnerize-* runners
 ```
 
 Flags: `--max <n>` (concurrent runners, default 4), `--interval <ms>` (poll, default
-15000), `--idle-timeout <ms>` (kill an unclaimed runner, default 120000).
+15000), `--idle-timeout <ms>` (kill an unclaimed runner, default 120000), `--only
+<linux,windows,macos>` (serve selected flavors), and `--no-keep-awake` (allow the
+host to sleep while the dispatcher runs). `status` always reports every available
+flavor.
 
 ---
 
@@ -81,7 +84,9 @@ runs-on: [self-hosted, windows, x64]
 
 Windows Sandbox permits only one active instance, so runnerize runs at most one
 Windows job at a time on each host even when `--max` is higher. Every job gets a
-fresh sandbox. runnerize waits for `wsb exec` readiness, shares the runner read-only
+fresh, visible sandbox window. Windows jobs require an interactive, unlocked local
+desktop; locked or disconnected RDP sessions are unsupported. runnerize waits for
+`wsb exec` readiness, shares the runner read-only
 and a writable control folder with `wsb share`, and runs the JIT wrapper with
 `wsb exec --run-as System` (`ExistingLogin` is unavailable before an interactive
 login). The sandbox is stopped after the runner exits. Nested virtualization is not
@@ -89,19 +94,27 @@ available inside Windows Sandbox, so Windows jobs cannot use Docker-in-Docker.
 
 ### Boot persistence on Windows
 
-`runnerize service install` uses a three-tier Windows logon trigger:
+`runnerize service install` detects and independently installs every available
+backend. Linux runs through the WSL systemd user service pinned to `--only linux`;
+Windows Sandbox runs through a native hidden PowerShell launcher pinned to `--only
+windows`. The native launcher uses a process mutex, keeps the system awake without
+forcing the display on, and writes `%LOCALAPPDATA%\runnerize\runnerize-windows.log`.
+If only WSL is available, a small Windows-side holder keeps the host awake while its
+systemd service is active.
 
-1. It first registers a hidden, per-user Task Scheduler task without elevation. The
-   task starts the WSL systemd user service at logon and restarts on failure.
+Each backend uses a three-tier Windows logon trigger:
+
+1. It first registers a hidden, per-user Task Scheduler task without elevation.
 2. If registration is access-denied, it requests one UAC approval and registers the
-   same task elevated. The prompt and elevated command share a 55-second timeout;
-   success or failure is reported through the elevated process exit code.
-3. If elevation is declined, unavailable, times out, or cannot be verified, it writes
-   a hidden `...\Start Menu\Programs\Startup\runnerize.vbs` launcher for the current
-   user. This fallback starts only at login and cannot automatically restart after a
-   crash. Approval at the timeout boundary can leave both triggers if the detached
-   elevated child finishes late; both only issue the idempotent `systemctl --user
-   start runnerize`, so the overlap is harmless.
+   same task elevated. The prompt and elevated command share a 55-second timeout.
+3. Only when the task is confirmed absent, it writes a distinct hidden Startup-folder
+   `.vbs` launcher for the current user. A task and its fallback are never intentionally
+   left active together.
+
+These triggers resume at the next interactive logon, not before login. Unattended
+restart requires Windows AutoLogon, which stores reusable credentials and is a
+security trade-off. Windows Sandbox remains unsupported on locked or disconnected
+RDP desktops.
 
 Pass `--no-elevate`, or set `RUNNERIZE_NO_ELEVATE` to any non-empty value, to skip
 Tier 2 for scripted installs and managed machines. Either setting is sufficient:

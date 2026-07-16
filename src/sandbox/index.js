@@ -4,8 +4,10 @@ import { macos } from './macos.js';
 
 export { linux, windows, macos };
 
-export async function detectFlavors() {
-  const flavors = [linux, windows, macos];
+export const FLAVOR_KEYS = new Set([linux.key, windows.key, macos.key]);
+
+export async function detectFlavors(only) {
+  const flavors = [linux, windows, macos].filter((flavor) => !only || only.has(flavor.key));
   const availability = await Promise.all(flavors.map(async (flavor) => {
     try {
       return await flavor.available();
