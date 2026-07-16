@@ -50,7 +50,9 @@ npm i -g runnerize
 runnerize service install
 ```
 
-The installer checks WSL, systemd, the container runtime, and GitHub authentication; prepares Node and runnerize inside WSL; installs a restarting systemd user service; enables user lingering where permitted; and adds a Windows logon trigger. It first registers the per-user Task Scheduler task without elevation. If Windows requires administrator access, it requests one UAC approval and registers the same task elevated. The prompt and elevated command share a 55-second timeout and report success through the elevated process exit code. If elevation is declined, unavailable, fails, or times out, runnerize falls back to the current user's Startup folder (login-only, without automatic restart).
+The installer detects and independently installs every available backend: a WSL systemd dispatcher restricted to Linux and a native Windows-Sandbox dispatcher restricted to Windows. Both persist through interactive-logon triggers and keep the host awake by default. The native log is `%LOCALAPPDATA%\runnerize\runnerize-windows.log`; a sandbox window is visible during each Windows job, and only one Windows job runs at a time. Windows jobs resume after an interactive logon, not headlessly before login; locked, disconnected, and RDP sessions are unsupported. Use `run --only linux|windows` to select a flavor or `--no-keep-awake` to permit host sleep.
+
+It first registers each per-user Task Scheduler task without elevation. If Windows requires administrator access, it requests one UAC approval and registers the same task elevated. The prompt and elevated command share a 55-second timeout and report success through the elevated process exit code. If elevation is declined, unavailable, fails, or times out, runnerize falls back to the current user's Startup folder (login-only, without automatic restart).
 
 For scripted installs or managed machines where you do not want a UAC prompt, pass `--no-elevate` or set `RUNNERIZE_NO_ELEVATE` to any non-empty value:
 

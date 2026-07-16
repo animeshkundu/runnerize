@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -68,12 +68,13 @@ function commandExists(command) {
   return probe.status === 0;
 }
 
-async function installSystemd() {
-  await preflightRun();
+async function installSystemd(options = {}) {
+  await preflightRun({ only: options.only });
   const unitPath = join(homedir(), '.config', 'systemd', 'user', `${SERVICE_NAME}.service`);
   const environmentFile = process.env.RUNNERIZE_SYSTEMD_ENV_FILE
     ? `EnvironmentFile=-${process.env.RUNNERIZE_SYSTEMD_ENV_FILE}\n`
     : '';
+  const onlyArgs = options.only?.size ? ` --only ${[...options.only].join(',')}` : '';
   mkdirSync(dirname(unitPath), { recursive: true });
   writeFileSync(unitPath, `[Unit]
 Description=runnerize ephemeral GitHub Actions dispatcher
@@ -82,7 +83,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(binPath)} run
+ExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(binPath)} run${onlyArgs}
 ${environmentFile}Restart=always
 RestartSec=5
 KillMode=mixed
@@ -277,16 +278,24 @@ function nativeRuntime() {
   return null;
 }
 
-export async function preflightRun({ install = true } = {}) {
+export async function preflightRun({ install = true, only } = {}) {
+  const wantsLinux = !only || only.has('linux');
+  const wantsWindows = !only || only.has('windows');
   let runtime;
-  if (platform() === 'win32') {
-    const context = resolveWslContext();
-    runtime = ensureWslRuntime(context, { install });
-  } else {
-    runtime = nativeRuntime();
-    if (!runtime) {
-      throw new Error('No working rootless Podman or Docker runtime was found. Install Podman, verify `podman info`, then rerun this command.');
+
+  if (wantsLinux) {
+    if (platform() === 'win32') {
+      const context = resolveWslContext();
+      runtime = ensureWslRuntime(context, { install });
+    } else {
+      runtime = nativeRuntime();
+      if (!runtime) {
+        throw new Error('No working rootless Podman or Docker runtime was found. Install Podman, verify `podman info`, then rerun this command.');
+      }
     }
+  }
+  if (wantsWindows && platform() === 'win32' && !commandExists('wsb.exe')) {
+    throw new Error('Windows Sandbox is required for the windows flavor. Enable Windows Sandbox, then rerun this command.');
   }
 
   try {
@@ -294,7 +303,8 @@ export async function preflightRun({ install = true } = {}) {
   } catch {
     throw new Error(`GitHub authentication is not available.\n${GITHUB_AUTH_GUIDANCE}`);
   }
-  console.log(`Prerequisites ready: container runtime ${runtime}; GitHub credential available.`);
+  const ready = [runtime && `container runtime ${runtime}`, wantsWindows && platform() === 'win32' && 'Windows Sandbox', 'GitHub credential available'].filter(Boolean);
+  console.log(`Prerequisites ready: ${ready.join('; ')}.`);
   return { runtime };
 }
 
@@ -394,10 +404,10 @@ function materializeRunnerize({ distro, user, home }) {
   return { root: destination, bin: `${destination}/bin/runnerize.js` };
 }
 
-function windowsStartupPath() {
+function windowsStartupPath(fileName = 'runnerize.vbs') {
   return join(
     process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'),
-    'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs',
+    'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', fileName,
   );
 }
 
@@ -418,12 +428,22 @@ function systemdStartCommand() {
   return 'export XDG_RUNTIME_DIR=/run/user/$(id -u); export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; systemctl --user start runnerize';
 }
 
-function taskSchedulerScript(distro, wslUser, windowsUser) {
-  const argumentsValue = `-d ${windowsCommandLineArg(distro)} -u ${windowsCommandLineArg(wslUser)} -e bash -lc ${windowsCommandLineArg(systemdStartCommand())}`;
+function wslTriggerSpec(distro, wslUser) {
+  const argument = `-d ${windowsCommandLineArg(distro)} -u ${windowsCommandLineArg(wslUser)} -e bash -lc ${windowsCommandLineArg(systemdStartCommand())}`;
+  return {
+    taskName: SERVICE_NAME,
+    startupFileName: 'runnerize.vbs',
+    execute: 'wsl.exe',
+    argument,
+    startupCommand: `wsl.exe ${argument}`,
+  };
+}
+
+function taskSchedulerScript(spec, windowsUser) {
   return [
-    `$taskName = ${powershellLiteral(SERVICE_NAME)}`,
+    `$taskName = ${powershellLiteral(spec.taskName)}`,
     `$user = ${powershellLiteral(windowsUser)}`,
-    `$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument ${powershellLiteral(argumentsValue)}`,
+    `$action = New-ScheduledTaskAction -Execute ${powershellLiteral(spec.execute)} -Argument ${powershellLiteral(spec.argument)}`,
     '$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user',
     '$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited',
     '$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 10 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
@@ -442,11 +462,10 @@ function isAccessDenied(result) {
   return /access (?:is )?denied|unauthorizedaccess|insufficient privilege|privilege.*not held|requires elevation|permission denied|0x80070005/i.test(output);
 }
 
-function writeStartupLauncher(distro, user) {
-  const startupPath = windowsStartupPath();
+function writeStartupLauncher(spec) {
+  const startupPath = windowsStartupPath(spec.startupFileName);
   mkdirSync(dirname(startupPath), { recursive: true });
-  const command = `wsl.exe -d ${windowsCommandLineArg(distro)} -u ${windowsCommandLineArg(user)} -e bash -lc ${windowsCommandLineArg(systemdStartCommand())}`;
-  writeFileSync(startupPath, `CreateObject("WScript.Shell").Run "${command.replaceAll('"', '""')}", 0, False\r\n`);
+  writeFileSync(startupPath, `CreateObject("WScript.Shell").Run "${spec.startupCommand.replaceAll('"', '""')}", 0, False\r\n`);
   return startupPath;
 }
 
@@ -478,23 +497,23 @@ async function runElevated(operation, command, { timeoutMs = ELEVATION_TIMEOUT_M
   return { ok: true };
 }
 
-function scheduledTaskPrincipal() {
-  const script = `$task = Get-ScheduledTask -TaskName ${powershellLiteral(SERVICE_NAME)} -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 1 }; [Console]::Out.Write($task.Principal.UserId)`;
+function scheduledTaskPrincipal(taskName) {
+  const script = `$task = Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 1 }; [Console]::Out.Write($task.Principal.UserId)`;
   const result = captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
   ]);
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
-async function installLogonTrigger(distro, user, { noElevate = false, elevationTimeoutMs } = {}) {
+async function installLogonTrigger(spec, { noElevate = false, elevationTimeoutMs } = {}) {
   const windowsUser = currentWindowsUser();
-  const script = taskSchedulerScript(distro, user, windowsUser);
+  const script = taskSchedulerScript(spec, windowsUser);
   console.log('Registering logon task...');
   const result = captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
   ], { encoding: 'utf8', windowsHide: true });
   if (result.status === 0) {
-    rmSync(windowsStartupPath(), { force: true });
+    rmSync(windowsStartupPath(spec.startupFileName), { force: true });
     console.log('Registered auto-start task.');
     return { kind: 'Task Scheduler', detail: `task ${SERVICE_NAME} for ${windowsUser}` };
   }
@@ -507,9 +526,9 @@ async function installLogonTrigger(distro, user, { noElevate = false, elevationT
     console.log('Task registration needs administrator access — requesting elevation (decline to use a login-only Startup entry)...');
     const elevated = await runElevated('install', script, { timeoutMs: elevationTimeoutMs });
     if (elevated.ok) {
-      const principal = scheduledTaskPrincipal();
+      const principal = scheduledTaskPrincipal(spec.taskName);
       if (principal?.toLowerCase() === windowsUser.toLowerCase()) {
-        rmSync(windowsStartupPath(), { force: true });
+        rmSync(windowsStartupPath(spec.startupFileName), { force: true });
         console.log('Registered auto-start task (elevated).');
         return { kind: 'Task Scheduler (elevated)', detail: `task ${SERVICE_NAME} for ${windowsUser}` };
       }
@@ -520,10 +539,10 @@ async function installLogonTrigger(distro, user, { noElevate = false, elevationT
   }
 
   console.log('Falling back to a Startup-folder entry (login-only, no auto-restart).');
-  return { kind: 'Startup folder fallback', detail: writeStartupLauncher(distro, user) };
+  return { kind: 'Startup folder fallback', detail: writeStartupLauncher(spec) };
 }
 
-async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
+async function installWslBackend({ noElevate = false, elevationTimeoutMs } = {}) {
   const context = resolveWslContext();
   console.log(`WSL distro: ${context.distro} (user ${context.user})`);
   const preflight = preflightWsl(context);
@@ -538,14 +557,102 @@ async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
   const installation = materializeRunnerize(context);
   console.log(`runnerize package: ${installation.root}`);
   const installCommand = preflight.token
-    ? ['env', `RUNNERIZE_SYSTEMD_ENV_FILE=${context.home}/.config/runnerize/.env`, node.path, installation.bin, 'service', 'install']
-    : [node.path, installation.bin, 'service', 'install'];
+    ? ['env', `RUNNERIZE_SYSTEMD_ENV_FILE=${context.home}/.config/runnerize/.env`, node.path, installation.bin, 'service', 'install', '--only', 'linux']
+    : [node.path, installation.bin, 'service', 'install', '--only', 'linux'];
   wslRun(context.distro, context.user, systemdWslArgs(installCommand));
   console.log('systemd user service: installed and enabled');
-  const trigger = await installLogonTrigger(context.distro, context.user, { noElevate, elevationTimeoutMs });
+  const trigger = await installLogonTrigger(wslTriggerSpec(context.distro, context.user), { noElevate, elevationTimeoutMs });
   console.log(`Windows logon trigger: ${trigger.kind} (${trigger.detail})`);
   console.log(`View logs: wsl.exe -d ${context.distro} -u ${context.user} -e journalctl --user -u runnerize -f`);
   console.log('Uninstall: runnerize service uninstall');
+}
+
+function windowsLocalRoot() {
+  return join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'runnerize');
+}
+
+function materializeWindowsApp() {
+  const root = join(windowsLocalRoot(), 'app');
+  const staging = `${root}.new.${process.pid}`;
+  const previous = `${root}.old.${process.pid}`;
+  rmSync(staging, { recursive: true, force: true });
+  mkdirSync(staging, { recursive: true });
+  for (const entry of ['bin', 'src', 'package.json']) {
+    cpSync(join(packageRoot, entry), join(staging, entry), { recursive: true });
+  }
+  rmSync(previous, { recursive: true, force: true });
+  if (existsSync(root)) renameSync(root, previous);
+  try {
+    renameSync(staging, root);
+  } catch (error) {
+    if (existsSync(previous)) renameSync(previous, root);
+    throw error;
+  }
+  rmSync(previous, { recursive: true, force: true });
+  return { root, bin: join(root, 'bin', 'runnerize.js') };
+}
+
+function persistWindowsToken() {
+  const envToken = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
+  if (!envToken) return null;
+  const tokenPath = join(windowsLocalRoot(), 'windows.token');
+  mkdirSync(dirname(tokenPath), { recursive: true });
+  const script = '$bytes=[Text.Encoding]::UTF8.GetBytes($env:RUNNERIZE_PLAIN_TOKEN); $encrypted=[Security.Cryptography.ProtectedData]::Protect($bytes,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($encrypted))';
+  const encrypted = capture(powershellPath, ['-NoProfile', '-NonInteractive', '-Command', script], {
+    env: { ...process.env, RUNNERIZE_PLAIN_TOKEN: envToken }, timeout: PROBE_TIMEOUT_MS,
+  });
+  if (!encrypted) throw new Error('DPAPI encryption returned no credential data.');
+  writeFileSync(tokenPath, `${encrypted}\n`, { mode: 0o600 });
+  console.log(`GitHub authentication: encrypted session token persisted for native Windows dispatcher (${tokenPath})`);
+  return tokenPath;
+}
+
+function writeWindowsLauncher(appBin) {
+  const root = windowsLocalRoot();
+  const launcher = join(root, 'runnerize-windows.ps1');
+  const log = join(root, 'runnerize-windows.log');
+  mkdirSync(root, { recursive: true });
+  writeFileSync(launcher, `$ErrorActionPreference = 'Stop'
+$mutex = [Threading.Mutex]::new($false, 'Local\\runnerize-windows')
+if (-not $mutex.WaitOne(0)) { exit 0 }
+Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class RunnerizePower { [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags); }
+'@
+try {
+  [void][RunnerizePower]::SetThreadExecutionState(0x80000001)
+  $node = (Get-Command node.exe -ErrorAction Stop).Source
+  & $node ${powershellLiteral(appBin)} run --only windows *>> ${powershellLiteral(log)}
+  exit $LASTEXITCODE
+} finally {
+  [void][RunnerizePower]::SetThreadExecutionState(0x80000000)
+  $mutex.ReleaseMutex()
+  $mutex.Dispose()
+}
+`);
+  return { launcher, log };
+}
+
+function windowsTriggerSpec(launcher) {
+  const argument = `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${windowsCommandLineArg(launcher)}`;
+  return {
+    taskName: `${SERVICE_NAME}-windows`,
+    startupFileName: `${SERVICE_NAME}-windows.vbs`,
+    execute: powershellPath,
+    argument,
+    startupCommand: `${windowsCommandLineArg(powershellPath)} ${argument}`,
+  };
+}
+
+async function installNativeWindows(options) {
+  await getToken();
+  const installation = materializeWindowsApp();
+  persistWindowsToken();
+  const launcher = writeWindowsLauncher(installation.bin);
+  const trigger = await installLogonTrigger(windowsTriggerSpec(launcher.launcher), options);
+  console.log(`Native Windows dispatcher: installed (${trigger.kind})`);
+  console.log(`Native Windows log: ${launcher.log}`);
+  return { installation, launcher, trigger };
 }
 
 function bestEffort(command, args) {
@@ -575,43 +682,73 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs } = {}) 
     bestEffort('wsl.exe', wslArgs(context.distro, context.user, ['rm', '-rf', installation, `${context.home}/.cache/runnerize/node`, `${context.home}/.config/runnerize`]));
   }
 
-  const script = `Get-ScheduledTask -TaskName ${powershellLiteral(SERVICE_NAME)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
-  const taskRemoval = captureResult(powershellPath, [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
-  ], { encoding: 'utf8', windowsHide: true });
-  if (taskRemoval.status !== 0 && isAccessDenied(taskRemoval)) {
-    if (noElevate) {
-      console.warn(`Could not remove the elevated ${SERVICE_NAME} task without administrator access. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
-    } else {
-      console.log('Task removal needs administrator access — requesting elevation...');
+  const removeTask = async (taskName) => {
+    const script = `Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
+    const taskRemoval = captureResult(powershellPath, [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
+    ], { encoding: 'utf8', windowsHide: true });
+    if (taskRemoval.status !== 0 && isAccessDenied(taskRemoval) && !noElevate) {
       const elevated = await runElevated('uninstall', script, { timeoutMs: elevationTimeoutMs });
-      if (!elevated.ok) {
-        console.warn(`Could not remove the elevated ${SERVICE_NAME} task: ${elevated.reason}. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
-      } else if (scheduledTaskPrincipal() === null) {
-        console.log('Removed auto-start task (elevated).');
-      } else {
-        console.warn(`Elevated ${SERVICE_NAME} task removal could not be confirmed. Remove it manually in Task Scheduler or rerun uninstall elevated.`);
-      }
+      if (!elevated.ok) console.warn(`Could not remove the elevated ${taskName} task: ${elevated.reason}.`);
+    } else if (taskRemoval.status !== 0 && isAccessDenied(taskRemoval)) {
+      console.warn(`Could not remove the elevated ${taskName} task without administrator access.`);
     }
-  } else if (taskRemoval.status !== 0) {
-    const detail = taskRemoval.stderr?.trim() || taskRemoval.stdout?.trim() || taskRemoval.error?.message || `exit code ${taskRemoval.status}`;
-    console.warn(`Could not remove the ${SERVICE_NAME} task: ${detail}. Remove it manually in Task Scheduler if it still exists.`);
-  }
+  };
+  await removeTask(SERVICE_NAME);
+  await removeTask(`${SERVICE_NAME}-windows`);
   rmSync(windowsStartupPath(), { force: true });
-  console.log('Removed the WSL systemd service, Windows logon trigger, package copy, and Node cache where present.');
+  rmSync(windowsStartupPath(`${SERVICE_NAME}-windows.vbs`), { force: true });
+  rmSync(join(windowsLocalRoot(), 'app'), { recursive: true, force: true });
+  rmSync(join(windowsLocalRoot(), 'runnerize-windows.ps1'), { force: true });
+  rmSync(join(windowsLocalRoot(), 'windows.token'), { force: true });
+  rmSync(join(windowsLocalRoot(), 'runnerize-windows.log'), { force: true });
+  console.log('Removed runnerize service backends and native artifacts where present.');
 }
 
 function elevationDisabled(options) {
   return Boolean(options.noElevate || process.env.RUNNERIZE_NO_ELEVATE);
 }
 
+async function installWindows(options = {}) {
+  const selected = options.only;
+  const wantsLinux = !selected || selected.has('linux');
+  const wantsWindows = !selected || selected.has('windows');
+  const results = [];
+
+  if (wantsLinux) {
+    try {
+      await installWslBackend(options);
+      results.push({ backend: 'linux', status: 'installed' });
+    } catch (error) {
+      console.warn(`Linux/WSL backend unavailable: ${error.message}`);
+      results.push({ backend: 'linux', status: 'unavailable', error });
+    }
+  } else results.push({ backend: 'linux', status: 'skipped' });
+
+  if (wantsWindows && commandExists('wsb.exe')) {
+    try {
+      await installNativeWindows(options);
+      results.push({ backend: 'windows', status: 'installed' });
+    } catch (error) {
+      console.warn(`Windows Sandbox backend unavailable: ${error.message}`);
+      results.push({ backend: 'windows', status: 'unavailable', error });
+    }
+  } else results.push({ backend: 'windows', status: wantsWindows ? 'unavailable' : 'skipped' });
+
+  for (const result of results) console.log(`Backend ${result.backend}: ${result.status}`);
+  if (!results.some((result) => result.status === 'installed')) {
+    throw new Error('No requested runnerize backend could be installed. Install WSL2/Podman or enable Windows Sandbox, then retry.');
+  }
+  return results;
+}
+
 export async function installService(options = {}) {
   if (platform() === 'darwin') return installLaunchd();
-  if (platform() === 'win32') return installWindows({ noElevate: elevationDisabled(options), elevationTimeoutMs: options.elevationTimeoutMs });
+  if (platform() === 'win32') return installWindows({ ...options, noElevate: elevationDisabled(options), elevationTimeoutMs: options.elevationTimeoutMs });
   if (!commandExists('systemctl')) {
     throw new Error('systemd is required to install runnerize as a Linux/WSL service.');
   }
-  return installSystemd();
+  return installSystemd(options);
 }
 
 export async function uninstallService(options = {}) {

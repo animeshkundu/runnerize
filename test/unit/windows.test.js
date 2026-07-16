@@ -201,7 +201,7 @@ test('windows.launch stop polling normalizes IDs and waits for a lingering sandb
         child.close(0);
       } else if (child.args.includes('list')) {
         listCalls += 1;
-        const environments = listCalls < 3 ? [{ Id: `{${sandboxId.toUpperCase()}}` }] : [];
+        const environments = sandboxId && listCalls < 4 ? [{ Id: `{${sandboxId.toUpperCase()}}` }] : [];
         child.emitStdout(JSON.stringify({ WindowsSandboxEnvironments: environments }));
         child.close(0);
       } else child.close(0);
@@ -210,7 +210,7 @@ test('windows.launch stop polling normalizes IDs and waits for a lingering sandb
       assert.deepEqual(await withKeepAlive(windows.launch('cfg', { idleTimeoutMs: 1000 })), {
         startedJob: false,
       });
-      assert.equal(listCalls, 3, 'polls until the normalized sandbox ID disappears');
+      assert.equal(listCalls, 4, 'probes stale instances, then polls until the normalized sandbox ID disappears');
     } finally {
       stub.restore();
     }

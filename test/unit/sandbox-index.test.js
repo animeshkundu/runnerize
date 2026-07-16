@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectFlavors, linux, windows, macos } from '../../src/sandbox/index.js';
+import { detectFlavors, FLAVOR_KEYS, linux, windows, macos } from '../../src/sandbox/index.js';
 
 // detectFlavors returns the exported flavor singletons whose `available()` resolves
 // truthy, and swallows a throwing `available()` as "not available". We drive it by
@@ -58,6 +58,19 @@ test('detectFlavors treats a throwing available() as unavailable', async () => {
     macos: async () => false,
   }, async () => {
     assert.deepEqual(await detectFlavors(), [], 'a flavor whose probe throws is excluded, not fatal');
+  });
+});
+
+test('detectFlavors filters before probing and exports stable flavor keys', async () => {
+  let linuxProbes = 0;
+  await withAvailability({
+    linux: async () => { linuxProbes += 1; return true; },
+    windows: async () => true,
+    macos: async () => true,
+  }, async () => {
+    assert.deepEqual(FLAVOR_KEYS, ['linux', 'windows', 'macos']);
+    assert.deepEqual((await detectFlavors(new Set(['windows']))).map((flavor) => flavor.key), ['windows']);
+    assert.equal(linuxProbes, 0);
   });
 });
 

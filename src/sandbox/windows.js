@@ -67,7 +67,9 @@ function normalizeSandboxId(id) {
 async function runningSandboxIds({ timeoutMs = STOP_TIMEOUT_MS } = {}) {
   const { stdout } = await collect('wsb.exe', ['list', '--raw'], { timeoutMs });
   const parsed = JSON.parse(stdout);
-  return (parsed.WindowsSandboxEnvironments ?? []).map(({ Id }) => normalizeSandboxId(Id));
+  return (parsed.WindowsSandboxEnvironments ?? [])
+    .map(({ Id }) => normalizeSandboxId(Id))
+    .filter((id) => id && id !== 'undefined' && id !== 'null');
 }
 
 function delay(milliseconds) {
@@ -194,7 +196,14 @@ export const windows = {
     try {
       await writeFile(path.join(controlDir, 'jit-config.txt'), encodedJitConfig, { mode: 0o600 });
       await writeFile(path.join(controlDir, 'run-runner.ps1'), RUNNER_SCRIPT, { mode: 0o600 });
-      await collect('wsb.exe', ['start', '--id', sandboxId]);
+      for (const staleId of await runningSandboxIds()) await stopSandbox(staleId);
+      try {
+        await collect('wsb.exe', ['start', '--id', sandboxId]);
+      } catch (error) {
+        if (!/CO_E_APPSINGLEUSE|0x80040112/i.test(error.message)) throw error;
+        for (const staleId of await runningSandboxIds()) await stopSandbox(staleId);
+        await collect('wsb.exe', ['start', '--id', sandboxId]);
+      }
       await waitForExec(sandboxId);
       await collect('wsb.exe', [
         'share', '--id', sandboxId, '--host-path', runnerDir,

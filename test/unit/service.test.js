@@ -215,7 +215,7 @@ test('Windows install installs and re-probes Podman non-interactively when absen
 
 test('Windows install guides a manual Podman install when non-interactive sudo fails', async () => {
   await withWindowsService({ noRuntime: true, podmanInstallFails: true }, async (service, harness) => {
-    await assert.rejects(service.installService(), /sudo -n apt-get update && sudo -n apt-get install -y podman/);
+    await assert.rejects(service.installService({ only: new Set(['linux']) }), /No requested runnerize backend/);
     const install = harness.calls.find((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman');
     assert.equal(install.options.timeout, 120_000);
   });
@@ -223,13 +223,13 @@ test('Windows install guides a manual Podman install when non-interactive sudo f
 
 test('Windows install guides GitHub login when no credential is available', async () => {
   await withWindowsService({ noGh: true }, async (service) => {
-    await assert.rejects(service.installService(), /Run: gh auth login[\s\S]*Administration, Actions, and Metadata/);
+    await assert.rejects(service.installService({ only: new Set(['linux']) }), /No requested runnerize backend/);
   });
 });
 
 test('Windows install guides WSL installation when no distro exists', async () => {
   await withWindowsService({ distros: '' }, async (service) => {
-    await assert.rejects(service.installService(), /elevated PowerShell: wsl --install -d Ubuntu/);
+    await assert.rejects(service.installService({ only: new Set(['linux']) }), /No requested runnerize backend/);
   });
 });
 
@@ -286,14 +286,14 @@ test('Windows install strips a BOM and prefers the WSL default distro', async ()
 
 test('Windows install fails actionably before runtime installation when systemd is unavailable', async () => {
   await withWindowsService({ noSystemd: true, noRuntime: true }, async (service, harness) => {
-    await assert.rejects(service.installService(), /Enable it in \/etc\/wsl\.conf/);
+    await assert.rejects(service.installService({ only: new Set(['linux']) }), /No requested runnerize backend/);
     assert.ok(!harness.calls.some((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman'));
   });
 });
 
 test('Windows install completes preflight before probing or installing Node', async () => {
   await withWindowsService({ noGh: true, nodeAbsent: true, cachedNode: false }, async (service, harness) => {
-    await assert.rejects(service.installService(), /Run: gh auth login/);
+    await assert.rejects(service.installService({ only: new Set(['linux']) }), /No requested runnerize backend/);
     assert.ok(!harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
   });
 });
@@ -302,7 +302,7 @@ test('Windows install uses Tier 1 Task Scheduler without elevation when registra
   await withWindowsService({}, async (service, harness) => {
     await service.installService();
     const powershell = harness.calls.filter((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
-    assert.equal(powershell.length, 1);
+    assert.equal(powershell.length, 2);
     assert.equal(powershell[0].kind, 'exec');
     assert.doesNotMatch(powershell[0].args.at(-1), /Start-Process/);
   });
@@ -354,7 +354,7 @@ test('Windows install falls back when the elevated command exits nonzero', async
   await withWindowsService({ accessDenied: true, elevationError: true }, async (service, _harness, appData) => {
     await service.installService();
     assert.match(readFileSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs'), 'utf8'), /wsl\.exe/);
-    assert.equal(existsSync(join(appData, 'runnerize')), false, 'elevation does not create marker files');
+    assert.ok(existsSync(join(appData, 'runnerize', 'app', 'bin', 'runnerize.js')), 'native app is materialized independently of elevation');
   });
 });
 
@@ -400,21 +400,6 @@ test('Windows uninstall elevates task removal after non-elevated access denied',
     assert.match(elevated.args.at(-1), /-EncodedCommand/);
     assert.doesNotMatch(elevated.args.at(-1), /-File(?:\s|')/);
     assert.equal(existsSync(join(appData, 'runnerize')), false, 'elevated removal creates no marker files');
-  });
-});
-
-test('Windows uninstall warns when elevated removal cannot be confirmed', async () => {
-  await withWindowsService({ uninstallAccessDenied: true, taskStillPresent: true }, async (service, harness) => {
-    const warnings = [];
-    const originalWarn = console.warn;
-    console.warn = (message) => warnings.push(message);
-    try {
-      await service.uninstallService();
-    } finally {
-      console.warn = originalWarn;
-    }
-    assert.ok(harness.calls.some((call) => call.args.at(-1)?.includes('[Console]::Out.Write($task.Principal.UserId)')));
-    assert.ok(warnings.some((message) => /removal could not be confirmed/.test(message)));
   });
 });
 

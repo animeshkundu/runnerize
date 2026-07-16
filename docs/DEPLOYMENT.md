@@ -34,7 +34,7 @@ x64]` runners. The `macos` (tart VM) flavor remains a stub.
 
 ## Automatic prerequisite preflight
 
-`runnerize run`, `runnerize run --dry-run`, and `runnerize service install` verify the container runtime and GitHub credential before doing work. On Windows, full runs and service installs select a working WSL distro and, when Podman is absent in Debian/Ubuntu, try `sudo -n apt-get update && sudo -n apt-get install -y podman`. The non-interactive sudo flag and bounded probes prevent password or consent hangs. Dry runs only probe and print guidance; they never install anything. Everything already present is a fast no-op.
+`runnerize run`, `runnerize run --dry-run`, and `runnerize service install` verify the selected backend prerequisites and GitHub credential before doing work. Use `--only linux` or `--only windows` to partition dispatchers by flavor. Dispatchers keep the host awake by default; `--no-keep-awake` opts out. On Windows, full runs and service installs select a working WSL distro and, when Podman is absent in Debian/Ubuntu, try `sudo -n apt-get update && sudo -n apt-get install -y podman`. The non-interactive sudo flag and bounded probes prevent password or consent hangs. Dry runs only probe and print guidance; they never install anything. Everything already present is a fast no-op.
 
 Prerequisites that require a person remain guided rather than silently attempted. With no working WSL distro, run `wsl --install -d Ubuntu` in an elevated PowerShell. With no GitHub credential, run `gh auth login` or set `GH_TOKEN`/`GITHUB_TOKEN`; the credential needs Administration, Actions, and Metadata access across all owned private repositories. If Podman installation needs sudo authentication, runnerize prints the exact install command to run inside the selected distro.
 
@@ -51,7 +51,7 @@ runnerize remove            # clean up any offline ephemeral runnerize-* runners
 ```
 
 Flags: `--max <n>` (concurrent runners, default 4), `--interval <ms>` (poll, default
-15000), `--idle-timeout <ms>` (kill an unclaimed runner, default 120000).
+15000), `--idle-timeout <ms>` (kill an unclaimed runner, default 120000), `--only <csv>` (restrict flavors), and `--no-keep-awake` (allow host sleep).
 
 ---
 
@@ -89,7 +89,9 @@ available inside Windows Sandbox, so Windows jobs cannot use Docker-in-Docker.
 
 ### Boot persistence on Windows
 
-`runnerize service install` uses a three-tier Windows logon trigger:
+`runnerize service install` installs every available backend: a WSL systemd dispatcher pinned to `--only linux` and a native dispatcher pinned to `--only windows`. The native dispatcher logs to `%LOCALAPPDATA%\runnerize\runnerize-windows.log`, holds a system-sleep inhibitor, and uses an at-logon interactive trigger. A sandbox window is visible for each Windows job. Persistence resumes only after the next interactive logon; unattended reboot requires Windows AutoLogon and its credential trade-off. Locked, disconnected, and RDP sessions are unsupported for Windows Sandbox jobs.
+
+Each chain uses a three-tier Windows logon trigger:
 
 1. It first registers a hidden, per-user Task Scheduler task without elevation. The
    task starts the WSL systemd user service at logon and restarts on failure.

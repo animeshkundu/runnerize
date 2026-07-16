@@ -1,5 +1,8 @@
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -131,6 +134,26 @@ export async function getToken({ signal } = {}) {
   if (envToken) {
     cachedToken = envToken;
     return cachedToken;
+  }
+
+  if (process.platform === 'win32') {
+    const encryptedPath = process.env.RUNNERIZE_WINDOWS_TOKEN_FILE
+      || join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'runnerize', 'windows.token');
+    try {
+      const encrypted = (await readFile(encryptedPath, 'utf8')).trim();
+      if (encrypted) {
+        const script = '$bytes=[Convert]::FromBase64String($env:RUNNERIZE_ENCRYPTED_TOKEN); $plain=[Security.Cryptography.ProtectedData]::Unprotect($bytes,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Text.Encoding]::UTF8.GetString($plain))';
+        const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+          encoding: 'utf8', timeout: DEFAULT_TIMEOUT_MS, windowsHide: true,
+          env: { ...process.env, RUNNERIZE_ENCRYPTED_TOKEN: encrypted }, signal,
+        });
+        cachedToken = stdout.trim();
+        if (!cachedToken) throw new Error('DPAPI returned an empty token');
+        return cachedToken;
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw new Error(`Could not decrypt the runnerize Windows credential: ${error.message}`);
+    }
   }
 
   const { stdout } = await execFileAsync('gh', ['auth', 'token'], {
