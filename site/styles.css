@@ -37,6 +37,8 @@
   --ok-ink: #0a7a5f;
   --stub-bg: rgba(176, 122, 12, 0.12);
   --stub-ink: #8a6100;
+  --preview-bg: rgba(91, 82, 229, 0.12);
+  --preview-ink: #4b43cf;
 
   /* diagram */
   --dg-arrow: #8b90a0;
@@ -94,6 +96,8 @@
     --ok-ink: #52e0cf;
     --stub-bg: rgba(230, 185, 105, 0.14);
     --stub-ink: #e2bd72;
+    --preview-bg: rgba(143, 136, 255, 0.15);
+    --preview-ink: #a8a2ff;
 
     --dg-arrow: #667089;
     --dg-arrow-faint: #414a5c;
@@ -411,6 +415,8 @@ code, pre { font-family: var(--mono); }
 .status--ok { color: var(--ok-ink); background: var(--ok-bg); }
 .status--ok::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; margin-right: 7px; }
 .status--stub { color: var(--stub-ink); background: var(--stub-bg); }
+.status--preview { color: var(--preview-ink); background: var(--preview-bg); }
+.status--preview::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; margin-right: 7px; }
 
 /* ----------  Limitations + roadmap  ---------- */
 .lr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; }

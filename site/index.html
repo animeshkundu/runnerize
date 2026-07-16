@@ -53,7 +53,7 @@
     <!-- ─────────────────────────  HERO  ───────────────────────── -->
     <section class="hero">
       <div class="wrap hero-inner">
-        <p class="eyebrow"><span class="dot"></span> v0.1 · live-validated on Win 11 + WSL2</p>
+        <p class="eyebrow"><span class="dot"></span> v0.4 · Linux + Windows validated</p>
         <h1 class="hero-title">
           Self-hosted runners that
           <span class="grad-text">vanish after one job.</span>
@@ -401,10 +401,10 @@
       <div class="wrap">
         <div class="section-head">
           <p class="kicker">Backends</p>
-          <h2>Linux today. Windows &amp; macOS opt-in.</h2>
+          <h2>Linux and Windows today. macOS in preview.</h2>
           <p class="section-sub">
-            The linux flavor is the validated default. The native Windows and macOS backends are
-            detected-and-stubbed opt-ins, wired for auto-detection but not yet exercised end to end.
+            Linux is live-validated with rootless containers. The Windows Sandbox backend is validated
+            on Windows 11 24H2. The macOS tart backend is implemented, with Apple Silicon hardware validation pending.
           </p>
         </div>
         <div class="table-wrap">
@@ -423,13 +423,13 @@
                 <td><code>windows</code></td>
                 <td>Windows 11 Pro / Enterprise</td>
                 <td>Windows Sandbox (disposable)</td>
-                <td><span class="status status--stub">stub · auto-detects when enabled</span></td>
+                <td><span class="status status--ok">working · Win11 24H2 validated</span></td>
               </tr>
               <tr>
                 <td><code>macos</code></td>
-                <td>Apple hardware</td>
+                <td>Apple Silicon</td>
                 <td><code>tart</code> VM</td>
-                <td><span class="status status--stub">stub · requires <code>tart</code></span></td>
+                <td><span class="status status--preview">preview · hardware validation pending</span></td>
               </tr>
             </tbody>
           </table>
@@ -455,7 +455,7 @@
             <h2 class="lr-h">What's next</h2>
             <ul class="lr-list lr-list--road">
               <li>Scoped GitHub App credential — short-lived, <code>actions:write</code> only, no code access — as the default production auth.</li>
-              <li>Windows Sandbox and macOS <code>tart</code> backends exercised end to end.</li>
+              <li>Apple Silicon hardware validation for the macOS <code>tart</code> backend.</li>
               <li>Published tagged releases via <code>npx github:animeshkundu/runnerize#&lt;tag&gt;</code> and npm.</li>
             </ul>
           </div>

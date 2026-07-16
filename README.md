@@ -4,7 +4,7 @@ On-demand, **stateless** self-hosted GitHub Actions runners for your **private**
 
 A single **dispatcher** watches your owned-private repos for queued jobs and, per job, mints a **just-in-time (JIT) runner** and runs it inside a **throwaway rootless container**. The runner takes exactly one job, then auto-deregisters and the container is destroyed. Nothing persists; the job never sees your host credentials or caches.
 
-> Status: **v0.1**, live-validated on Windows 11 + WSL2 (rootless Podman). The macOS (`tart`) and native-Windows (Windows Sandbox) backends are detected-and-stubbed opt-ins, not yet exercised end to end.
+> Status: Linux is working and live-validated with rootless Podman. The native Windows Sandbox backend is working and validated on Windows 11 24H2. The macOS `tart` backend is implemented; hardware validation on Apple Silicon is pending.
 
 ## Why
 
@@ -30,11 +30,11 @@ dispatcher (one always-on process)
   - **Linux:** `podman` (preferred) or `docker`, native.
   - **Windows:** WSL2 with `podman`/`docker` inside a distro (no Docker Desktop needed).
   - **macOS:** `colima` or `podman machine` (a Lima Linux VM) for linux-container jobs.
-- A **GitHub token** with access to your repos. v0.1 resolves it from `$GH_TOKEN` / `$GITHUB_TOKEN`, else `gh auth token`. (A scoped **GitHub App** — short-lived, `actions:write` only — is the recommended production credential and is on the roadmap.)
+- A **GitHub token** with access to your repos. runnerize resolves it from `$GH_TOKEN` / `$GITHUB_TOKEN`, else `gh auth token`. (A scoped **GitHub App** — short-lived, `actions:write` only — is the recommended production credential and is on the roadmap.)
 
 ## Usage
 
-For a fresh Windows 11 setup, see [docs/QUICKSTART-windows.md](docs/QUICKSTART-windows.md).
+For a fresh Windows 11 setup, see [docs/QUICKSTART-windows.md](docs/QUICKSTART-windows.md). For Apple Silicon, see the [macOS deployment guide](docs/DEPLOYMENT.md#macos-host).
 
 ```bash
 # from a checkout:
@@ -78,8 +78,8 @@ jobs:
 | Flavor | Host | Mechanism | Status |
 |---|---|---|---|
 | `linux` | any (Linux / WSL / Colima) | rootless container, fat image | **working** |
-| `windows` | Windows 11 Pro/Enterprise | Windows Sandbox (disposable) | stub; auto-detects when the feature is enabled |
-| `macos` | Apple hardware | `tart` VM | stub; requires `tart` |
+| `windows` | Windows 11 Pro/Enterprise | Windows Sandbox (disposable) | **working**; validated on Windows 11 24H2 |
+| `macos` | Apple Silicon | `tart` VM | **implemented**; hardware validation pending |
 
 ## Known limitations
 
