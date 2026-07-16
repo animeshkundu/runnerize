@@ -29,6 +29,7 @@ function installStubs({ exec, spawn }) {
 function successfulHarness(options = {}) {
   const calls = [];
   let cachedNodeChecks = 0;
+  const registeredActions = new Map();
   const exec = (file, args, execOptions = {}) => {
     calls.push({ kind: 'exec', file, args, options: execOptions });
     if (file.toLowerCase().endsWith('powershell.exe')) {
@@ -36,8 +37,30 @@ function successfulHarness(options = {}) {
       if (command.includes('WindowsIdentity]::GetCurrent().User.Value')) return 'S-1-5-21-1234\n';
       const elevatedLaunch = command.includes('Start-Process -FilePath');
       const confirmation = command.includes('[Console]::Out.Write($task.Principal.UserId)');
+      const specMatch = command.includes('$a = $task.Actions | Select-Object -First 1');
+      if (specMatch) {
+        const taskNameMatch = command.match(/-TaskName '([^']*)'/);
+        const taskName = taskNameMatch?.[1];
+        // A genuinely-failed registration (as opposed to a powershell.exe crash-after-success)
+        // must not be resurrected by the post-failure confirmation check: the task was never
+        // actually registered, so this must report a mismatch/absence for that specific task.
+        if (options.windowsTaskFails && taskName === 'runnerize-windows') {
+          const error = new Error('no match');
+          error.status = 1;
+          error.stdout = '';
+          error.stderr = '';
+          throw error;
+        }
+        if (registeredActions.get(taskName) === true) return '';
+        const error = new Error('no match');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = '';
+        throw error;
+      }
       if (confirmation) {
         if (options.taskMissing || (options.accessDenied && (
+
           options.noElevateExpected || options.elevationDeclined || options.elevationError || options.elevationTimeout || options.nullExitCode
         ))) {
           const error = new Error('task missing');
@@ -53,11 +76,14 @@ function successfulHarness(options = {}) {
         error.stderr = '';
         throw error;
       }
-      if (options.windowsTaskFails && command.includes("$taskName = 'runnerize-windows'") && command.includes('Register-ScheduledTask')) {
+      if ((options.windowsTaskFails || options.registrationCrashesAfterSuccess) && command.includes("$taskName = 'runnerize-windows'") && command.includes('Register-ScheduledTask')) {
+        // Simulates the powershell.exe child that dies at teardown (signal-less, empty
+        // stdout/stderr) right after the CIM cmdlets already registered the task successfully.
+        if (options.registrationCrashesAfterSuccess) registeredActions.set('runnerize-windows', true);
         const error = new Error('windows task registration failed');
         error.status = 1;
         error.stdout = '';
-        error.stderr = error.message;
+        error.stderr = options.registrationCrashesAfterSuccess ? '' : error.message;
         throw error;
       }
       const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
@@ -95,7 +121,11 @@ function successfulHarness(options = {}) {
         assert.doesNotMatch(elevatedScript, /Set-Content/);
         assert.match(elevatedScript, /exit 0/);
         assert.match(elevatedScript, /exit 1/);
+        const elevatedTaskNameMatch = elevatedScript.match(/\$taskName = '([^']*)'/);
+        if (elevatedTaskNameMatch && !options.taskMissing) registeredActions.set(elevatedTaskNameMatch[1], true);
       }
+      const registerMatch = !elevatedLaunch && command.includes('Register-ScheduledTask') && command.match(/\$taskName = '([^']*)'/);
+      if (registerMatch) registeredActions.set(registerMatch[1], true);
       return '';
     }
     if (file !== 'wsl.exe') return '';
@@ -210,11 +240,17 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     assert.equal(tasks.length, 2);
     assert.ok(tasks.some((call) => call.args.at(-1).includes("$taskName = 'runnerize-windows'")));
     for (const call of tasks) {
-      assert.match(call.args.at(-1), /Remove-Item -LiteralPath \$startupPath -Force -ErrorAction SilentlyContinue/);
+      // A trailing Remove-Item run in the same powershell.exe process right after the
+      // ScheduledTasks module's CIM cmdlets (Get-/Register-ScheduledTask) reliably crashes
+      // that process on exit, even though the registration itself already succeeded. Startup
+      // fallback cleanup is done from Node (rmSync) instead — the script must stay clear of it.
+      assert.doesNotMatch(call.args.at(-1), /Remove-Item/);
     }
     const launcher = readFileSync(join(appData, 'runnerize', 'runnerize-windows.ps1'), 'utf8');
     assert.match(launcher, /Local\\runnerize-windows/);
-    assert.match(launcher, /SetThreadExecutionState\(0x80000001\)/);
+    // A raw 0x80000001 literal parses as a negative Int32 in PowerShell (high bit set), which
+    // then fails to bind to the uint esFlags P/Invoke parameter — Convert.ToUInt32 avoids that.
+    assert.match(launcher, /SetThreadExecutionState\(\[Convert\]::ToUInt32\('80000001', 16\)\)/);
     assert.match(launcher, /run --only windows/);
     assert.match(launcher, /runnerize-windows\.log/);
     assert.ok(existsSync(join(appData, 'runnerize', 'app', 'bin', 'runnerize.js')));
@@ -229,6 +265,20 @@ test('Windows install adds the WSL keep-awake holder when the Windows backend fa
       .map((call) => call.args.at(-1));
     assert.ok(taskCommands.some((command) => command.includes("$taskName = 'runnerize-wsl-keepawake'")));
     assert.ok(existsSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1')));
+  });
+});
+
+test('Windows install treats a post-success powershell.exe crash as registered, not failed', async () => {
+  await withWindowsService({ registrationCrashesAfterSuccess: true }, async (service, harness, appData) => {
+    await service.installService();
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    // No UAC elevation, no wsl-keepawake fallback, and no Startup-folder fallback: the
+    // registration is confirmed via Get-ScheduledTask and treated as a success outright.
+    assert.ok(!taskCommands.some((command) => command.includes('Start-Process')));
+    assert.ok(!taskCommands.some((command) => command.includes("$taskName = 'runnerize-wsl-keepawake'")));
+    assert.equal(existsSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize-windows.vbs')), false);
   });
 });
 

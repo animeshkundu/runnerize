@@ -35,7 +35,13 @@ function xmlEscape(value) {
 }
 
 function run(command, args, options = {}) {
-  execFileSync(command, args, { stdio: 'inherit', ...options });
+  // Capture and drain the child's output rather than inheriting the parent's stdio. An
+  // inherited-stdio child (notably wsl.exe) left this process exiting via SIGSEGV (139) on
+  // some runs; draining instead of inheriting avoids that. Echo the captured output so install
+  // progress stays visible. (The Task Scheduler registration crash is a separate, unrelated
+  // issue — see the comment on taskSchedulerScript.)
+  const output = execFileSync(command, args, { encoding: 'utf8', windowsHide: true, ...options });
+  if (output) process.stdout.write(output);
 }
 
 function capture(command, args, options = {}) {
@@ -430,9 +436,16 @@ function systemdStartCommand() {
 }
 
 function taskSchedulerScript(spec, windowsUser) {
+  // Deliberately does NOT remove the Startup-folder fallback file here (the caller already
+  // does that via rmSync once it sees the registration succeed). A trailing Remove-Item run
+  // in the same PowerShell process right after Register-ScheduledTask/Get-ScheduledTask (the
+  // ScheduledTasks module's CIM-backed cmdlets) reliably crashes this powershell.exe on exit:
+  // signal-less, code-less, output-less non-zero exit, even though the task registration
+  // itself already succeeded. Reproduced deterministically with no WSL involvement at all;
+  // reordering Remove-Item before the CIM cmdlets, or dropping it entirely and cleaning up in
+  // Node instead, avoids the crash. See installLogonTrigger's rmSync calls for the real cleanup.
   return [
     `$taskName = ${powershellLiteral(spec.taskName)}`,
-    `$startupPath = ${powershellLiteral(windowsStartupPath(spec.startupFileName))}`,
     `$user = ${powershellLiteral(windowsUser)}`,
     `$action = New-ScheduledTaskAction -Execute ${powershellLiteral(spec.execute)} -Argument ${powershellLiteral(spec.argument)}`,
     '$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user',
@@ -440,7 +453,6 @@ function taskSchedulerScript(spec, windowsUser) {
     '$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 10 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
     'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop',
     'Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null',
-    'Remove-Item -LiteralPath $startupPath -Force -ErrorAction SilentlyContinue',
   ].join('; ');
 }
 
@@ -497,6 +509,24 @@ function scheduledTaskPrincipal(taskName) {
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
+function scheduledTaskMatchesSpec(spec) {
+  // Confirms the registered task is actually THIS spec's task (not merely a same-named leftover
+  // from something else): compares the action's Execute/Arguments against what we asked for.
+  // Deliberately avoids comparing Principal.UserId against the SID passed to -UserId — Task
+  // Scheduler normalizes that property to a friendly account name on readback, so a SID
+  // comparison never matches even for a correctly-registered task.
+  const script = [
+    `$task = Get-ScheduledTask -TaskName ${powershellLiteral(spec.taskName)} -ErrorAction SilentlyContinue`,
+    'if ($null -eq $task) { exit 1 }',
+    '$a = $task.Actions | Select-Object -First 1',
+    `if ($a.Execute -eq ${powershellLiteral(spec.execute)} -and $a.Arguments -eq ${powershellLiteral(spec.argument)}) { exit 0 } else { exit 1 }`,
+  ].join('; ');
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ]);
+  return result.status === 0;
+}
+
 async function installLogonTrigger(spec, { noElevate = false, elevationTimeoutMs } = {}) {
   const windowsUser = currentWindowsUser();
   const script = taskSchedulerScript(spec, windowsUser);
@@ -510,6 +540,20 @@ async function installLogonTrigger(spec, { noElevate = false, elevationTimeoutMs
     return { kind: 'Task Scheduler', detail: `task ${spec.taskName} for ${windowsUser}` };
   }
   if (!isAccessDenied(result)) {
+    // The powershell child can still register the task successfully and then die on its own
+    // way out (a silent, signal-less non-zero exit with empty stdout/stderr), which otherwise
+    // gets misreported as a registration failure. Confirm against Task Scheduler itself before
+    // giving up — a fresh powershell.exe running only Get-ScheduledTask doesn't hit that crash.
+    // Compares the actual registered action, not just existence (a stale same-named task with
+    // different content shouldn't be mistaken for success) or an identity-string match (Task
+    // Scheduler normalizes $task.Principal.UserId to a friendly account name on readback even
+    // when a SID was passed to -UserId, so comparing it back against currentWindowsUser()'s SID
+    // never matches).
+    if (scheduledTaskMatchesSpec(spec)) {
+      rmSync(windowsStartupPath(spec.startupFileName), { force: true });
+      console.log('Registered auto-start task.');
+      return { kind: 'Task Scheduler', detail: `task ${spec.taskName} for ${windowsUser}` };
+    }
     const detail = result.stderr?.trim() || result.stdout?.trim() || result.error?.message || `exit code ${result.status}`;
     throw new Error(`Failed to register Task Scheduler task ${spec.taskName}: ${detail}`);
   }
@@ -518,13 +562,13 @@ async function installLogonTrigger(spec, { noElevate = false, elevationTimeoutMs
     console.log('Task registration needs administrator access — requesting elevation (decline to use a login-only Startup entry)...');
     const elevated = await runElevated('install', script, { timeoutMs: elevationTimeoutMs });
     if (elevated.ok) {
-      const principal = scheduledTaskPrincipal(spec.taskName);
-      if (principal?.toLowerCase() === windowsUser.toLowerCase()) {
+      // Same action-content confirmation as above, for the same reasons.
+      if (scheduledTaskMatchesSpec(spec)) {
         rmSync(windowsStartupPath(spec.startupFileName), { force: true });
         console.log('Registered auto-start task (elevated).');
         return { kind: 'Task Scheduler (elevated)', detail: `task ${spec.taskName} for ${windowsUser}` };
       }
-      console.warn(`Elevated task registration could not be confirmed${principal ? ` for ${windowsUser}` : ''}.`);
+      console.warn(`Elevated task registration could not be confirmed for ${windowsUser}.`);
     } else {
       console.warn(`Elevated task registration did not complete: ${elevated.reason}`);
       if (elevated.reason === 'elevation prompt was not answered') {
@@ -596,10 +640,15 @@ function writeWindowsLauncher({ keepAwake = true } = {}) {
   const appBin = windowsDataPath('app', 'bin', 'runnerize.js');
   const logPath = windowsDataPath('runnerize-windows.log');
   mkdirSync(dirname(launcherPath), { recursive: true });
+  // ES_SYSTEM_REQUIRED | ES_CONTINUOUS (0x80000001) and ES_CONTINUOUS (0x80000000) both have
+  // their high bit set, so PowerShell parses the hex literal as a negative Int32 (its default
+  // numeric type for a 32-bit-wide hex literal) rather than a UInt32 — which then fails to bind
+  // to SetThreadExecutionState's `uint esFlags` P/Invoke parameter with a conversion error.
+  // Parsing through Convert.ToUInt32 sidesteps the literal-typing quirk entirely.
   const wakeStart = keepAwake
-    ? "Add-Type -Namespace Runnerize -Name Native -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint esFlags);'; [Runnerize.Native]::SetThreadExecutionState(0x80000001) | Out-Null"
+    ? "Add-Type -Namespace Runnerize -Name Native -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint esFlags);'; [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null"
     : '';
-  const wakeStop = keepAwake ? '[Runnerize.Native]::SetThreadExecutionState(0x80000000) | Out-Null' : '';
+  const wakeStop = keepAwake ? "[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) | Out-Null" : '';
   writeFileSync(launcherPath, `$ErrorActionPreference = 'Stop'\r\n$created = $false\r\n$mutex = [Threading.Mutex]::new($true, 'Local\\runnerize-windows', [ref]$created)\r\nif (-not $created) { $mutex.Dispose(); exit 0 }\r\ntry {\r\n  ${wakeStart}\r\n  $node = (Get-Command node.exe -ErrorAction Stop).Source\r\n  & $node ${powershellLiteral(appBin)} run --only windows *>> ${powershellLiteral(logPath)}\r\n} finally {\r\n  ${wakeStop}\r\n  $mutex.ReleaseMutex()\r\n  $mutex.Dispose()\r\n}\r\n`);
   return launcherPath;
 }
@@ -619,7 +668,7 @@ function wslKeepAwakeSpec(context) {
   const launcherPath = windowsDataPath('runnerize-wsl-keepawake.ps1');
   const activeArgs = `-d ${windowsCommandLineArg(context.distro)} -u ${windowsCommandLineArg(context.user)} -e bash -lc ${windowsCommandLineArg('export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize')}`;
   mkdirSync(dirname(launcherPath), { recursive: true });
-  writeFileSync(launcherPath, `$ErrorActionPreference = 'SilentlyContinue'\r\nAdd-Type -Namespace Runnerize -Name Native -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'\r\n[Runnerize.Native]::SetThreadExecutionState(0x80000001) | Out-Null\r\ntry { while ($true) { & wsl.exe ${activeArgs}; if ($LASTEXITCODE -ne 0) { break }; Start-Sleep -Seconds 30 } } finally { [Runnerize.Native]::SetThreadExecutionState(0x80000000) | Out-Null }\r\n`);
+  writeFileSync(launcherPath, `$ErrorActionPreference = 'SilentlyContinue'\r\nAdd-Type -Namespace Runnerize -Name Native -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'\r\n[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null\r\ntry { while ($true) { & wsl.exe ${activeArgs}; if ($LASTEXITCODE -ne 0) { break }; Start-Sleep -Seconds 30 } } finally { [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) | Out-Null }\r\n`);
   const argument = `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${windowsCommandLineArg(launcherPath)}`;
   return {
     taskName: 'runnerize-wsl-keepawake',
