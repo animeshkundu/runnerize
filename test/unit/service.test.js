@@ -130,7 +130,9 @@ function successfulHarness(options = {}) {
   const spawn = (file, args, spawnOptions = {}) => {
     calls.push({ kind: 'spawn', file, args, options: spawnOptions });
     if (file === 'whoami.exe') return { status: 0, stdout: 'DESKTOP\\ani\n', stderr: '' };
-    if (file === 'where.exe' && args[0] === 'wsb.exe' && options.noWsb) return { status: 1, stdout: '', stderr: '' };
+    if (file === 'where.exe' && args[0] === 'wsb.exe') {
+      return { status: options.noWsb ? 1 : 0, stdout: options.noWsb ? '' : 'C:\\Windows\\System32\\wsb.exe\n', stderr: '' };
+    }
     return { status: 0, stdout: '', stderr: '' };
   };
   return { calls, exec, spawn };
@@ -141,13 +143,16 @@ async function withWindowsService(options, action) {
   const appData = mkdtempSync(join(tmpdir(), 'runnerize-service-'));
   const oldAppData = process.env.APPDATA;
   const oldToken = process.env.GH_TOKEN;
+  const oldGitHubToken = process.env.GITHUB_TOKEN;
   const oldLocalAppData = process.env.LOCALAPPDATA;
   const oldNoElevate = process.env.RUNNERIZE_NO_ELEVATE;
   process.env.APPDATA = appData;
   process.env.LOCALAPPDATA = appData;
   if (options.noElevateEnv) process.env.RUNNERIZE_NO_ELEVATE = options.noElevateEnv;
   else delete process.env.RUNNERIZE_NO_ELEVATE;
+  delete process.env.GITHUB_TOKEN;
   if (options.token) process.env.GH_TOKEN = options.token;
+  else if (!options.noWsb && !options.noNativeToken) process.env.GH_TOKEN = 'test-native-token';
   else delete process.env.GH_TOKEN;
   const restore = installStubs(harness);
   try {
@@ -160,6 +165,8 @@ async function withWindowsService(options, action) {
     else process.env.APPDATA = oldAppData;
     if (oldToken === undefined) delete process.env.GH_TOKEN;
     else process.env.GH_TOKEN = oldToken;
+    if (oldGitHubToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = oldGitHubToken;
     if (oldLocalAppData === undefined) delete process.env.LOCALAPPDATA;
     else process.env.LOCALAPPDATA = oldLocalAppData;
     if (oldNoElevate === undefined) delete process.env.RUNNERIZE_NO_ELEVATE;
