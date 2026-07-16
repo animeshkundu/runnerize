@@ -16,7 +16,8 @@ pre-registered; nothing persists between jobs.
 The `linux` flavor mints runners labelled `[self-hosted, linux, x64]` and runs
 jobs in rootless **podman/docker** containers. On Windows 11 24H2+, the native
 `windows` flavor uses Windows Sandbox for disposable `[self-hosted, windows,
-x64]` runners. The `macos` (tart VM) flavor remains a stub.
+x64]` runners. On Apple Silicon, the native `macos` flavor uses disposable tart
+VMs for `[self-hosted, macos, arm64]` runners.
 
 ## Prerequisites (any host)
 
@@ -133,13 +134,55 @@ removes the Startup entry and WSL materialized files where present.
 
 ## macOS host
 
-Runs the **linux** flavor (the `macos`/tart backend is a stub).
+An Apple Silicon host can serve both Linux-container jobs and native macOS jobs.
 
 ### Runtime
-- Provide a Linux container engine: **Colima** (`brew install colima && colima start`)
-  or `podman machine` (`podman machine init && podman machine start`). Either gives
-  a Linux VM whose podman/docker runnerize uses for Linux-container jobs.
+- For the **linux** flavor, provide a Linux container engine: **Colima** (`brew
+  install colima && colima start`) or `podman machine` (`podman machine init &&
+  podman machine start`).
+- For the native **macos** flavor, install **tart** (`brew install cirruslabs/cli/tart`)
+  and provide a macOS base VM image. The flavor is unavailable on Intel Macs.
 - Node >= 20 (`brew install node`), and `gh` authenticated or `GH_TOKEN` set.
+
+### Native macOS jobs with tart
+
+A repo opts in with:
+
+```yaml
+runs-on: [self-hosted, macos, arm64]
+```
+
+`npx runnerize service install` audits the Mac first. On Apple Silicon it installs
+tart automatically through Homebrew when possible, without sudo. It does not pull
+a base image automatically because macOS images are tens of gigabytes; instead it
+prints numbered copy-paste commands for Homebrew/tart gaps, the one-time image
+pull, SSH credentials, and GitHub login. The launchd agent is still installed when
+another backend is usable, so completing a guided step later enables the macOS
+flavor without reinstalling.
+
+Set `RUNNERIZE_MACOS_IMAGE` to a local tart VM name or remote image reference,
+for example `ghcr.io/cirruslabs/macos-sequoia-base:latest`, then run `tart pull
+"$RUNNERIZE_MACOS_IMAGE"`. runnerize clones the image for every job, boots the
+clone without a graphical console, connects over SSH, runs one JIT-configured
+runner, then stops and deletes the clone. No runner workspace or registration
+state persists. The per-host cap is two concurrent macOS VMs, even when `--max`
+is higher.
+
+Configuration:
+
+- `RUNNERIZE_MACOS_IMAGE` (required): tart base image name or reference.
+- `RUNNERIZE_MACOS_SSH_USER` (default `admin`): SSH user in the base image.
+- `RUNNERIZE_MACOS_SSH_KEY` (optional): path to a private SSH key. Without it,
+  SSH uses the agent and default identity files.
+- `RUNNERIZE_MACOS_RUNNER_DIR` (optional): actions-runner directory inside the
+  VM. Baking the runner into the base image is faster than downloading it for
+  every job.
+- `RUNNERIZE_MACOS_RUNNER_VERSION` (optional): actions-runner version to use;
+  otherwise runnerize resolves the latest version before launch.
+
+The base image must boot unattended, provide network access, accept SSH for the
+configured user, and include `bash`, `curl`, and `tar`. If
+`RUNNERIZE_MACOS_RUNNER_DIR` is set, that directory must contain `run.sh`.
 
 ### Boot persistence on macOS
 - `runnerize service install` writes a **launchd** agent
@@ -181,8 +224,9 @@ can move to runnerize by dropping its custom label and using
 
 - **Windows Sandbox** (`src/sandbox/windows.js`) is implemented on Windows 11 24H2+
   as described above. `available()` enables it automatically when `wsb.exe` responds.
-- **macOS / tart** (`src/sandbox/macos.js`) remains future work: clone and boot a
-  throwaway `tart` VM for exactly one JIT-configured job (Apple hardware only).
+- **macOS / tart** (`src/sandbox/macos.js`) is implemented on Apple Silicon. It
+  enables automatically when `tart` responds and `RUNNERIZE_MACOS_IMAGE` supplies
+  the base image used for each throwaway VM.
 
 ## Current live host (as of this handoff)
 

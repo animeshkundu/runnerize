@@ -10,18 +10,21 @@ const require = createRequire(import.meta.url);
 const childProcess = require('node:child_process');
 const os = require('node:os');
 
-function installStubs({ exec, spawn }) {
+function installStubs({ exec, spawn, platformName = 'win32', home }) {
   const originalExec = childProcess.execFileSync;
   const originalSpawn = childProcess.spawnSync;
   const originalPlatform = os.platform;
+  const originalHomedir = os.homedir;
   childProcess.execFileSync = exec;
   childProcess.spawnSync = spawn;
-  os.platform = () => 'win32';
+  os.platform = () => platformName;
+  if (home) os.homedir = () => home;
   syncBuiltinESMExports();
   return () => {
     childProcess.execFileSync = originalExec;
     childProcess.spawnSync = originalSpawn;
     os.platform = originalPlatform;
+    os.homedir = originalHomedir;
     syncBuiltinESMExports();
   };
 }

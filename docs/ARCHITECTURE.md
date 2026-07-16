@@ -222,12 +222,12 @@ process subtree alone to finish.
 ## Sandbox flavors
 
 `detectFlavors()` returns the flavors the current host can serve *now*
-(`available()` true). Today only `linux` is implemented and working; `windows`
-(Windows Sandbox `.wsb`) and `macos` (`tart` VM) are stubs whose `available()` returns
-`false` and whose `launch()` throws. Adding a backend means implementing the same
-`FLAVOR` interface (`key`, `labels`, `available()`, `launch()`), and — critically —
-carrying the same invariants into it: statelessness, one job per instance, the idle
-watchdog, JIT config via env not argv, and deregister-on-failure.
+(`available()` true). `linux` uses rootless podman/docker containers, `windows` uses
+Windows Sandbox on Windows 11 24H2+, and `macos` uses throwaway tart VMs on Apple
+Silicon. Each implements the same `FLAVOR` interface (`key`, `labels`, optional
+`maxConcurrent`, `available()`, `launch()`), carrying the same invariants:
+statelessness, one job per instance, the idle watchdog, JIT config kept off argv,
+and deregister-on-failure.
 
 ## Known limitations (by design, for now)
 
