@@ -146,9 +146,10 @@ test('JIT runner claims a queued private-repo job, runs it to success, and auto-
   assert.equal(completed.conclusion, 'success', 'the job concluded successfully');
 
   // 5) The ephemeral runner auto-deregistered: 0 leaked runnerize-* registrations.
-  //    (Auto-deregistration can lag a beat behind job completion; poll briefly.)
+  //    Auto-deregistration lags a beat behind job completion and, under CI load, can take
+  //    well over a minute — poll generously so a slow-but-eventual deregistration is not a flake.
   let leaked = [];
-  for (let i = 0; i < 10; i += 1) {
+  for (let i = 0; i < 40; i += 1) {
     const runners = await github.listRunners(REPO);
     leaked = runners.filter((r) => r.name?.startsWith('runnerize-'));
     if (leaked.length === 0) break;
