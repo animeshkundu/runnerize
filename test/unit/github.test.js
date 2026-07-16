@@ -55,6 +55,42 @@ test('getToken falls back to `gh auth token` when no env token', async () => {
   }
 });
 
+test('getToken makes DPAPI decrypt failures terminating PowerShell errors', async () => {
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  const prevLocal = process.env.LOCALAPPDATA;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const local = mkdtempSync(join(tmpdir(), 'runnerize-github-'));
+  const tokenPath = join(local, 'runnerize', 'windows.token');
+  mkdirSync(join(local, 'runnerize'));
+  writeFileSync(tokenPath, 'encrypted');
+  process.env.LOCALAPPDATA = local;
+  const exec = new ExecFileStub((file, args) => {
+    if (file === 'gh') throw new Error('not authenticated');
+    assert.equal(file, 'powershell.exe');
+    assert.deepEqual(args.slice(0, 2), ['-NoProfile', '-NonInteractive']);
+    assert.match(args.at(-1), /^\$ErrorActionPreference = 'Stop';/);
+    return { stdout: 'decrypted-token', stderr: '' };
+  }).install();
+  const restorePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' });
+  const gh = await freshImport('../../src/github.js');
+  try {
+    assert.equal(await gh.getToken(), 'decrypted-token');
+  } finally {
+    exec.restore();
+    Object.defineProperty(process, 'platform', restorePlatform);
+    rmSync(local, { recursive: true, force: true });
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+    if (prevLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = prevLocal;
+  }
+});
+
 test('getUser returns login and type', async () => {
   await withGithub({ user: { login: 'alice', type: 'User' } }, async (gh) => {
     assert.deepEqual(await gh.getUser(), { login: 'alice', type: 'User' });

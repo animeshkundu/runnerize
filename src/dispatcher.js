@@ -69,12 +69,14 @@ function abortableDelay(milliseconds, signal) {
 }
 
 function runnerLabels(runner) {
-  return new Set(runner.labels.map((label) => typeof label === 'string' ? label : label.name));
+  return new Set(runner.labels.map((label) => (
+    typeof label === 'string' ? label : label.name
+  ).toLowerCase()));
 }
 
 function belongsToFlavor(runner, flavors) {
   const labels = runnerLabels(runner);
-  return flavors.some((flavor) => flavor.labels.every((label) => labels.has(label)));
+  return flavors.some((flavor) => flavor.labels.every((label) => labels.has(label.toLowerCase())));
 }
 
 async function reconcile(repos, flavors, signal) {

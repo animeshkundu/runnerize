@@ -27,8 +27,8 @@ export function keepHostAwake({
   } else if (platform === 'linux') {
     child = spawnChild('systemd-inhibit', [
       '--what=sleep', '--why=runnerize', '--mode=block',
-      'sh', '-c', 'while :; do sleep 3600; done',
-    ], { stdio: 'ignore', windowsHide: true });
+      'sh', '-c', 'read -r _ || true',
+    ], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
   } else {
     return NOOP;
   }

@@ -432,6 +432,7 @@ function systemdStartCommand() {
 function taskSchedulerScript(spec, windowsUser) {
   return [
     `$taskName = ${powershellLiteral(spec.taskName)}`,
+    `$startupPath = ${powershellLiteral(windowsStartupPath(spec.startupFileName))}`,
     `$user = ${powershellLiteral(windowsUser)}`,
     `$action = New-ScheduledTaskAction -Execute ${powershellLiteral(spec.execute)} -Argument ${powershellLiteral(spec.argument)}`,
     '$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user',
@@ -439,6 +440,7 @@ function taskSchedulerScript(spec, windowsUser) {
     '$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 10 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
     'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop',
     'Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null',
+    'Remove-Item -LiteralPath $startupPath -Force -ErrorAction SilentlyContinue',
   ].join('; ');
 }
 
@@ -580,7 +582,7 @@ function persistWindowsTokenIfNeeded() {
   if (gh.status === 0 && gh.stdout.trim()) return false;
   const tokenPath = windowsDataPath('windows.token');
   mkdirSync(dirname(tokenPath), { recursive: true });
-  const script = `$secure = ConvertTo-SecureString $env:RUNNERIZE_INSTALL_TOKEN -AsPlainText -Force; ConvertFrom-SecureString $secure | Set-Content -LiteralPath ${powershellLiteral(tokenPath)}`;
+  const script = `$ErrorActionPreference = 'Stop'; $secure = ConvertTo-SecureString $env:RUNNERIZE_INSTALL_TOKEN -AsPlainText -Force; ConvertFrom-SecureString $secure | Set-Content -LiteralPath ${powershellLiteral(tokenPath)}`;
   const result = captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-Command', script,
   ], { env: { ...process.env, RUNNERIZE_INSTALL_TOKEN: envToken } });
@@ -632,6 +634,7 @@ async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
   const statuses = [];
   let context;
   let linuxInstalled = false;
+  let windowsInstalled = false;
   let linuxError;
   try {
     context = resolveWslContext();
@@ -670,6 +673,7 @@ async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
       console.log(`Windows logon trigger: ${trigger.kind} (${trigger.detail})`);
       console.log(`Windows dispatcher log: ${windowsDataPath('runnerize-windows.log')}`);
       console.log(`runnerize package: ${installation.root}`);
+      windowsInstalled = true;
       statuses.push('windows=installed');
     } catch (error) {
       console.warn(`Windows backend unavailable: ${error.message}`);
@@ -678,10 +682,11 @@ async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
   } else {
     console.warn('Windows backend unavailable: wsb.exe was not found.');
     statuses.push('windows=unavailable');
-    if (context && linuxInstalled) {
-      const trigger = await installLogonTrigger(wslKeepAwakeSpec(context), { noElevate, elevationTimeoutMs });
-      console.log(`WSL host keep-awake trigger: ${trigger.kind} (${trigger.detail})`);
-    }
+  }
+
+  if (!windowsInstalled && context && linuxInstalled) {
+    const trigger = await installLogonTrigger(wslKeepAwakeSpec(context), { noElevate, elevationTimeoutMs });
+    console.log(`WSL host keep-awake trigger: ${trigger.kind} (${trigger.detail})`);
   }
 
   console.log(`Backend summary: ${statuses.join(', ')}`);

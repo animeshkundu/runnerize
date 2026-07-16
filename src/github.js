@@ -152,7 +152,7 @@ export async function getToken({ signal } = {}) {
     const tokenPath = join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'runnerize', 'windows.token');
     if (!existsSync(tokenPath)) throw error;
     try {
-      const script = `[Console]::Out.Write([System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath '${tokenPath.replaceAll("'", "''")}' | ConvertTo-SecureString)).Password)`;
+      const script = `$ErrorActionPreference = 'Stop'; [Console]::Out.Write([System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath '${tokenPath.replaceAll("'", "''")}' | ConvertTo-SecureString)).Password)`;
       const { stdout } = await execFileAsync('powershell.exe', [
         '-NoProfile', '-NonInteractive', '-Command', script,
       ], { encoding: 'utf8', timeout: DEFAULT_TIMEOUT_MS, windowsHide: true, signal });

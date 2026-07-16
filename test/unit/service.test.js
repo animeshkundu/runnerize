@@ -53,6 +53,13 @@ function successfulHarness(options = {}) {
         error.stderr = '';
         throw error;
       }
+      if (options.windowsTaskFails && command.includes("$taskName = 'runnerize-windows'") && command.includes('Register-ScheduledTask')) {
+        const error = new Error('windows task registration failed');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = error.message;
+        throw error;
+      }
       const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
       if ((options.accessDenied && !elevatedLaunch) || (options.uninstallAccessDenied && unregister)) {
         const error = new Error(options.localizedDenied ? 'Zugriff verweigert' : 'Access is denied');
@@ -202,12 +209,26 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     const tasks = harness.calls.filter((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
     assert.equal(tasks.length, 2);
     assert.ok(tasks.some((call) => call.args.at(-1).includes("$taskName = 'runnerize-windows'")));
+    for (const call of tasks) {
+      assert.match(call.args.at(-1), /Remove-Item -LiteralPath \$startupPath -Force -ErrorAction SilentlyContinue/);
+    }
     const launcher = readFileSync(join(appData, 'runnerize', 'runnerize-windows.ps1'), 'utf8');
     assert.match(launcher, /Local\\runnerize-windows/);
     assert.match(launcher, /SetThreadExecutionState\(0x80000001\)/);
     assert.match(launcher, /run --only windows/);
     assert.match(launcher, /runnerize-windows\.log/);
     assert.ok(existsSync(join(appData, 'runnerize', 'app', 'bin', 'runnerize.js')));
+  });
+});
+
+test('Windows install adds the WSL keep-awake holder when the Windows backend fails', async () => {
+  await withWindowsService({ windowsTaskFails: true }, async (service, harness, appData) => {
+    await service.installService();
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    assert.ok(taskCommands.some((command) => command.includes("$taskName = 'runnerize-wsl-keepawake'")));
+    assert.ok(existsSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1')));
   });
 });
 
@@ -283,6 +304,9 @@ test('Windows install persists a Windows token and downloads pinned Node when ab
     assert.equal(download.options.encoding, 'utf8');
     assert.equal(download.options.windowsHide, true);
     assert.ok(download.args.includes('55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742'));
+    const protect = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe')
+      && call.args.at(-1).includes('RUNNERIZE_INSTALL_TOKEN'));
+    assert.match(protect.args.at(-1), /^\$ErrorActionPreference = 'Stop';/);
   });
 });
 

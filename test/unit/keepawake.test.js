@@ -34,6 +34,8 @@ test('keepHostAwake uses systemd-inhibit on native Linux', () => {
   assert.equal(calls[0].command, 'systemd-inhibit');
   assert.ok(calls[0].args.includes('--what=sleep'));
   assert.ok(calls[0].args.includes('--mode=block'));
+  assert.deepEqual(calls[0].args.slice(-3), ['sh', '-c', 'read -r _ || true']);
+  assert.deepEqual(calls[0].options.stdio, ['pipe', 'ignore', 'ignore']);
   lock.dispose();
   assert.equal(calls[0].child.killed, true);
 });

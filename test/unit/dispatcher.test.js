@@ -343,7 +343,7 @@ test('reconcile deletes offline runnerize-* registrations but leaves foreign/onl
       repos: [{ full_name: 'me/recon', private: true }],
       runners: {
         'me/recon': [
-          { id: 1, name: 'runnerize-stale', status: 'offline', labels: ['self-hosted', 'linux', 'x64'] },
+          { id: 1, name: 'runnerize-stale', status: 'offline', labels: ['SELF-HOSTED', 'Linux', 'X64'] },
           { id: 2, name: 'runnerize-live', status: 'online', labels: ['self-hosted', 'linux', 'x64'] },
           { id: 3, name: 'someones-runner', status: 'offline', labels: ['self-hosted', 'linux', 'x64'] },
         ],
