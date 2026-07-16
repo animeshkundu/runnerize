@@ -52,6 +52,8 @@ function sshArgs(user, ip) {
     '-o', 'StrictHostKeyChecking=no',
     '-o', 'UserKnownHostsFile=/dev/null',
     '-o', 'ConnectTimeout=10',
+    '-o', 'ServerAliveInterval=15',
+    '-o', 'ServerAliveCountMax=3',
   ];
   const key = process.env.RUNNERIZE_MACOS_SSH_KEY;
   if (key) args.push('-i', key);
@@ -71,7 +73,7 @@ function startTartVm(vmName) {
       outcome = { error };
       resolve(outcome);
     };
-    child.stderr?.on('data', (chunk) => { stderr += chunk; });
+    child.stderr?.on('data', (chunk) => { stderr = (stderr + chunk).slice(-65_536); });
     child.once('error', finish);
     child.once('close', (code) => finish(code === 0
       ? null
@@ -144,7 +146,7 @@ exec ./run.sh --jitconfig "$JITCFG"
 `;
 }
 
-async function observeRunner(child, idleTimeoutMs, onStarted, stop) {
+async function observeRunner(child, idleTimeoutMs, onStarted) {
   return new Promise((resolve, reject) => {
     let startedJob = false;
     let stdoutRemainder = '';
@@ -173,10 +175,8 @@ async function observeRunner(child, idleTimeoutMs, onStarted, stop) {
     const timer = setTimeout(() => {
       if (startedJob) return;
       timedOut = true;
-      void stop().finally(() => {
-        child.kill('SIGTERM');
-        settle(() => resolve({ startedJob: false }));
-      });
+      child.kill('SIGKILL');
+      settle(() => resolve({ startedJob: false }));
     }, idleTimeoutMs);
 
     child.stdout?.on('data', (chunk) => {
@@ -184,7 +184,7 @@ async function observeRunner(child, idleTimeoutMs, onStarted, stop) {
     });
     child.stderr?.on('data', (chunk) => {
       const text = chunk.toString();
-      stderr += text;
+      stderr = (stderr + text).slice(-65_536);
       stderrRemainder = observeOutput(text, stderrRemainder);
     });
     child.once('error', (error) => settle(() => reject(error)));
@@ -255,9 +255,10 @@ export const macos = {
       await waitForSsh(args, tartRun);
 
       const child = spawn('ssh', [...args, 'bash -s'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      child.stdin?.on('error', () => {});
       const script = bootstrapScript(encodedJitConfig, runnerDir, version);
       child.stdin?.end(script);
-      return await observeRunner(child, idleTimeoutMs, onStarted, stop);
+      return await observeRunner(child, idleTimeoutMs, onStarted);
     } finally {
       await stop();
       try {

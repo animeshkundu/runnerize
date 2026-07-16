@@ -145,13 +145,49 @@ test('macos.launch observes a job once, keeps the config off argv, and deletes t
       assert.match(stdin, /\.\/run\.sh --jitconfig/);
       assert.match(stdin, /printf '%s'.*> "\$jitfile"/);
       assert.ok(!ssh.args.join(' ').includes('secret-jit-config'));
+      assert.ok(ssh.args.includes('ServerAliveInterval=15'));
+      assert.ok(ssh.args.includes('ServerAliveCountMax=3'));
     } finally {
       stub.restore();
     }
   });
 });
 
-test('macos.launch idle timeout resolves false and stops and deletes the VM', async () => {
+test('macos.launch idle timeout kills SSH before sequential stop and delete', async () => {
+  await withMacos(async (macos) => {
+    const events = [];
+    let runner;
+    const stub = new SpawnStub((child) => {
+      if (child.command === 'tart' && child.args[0] === 'run') return;
+      if (child.command === 'tart' && child.args[0] === 'ip') {
+        child.emitStdout('192.0.2.10\n');
+        child.close(0);
+      } else if (child.command === 'ssh' && child.args.at(-1) === 'true') child.close(0);
+      else if (child.command === 'ssh' && child.args.at(-1) === 'bash -s') {
+        runner = child;
+        const kill = child.kill.bind(child);
+        child.kill = (signal) => { events.push(`kill:${signal}`); return kill(signal); };
+      } else if (child.command === 'tart' && child.args[0] === 'stop') {
+        events.push('stop');
+        setTimeout(() => { events.push('stop-complete'); child.close(0); }, 5);
+      } else if (child.command === 'tart' && child.args[0] === 'delete') {
+        events.push('delete');
+        child.close(0);
+      } else child.close(0);
+    }).install();
+    try {
+      assert.deepEqual(await withKeepAlive(macos.launch('cfg', { idleTimeoutMs: 20 })), {
+        startedJob: false,
+      });
+      assert.ok(runner.signals.includes('SIGKILL'));
+      assert.deepEqual(events, ['kill:SIGKILL', 'stop', 'stop-complete', 'delete']);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('macos.launch tolerates SSH stdin EPIPE and reports the child exit', async () => {
   await withMacos(async (macos) => {
     const stub = new SpawnStub((child) => {
       if (child.command === 'tart' && child.args[0] === 'run') return;
@@ -159,16 +195,17 @@ test('macos.launch idle timeout resolves false and stops and deletes the VM', as
         child.emitStdout('192.0.2.10\n');
         child.close(0);
       } else if (child.command === 'ssh' && child.args.at(-1) === 'true') child.close(0);
-      else if (child.command === 'ssh' && child.args.at(-1) === 'bash -s') return;
-      else child.close(0);
+      else if (child.command === 'ssh' && child.args.at(-1) === 'bash -s') {
+        child.stdin.emit('error', Object.assign(new Error('broken pipe'), { code: 'EPIPE' }));
+        child.emitStderr('connection lost');
+        child.close(255);
+      } else child.close(0);
     }).install();
     try {
-      assert.deepEqual(await withKeepAlive(macos.launch('cfg', { idleTimeoutMs: 20 })), {
-        startedJob: false,
-      });
-      const vmName = stub.find('clone').args[2];
-      assert.ok(stub.find('stop', vmName));
-      assert.ok(stub.find('delete', vmName));
+      await assert.rejects(
+        withKeepAlive(macos.launch('cfg', { idleTimeoutMs: 1000 })),
+        /macos runner exited before starting a job: connection lost/,
+      );
     } finally {
       stub.restore();
     }
