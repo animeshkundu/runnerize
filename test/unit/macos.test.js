@@ -84,20 +84,43 @@ test('macos.available returns false on Intel macOS without spawning', async () =
   }
 });
 
+test('macos.available returns false without a configured image and does not spawn', async () => {
+  const restore = overrideProcess({ platform: 'darwin', arch: 'arm64' });
+  const previous = process.env.RUNNERIZE_MACOS_IMAGE;
+  delete process.env.RUNNERIZE_MACOS_IMAGE;
+  const stub = new SpawnStub(() => { throw new Error('must not spawn'); }).install();
+  try {
+    const { macos } = await freshImport('../../src/sandbox/macos.js');
+    assert.equal(await macos.available(), false);
+    assert.equal(stub.children.length, 0);
+  } finally {
+    stub.restore();
+    if (previous === undefined) delete process.env.RUNNERIZE_MACOS_IMAGE;
+    else process.env.RUNNERIZE_MACOS_IMAGE = previous;
+    restore();
+  }
+});
+
 test('macos.available returns false when tart is missing', async () => {
   const restore = overrideProcess({ platform: 'darwin', arch: 'arm64' });
+  const previous = process.env.RUNNERIZE_MACOS_IMAGE;
+  process.env.RUNNERIZE_MACOS_IMAGE = 'base-image';
   const stub = new SpawnStub((child) => child.fail(new Error('ENOENT'))).install();
   try {
     const { macos } = await freshImport('../../src/sandbox/macos.js');
     assert.equal(await macos.available(), false);
   } finally {
     stub.restore();
+    if (previous === undefined) delete process.env.RUNNERIZE_MACOS_IMAGE;
+    else process.env.RUNNERIZE_MACOS_IMAGE = previous;
     restore();
   }
 });
 
-test('macos.available returns true on Apple Silicon when tart responds', async () => {
+test('macos.available returns true on configured Apple Silicon when tart responds', async () => {
   const restore = overrideProcess({ platform: 'darwin', arch: 'arm64' });
+  const previous = process.env.RUNNERIZE_MACOS_IMAGE;
+  process.env.RUNNERIZE_MACOS_IMAGE = 'base-image';
   const stub = new SpawnStub((child) => child.close(0)).install();
   try {
     const { macos } = await freshImport('../../src/sandbox/macos.js');
@@ -105,6 +128,8 @@ test('macos.available returns true on Apple Silicon when tart responds', async (
     assert.ok(stub.find('--version'));
   } finally {
     stub.restore();
+    if (previous === undefined) delete process.env.RUNNERIZE_MACOS_IMAGE;
+    else process.env.RUNNERIZE_MACOS_IMAGE = previous;
     restore();
   }
 });

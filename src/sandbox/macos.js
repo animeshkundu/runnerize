@@ -205,6 +205,7 @@ export const macos = {
 
   async available() {
     if (process.platform !== 'darwin' || process.arch !== 'arm64') return false;
+    if (!process.env.RUNNERIZE_MACOS_IMAGE) return false;
     try {
       await collect('tart', ['--version'], { timeoutMs: 5_000 });
       return true;

@@ -159,9 +159,14 @@ function tartImageAvailable(image) {
   try {
     const listed = JSON.parse(result.stdout);
     const images = Array.isArray(listed) ? listed : listed.vms ?? listed.VMs ?? [];
-    return images.some((entry) => (typeof entry === 'string' ? entry : entry.name) === image);
+    return images.some((entry) => {
+      if (typeof entry === 'string') return entry === image;
+      const name = entry.Name ?? entry.name;
+      const source = entry.Source ?? entry.source;
+      return name === image || source === image;
+    });
   } catch {
-    return result.stdout.split(/\r?\n/).some((line) => line.trim().split(/\s+/)[0] === image);
+    return result.stdout.split(/\r?\n/).some((line) => line.trim().split(/\s+/).includes(image));
   }
 }
 

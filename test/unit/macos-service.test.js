@@ -32,7 +32,7 @@ async function withMacosService(options, action) {
       throw error;
     }
     if (file === 'tart' && args[0] === 'list') {
-      return JSON.stringify(options.imagePresent ? [{ name: options.image || 'local-base' }] : []);
+      return JSON.stringify(options.imagePresent ? [{ Name: options.image || 'local-base', Source: 'local' }] : []);
     }
     if (file === 'gh' && args[0] === 'auth') {
       if (options.noCredential) {
