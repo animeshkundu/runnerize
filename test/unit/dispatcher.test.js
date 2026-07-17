@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runDispatcher } from '../../src/dispatcher.js';
+import { pollDelay, runDispatcher } from '../../src/dispatcher.js';
 import { runnerNamePrefix } from '../../src/github.js';
 import { GitHubStub } from '../helpers/github-stub.js';
 import { FakeFlavor, installFakeFlavor, waitFor, tick } from '../helpers/dispatcher-harness.js';
@@ -90,8 +90,57 @@ test('runDispatcher validates its numeric options', async () => {
   await assert.rejects(() => runDispatcher({ maxConcurrent: 0, signal }), TypeError);
   await assert.rejects(() => runDispatcher({ maxConcurrent: 1.5, signal }), TypeError);
   await assert.rejects(() => runDispatcher({ pollIntervalMs: 0, signal }), TypeError);
+  await assert.rejects(() => runDispatcher({ pollIntervalMs: 20, pollMaxIntervalMs: 19, signal }), TypeError);
+  await assert.rejects(() => runDispatcher({ pollMaxIntervalMs: 0, signal }), TypeError);
   await assert.rejects(() => runDispatcher({ idleTimeoutMs: -1, signal }), TypeError);
   await assert.rejects(() => runDispatcher({ reconcileMs: 0, signal }), TypeError);
+});
+
+test('poll delay is jittered within bounds and varies across calls', () => {
+  const values = [0, 0.5, 1].map((random) => pollDelay({
+    floorMilliseconds: 100,
+    capMilliseconds: 800,
+    repoCount: 1,
+    freeCapacity: 2,
+    maxCapacity: 4,
+    random: () => random,
+  }));
+
+  assert.deepEqual(values, [337.5, 450, 562.5]);
+  assert.ok(values.every((value) => value >= 75 && value <= 1000));
+});
+
+test('poll delay increases with capacity-normalized load and respects floor and cap', () => {
+  const delay = (freeCapacity, random = 0.5) => pollDelay({
+    floorMilliseconds: 100,
+    capMilliseconds: 800,
+    repoCount: 1,
+    freeCapacity,
+    maxCapacity: 4,
+    random: () => random,
+  });
+
+  assert.equal(delay(4), 100, 'idle hosts poll at the rate-safe floor');
+  assert.ok(delay(3) < delay(2));
+  assert.ok(delay(2) < delay(1));
+  assert.ok(delay(1) < delay(0));
+  assert.equal(delay(0), 800, 'full hosts poll at the cap');
+  assert.equal(delay(4, 0), 100, 'negative jitter never takes idle polling below the floor');
+  assert.equal(delay(0, 1), 800, 'positive jitter never takes full polling above the cap');
+});
+
+test('repo-count scaling remains additive without crossing the configured cap', () => {
+  const options = {
+    floorMilliseconds: 100,
+    capMilliseconds: 800,
+    freeCapacity: 4,
+    maxCapacity: 4,
+    random: () => 0.5,
+  };
+
+  assert.equal(pollDelay({ ...options, repoCount: 20 }), 100);
+  assert.equal(pollDelay({ ...options, repoCount: 21 }), 200);
+  assert.equal(pollDelay({ ...options, repoCount: 200 }), 800);
 });
 
 test('mints toMint = min(demand - unassigned, free): capped by the semaphore', async () => {
@@ -247,6 +296,34 @@ test('two-counter model: onStarted decrements unassigned exactly once (settle do
     assert.ok(await waitFor(() => flavor.launches.length === 3), 'freeing one started runner mints exactly one more');
     await tick(100);
     assert.equal(flavor.launches.length, 3, 'no over-mint: settle did not double-decrement unassigned');
+  });
+});
+
+test('runner completion interrupts a full-host backoff and triggers a prompt poll', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  await runSession({
+    flavor,
+    options: { maxConcurrent: 1, pollIntervalMs: 20, pollMaxIntervalMs: 2000, random: () => 0.5 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/wakeup', private: true }],
+      runs: { 'me/wakeup': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: [{ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] }] },
+    },
+  }, async ({ start, flavor, stub }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 1), 'the first runner launches');
+    await tick(50); // let the poll cycle enter its full-host backoff
+    const pollsBeforeCompletion = stub.countCalls('GET', '/user/repos');
+    stub.jobs.set('1', []);
+
+    flavor.launches[0].succeed({ startedJob: true });
+
+    assert.ok(await waitFor(
+      () => stub.countCalls('GET', '/user/repos') > pollsBeforeCompletion,
+      { timeoutMs: 500 },
+    ), 'slot release wakes polling well before the 2s full-host fallback');
   });
 });
 
