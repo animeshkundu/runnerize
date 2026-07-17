@@ -11,7 +11,9 @@ import {
 import { runDispatcher } from '../src/dispatcher.js';
 import { detectFlavors, FLAVOR_KEYS } from '../src/sandbox/index.js';
 import { installService, preflightRun, uninstallService } from '../src/service.js';
-import { guardStatus, installGuard, uninstallGuard } from '../src/guard.js';
+import {
+  createGuardLease, guardOff, guardStatus, installGuard, runGuardRecover, runGuardWatch, uninstallGuard,
+} from '../src/guard.js';
 
 const HELP = `runnerize - on-demand ephemeral GitHub Actions runners
 
@@ -20,7 +22,7 @@ Usage:
   runnerize status
   runnerize remove
   runnerize service install|uninstall [--no-elevate] [--no-guard]
-  runnerize guard install [--shutdown-guard] | uninstall | status
+  runnerize guard install [--shutdown-guard] | uninstall [--shutdown-guard] | status | on | off <session-id>
   runnerize --help
 
 Options:
@@ -32,7 +34,7 @@ Options:
   --dry-run              Count and display demand without minting runners
   --no-elevate           Never prompt for administrator access during service setup
   --no-guard             Skip host-stability guard setup during service install or uninstall
-  --shutdown-guard       Reserved for the Tier-2 shutdown guard (not yet implemented)
+  --shutdown-guard       Install or remove the opt-in Hyper-V host shutdown guard
   -h, --help             Show this help
 `;
 
@@ -230,21 +232,50 @@ async function main() {
     }
     case 'guard': {
       const [action, ...flags] = args;
-      if (!['install', 'uninstall', 'status'].includes(action)) {
-        throw new Error('Usage: runnerize guard install [--shutdown-guard] | uninstall | status');
+      if (!['install', 'uninstall', 'status', 'on', 'off'].includes(action)) {
+        throw new Error('Usage: runnerize guard install [--shutdown-guard] | uninstall [--shutdown-guard] | status | on | off <session-id>');
       }
-      if (action === 'install') {
+      if (['install', 'uninstall'].includes(action)) {
         if (flags.some((flag) => flag !== '--shutdown-guard') || flags.length > 1) {
-          throw new Error('Usage: runnerize guard install [--shutdown-guard]');
+          throw new Error(`Usage: runnerize guard ${action} [--shutdown-guard]`);
         }
-        await installGuard({ shutdownGuard: flags.includes('--shutdown-guard') });
+        const options = { shutdownGuard: flags.includes('--shutdown-guard') };
+        if (action === 'install') await installGuard(options);
+        else await uninstallGuard(options);
+      } else if (action === 'on') {
+        if (flags.length) throw new Error(`Unexpected argument: ${flags[0]}`);
+        const lease = await createGuardLease();
+        if (lease) {
+          console.log(`Holding shutdown-guard lease ${lease.sessionId}; press Ctrl-C to release.`);
+          await new Promise((resolve) => {
+            let released = false;
+            const stop = () => {
+              if (released) return;
+              released = true;
+              lease.release();
+              resolve();
+            };
+            process.once('SIGINT', stop);
+            process.once('SIGTERM', stop);
+          });
+        }
+      } else if (action === 'off') {
+        if (flags.length !== 1) throw new Error('Usage: runnerize guard off <session-id>');
+        await guardOff(flags[0]);
       } else {
         if (flags.length) throw new Error(`Unexpected argument: ${flags[0]}`);
-        if (action === 'uninstall') await uninstallGuard();
-        else await guardStatus();
+        await guardStatus();
       }
       return;
     }
+    case 'guard-watch':
+      if (args.length) throw new Error(`Unexpected argument: ${args[0]}`);
+      await runGuardWatch();
+      return;
+    case 'guard-recover':
+      if (args.length) throw new Error(`Unexpected argument: ${args[0]}`);
+      await runGuardRecover();
+      return;
     default:
       throw new Error(`Unknown command: ${command}`);
   }

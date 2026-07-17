@@ -1,25 +1,48 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync,
+} from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { dirname } from 'node:path';
+import { basename as winBasename, join as winJoin } from 'node:path/win32';
 import { platform } from 'node:os';
-import { powershellLiteral, runElevated, windowsPowerShellPath } from './service.js';
+import { fileURLToPath } from 'node:url';
+import {
+  powershellLiteral, runElevated, systemStartupTaskScript, systemTasksRemovalScript, windowsPowerShellPath,
+} from './service.js';
 
 const WINDOWS_UPDATE_KEY = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate';
 const AU_KEY = `${WINDOWS_UPDATE_KEY}\\AU`;
 const POWER_KEY = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Power';
 const DEFAULT_ACTIVE_HOURS = '6-0';
 const PROBE_TIMEOUT_MS = 10_000;
+const DEFAULT_HEARTBEAT_MS = 5_000;
+const DEFAULT_LEASE_TIMEOUT_MS = 20_000;
+const DEFAULT_RECOVERY_GRACE_MS = 30_000;
+const WATCH_TASK = 'runnerize-guard-watch';
+const RECOVER_TASK = 'runnerize-guard-recover';
+const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
+const packageRoot = dirname(dirname(binPath));
 
-function guardStatePath() {
-  return join(process.env.ProgramData || 'C:\\ProgramData', 'runnerize', 'guard', 'tier1-state.json');
+function guardRoot() {
+  return winJoin(process.env.ProgramData || 'C:\\ProgramData', 'runnerize', 'guard');
+}
+
+function tier1StatePath() {
+  return winJoin(guardRoot(), 'tier1-state.json');
+}
+
+function shutdownStatePath() {
+  return winJoin(guardRoot(), 'state.json');
+}
+
+function leasesPath() {
+  return winJoin(guardRoot(), 'leases');
 }
 
 function captureSpawn(command, args, { spawnChild = spawn, timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
-    const child = spawnChild(command, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
+    const child = spawnChild(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -52,8 +75,6 @@ async function capturePowerShell(script, options) {
 
 export async function isHyperVGuest(options = {}) {
   if ((options.platformName ?? platform()) !== 'win32') return false;
-  // Keep this CIM-only process minimal. Appending unrelated cmdlets after CIM-backed cmdlets can
-  // make Windows PowerShell crash while exiting on affected hosts.
   const script = "$c = Get-CimInstance Win32_ComputerSystem; [Console]::Out.Write((($c.Model -eq 'Virtual Machine') -and ($c.Manufacturer -like '*Microsoft*') -and [bool]$c.HypervisorPresent).ToString().ToLowerInvariant())";
   const result = await capturePowerShell(script, options);
   return result.status === 0 && result.stdout.trim().toLowerCase() === 'true';
@@ -90,8 +111,6 @@ function stateCaptureScript(path) {
 }
 
 function applyScript(path, { start, end }) {
-  // Microsoft Windows Update policy CSP registry mappings: SetActiveHours,
-  // ActiveHoursStart, and ActiveHoursEnd under the WindowsUpdate policy key.
   return [
     stateCaptureScript(path),
     `New-Item -Path ${powershellLiteral(AU_KEY)} -Force | Out-Null`,
@@ -108,25 +127,93 @@ function applyScript(path, { start, end }) {
 function restoreScript(path) {
   return [
     `$statePath = ${powershellLiteral(path)}`,
-    'if (-not (Test-Path -LiteralPath $statePath)) { exit 0 }',
-    '$state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json',
-    `$expected = @(@{ path = ${powershellLiteral(AU_KEY)}; name = 'NoAutoRebootWithLoggedOnUsers' }, @{ path = ${powershellLiteral(WINDOWS_UPDATE_KEY)}; name = 'SetActiveHours' }, @{ path = ${powershellLiteral(WINDOWS_UPDATE_KEY)}; name = 'ActiveHoursStart' }, @{ path = ${powershellLiteral(WINDOWS_UPDATE_KEY)}; name = 'ActiveHoursEnd' })`,
-    'foreach ($target in $expected) {',
-    '  $setting = $state.settings | Where-Object { $_.path -eq $target.path -and $_.name -eq $target.name } | Select-Object -First 1',
-    "  if ($null -eq $setting) { throw ('Saved guard state is missing ' + $target.name) }",
-    '  if ($setting.existed) {',
-    "    if ($setting.kind -notin @('String', 'ExpandString', 'Binary', 'DWord', 'MultiString', 'QWord')) { throw ('Saved guard state has an invalid registry kind for ' + $target.name) }",
-    '    New-Item -Path $target.path -Force | Out-Null',
-    '    New-ItemProperty -Path $target.path -Name $target.name -PropertyType $setting.kind -Value $setting.data -Force | Out-Null',
-    '  } else {',
-    '    Remove-ItemProperty -LiteralPath $target.path -Name $target.name -ErrorAction SilentlyContinue',
+    'if (Test-Path -LiteralPath $statePath) {',
+    '  $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json',
+    `  $expected = @(@{ path = ${powershellLiteral(AU_KEY)}; name = 'NoAutoRebootWithLoggedOnUsers' }, @{ path = ${powershellLiteral(WINDOWS_UPDATE_KEY)}; name = 'SetActiveHours' }, @{ path = ${powershellLiteral(WINDOWS_UPDATE_KEY)}; name = 'ActiveHoursStart' }, @{ path = ${powershellLiteral(WINDOWS_UPDATE_KEY)}; name = 'ActiveHoursEnd' })`,
+    '  foreach ($target in $expected) {',
+    '    $setting = $state.settings | Where-Object { $_.path -eq $target.path -and $_.name -eq $target.name } | Select-Object -First 1',
+    "    if ($null -eq $setting) { throw ('Saved guard state is missing ' + $target.name) }",
+    '    if ($setting.existed) {',
+    "      if ($setting.kind -notin @('String', 'ExpandString', 'Binary', 'DWord', 'MultiString', 'QWord')) { throw ('Saved guard state has an invalid registry kind for ' + $target.name) }",
+    '      New-Item -Path $target.path -Force | Out-Null',
+    '      New-ItemProperty -Path $target.path -Name $target.name -PropertyType $setting.kind -Value $setting.data -Force | Out-Null',
+    '    } else { Remove-ItemProperty -LiteralPath $target.path -Name $target.name -ErrorAction SilentlyContinue }',
+    '  }',
+    '  if ($state.hibernateOn) { & powercfg.exe /hibernate on; if ($LASTEXITCODE -ne 0) { throw \'powercfg /hibernate on failed\' } }',
+    '  Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue',
+    '}',
+  ].join('\r\n');
+}
+
+function taskSpec(taskName, command, options = {}) {
+  const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
+  const root = options.guardAppRoot ?? winJoin(guardRoot(), 'app');
+  return { taskName, execute: process.execPath, argument: `${quote(winJoin(root, 'bin', 'runnerize.js'))} ${command}` };
+}
+
+function copyShutdownGuardAppScript(options = {}) {
+  const root = options.guardAppRoot ?? winJoin(guardRoot(), 'app');
+  const source = options.packageRoot ?? packageRoot;
+  return [
+    `New-Item -ItemType Directory -Path ${powershellLiteral(root)} -Force | Out-Null`,
+    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'bin'))} -Destination ${powershellLiteral(root)} -Recurse -Force`,
+    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'src'))} -Destination ${powershellLiteral(root)} -Recurse -Force`,
+    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'package.json'))} -Destination ${powershellLiteral(root)} -Force`,
+  ].join('\r\n');
+}
+
+export function shutdownGuardInstallScript(options = {}) {
+  const root = options.guardRoot ?? guardRoot();
+  const leases = options.leasesPath ?? winJoin(root, 'leases');
+  const state = options.shutdownStatePath ?? winJoin(root, 'state.json');
+  const watch = taskSpec(WATCH_TASK, 'guard-watch', options);
+  return [
+    `New-Item -ItemType Directory -Path ${powershellLiteral(leases)} -Force | Out-Null`,
+    `$rootAcl = New-Object System.Security.AccessControl.DirectorySecurity`,
+    `$rootAcl.SetAccessRuleProtection($true, $false)`,
+    `$rootAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM','FullControl','ContainerInherit,ObjectInherit','None','Allow')))`,
+    `$rootAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\\Administrators','FullControl','ContainerInherit,ObjectInherit','None','Allow')))`,
+    `$rootAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('Authenticated Users','ReadAndExecute','None','None','Allow')))`,
+    `Set-Acl -LiteralPath ${powershellLiteral(root)} -AclObject $rootAcl`,
+    copyShutdownGuardAppScript(options),
+    `$appAcl = Get-Acl -LiteralPath ${powershellLiteral(root)}`,
+    `Set-Acl -LiteralPath ${powershellLiteral(options.guardAppRoot ?? winJoin(root, 'app'))} -AclObject $appAcl`,
+    `$leaseAcl = New-Object System.Security.AccessControl.DirectorySecurity`,
+    `$leaseAcl.SetAccessRuleProtection($true, $false)`,
+    `$leaseAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM','FullControl','ContainerInherit,ObjectInherit','None','Allow')))`,
+    `$leaseAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\\Administrators','FullControl','ContainerInherit,ObjectInherit','None','Allow')))`,
+    `$leaseAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('Authenticated Users','ListDirectory,CreateFiles,ReadAttributes,ReadExtendedAttributes,ReadPermissions,Synchronize','None','None','Allow')))`,
+    `$leaseAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('CREATOR OWNER','Modify','ObjectInherit','InheritOnly','Allow')))`,
+    `Set-Acl -LiteralPath ${powershellLiteral(leases)} -AclObject $leaseAcl`,
+    `if (-not (Test-Path -LiteralPath ${powershellLiteral(state)})) { [System.IO.File]::WriteAllText(${powershellLiteral(state)}, '{"version":1,"service":null}', [System.Text.UTF8Encoding]::new($false)) }`,
+    systemStartupTaskScript(watch),
+    systemTasksRemovalScript([RECOVER_TASK]),
+    `& schtasks.exe /Run /TN ${powershellLiteral(WATCH_TASK)} | Out-Null`,
+  ].join('\r\n');
+}
+
+function restoreShutdownServiceScript(path = shutdownStatePath()) {
+  return [
+    `$statePath = ${powershellLiteral(path)}`,
+    'if (Test-Path -LiteralPath $statePath) {',
+    '  $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json',
+    '  if ($null -ne $state.service) {',
+    "    if ($state.service.startupType -notin @('Automatic','Manual','Disabled')) { throw 'Invalid saved vmicshutdown startup type' }",
+    "    Set-Service -Name 'vmicshutdown' -StartupType $state.service.startupType",
+    "    if ($state.service.wasRunning) { Start-Service -Name 'vmicshutdown' } else { Stop-Service -Name 'vmicshutdown' -Force -ErrorAction SilentlyContinue }",
     '  }',
     '}',
-    'if ($state.hibernateOn) {',
-    '  & powercfg.exe /hibernate on',
-    "  if ($LASTEXITCODE -ne 0) { throw 'powercfg /hibernate on failed' }",
-    '}',
-    'Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue',
+  ].join('\r\n');
+}
+
+export function shutdownGuardUninstallScript(options = {}) {
+  const root = options.guardRoot ?? guardRoot();
+  const state = options.shutdownStatePath ?? winJoin(root, 'state.json');
+  return [
+    systemTasksRemovalScript([WATCH_TASK, RECOVER_TASK]),
+    restoreShutdownServiceScript(state),
+    `Remove-Item -LiteralPath ${powershellLiteral(state)} -Force -ErrorAction SilentlyContinue`,
+    `Remove-Item -LiteralPath ${powershellLiteral(root)} -Recurse -Force -ErrorAction SilentlyContinue`,
   ].join('\r\n');
 }
 
@@ -144,38 +231,190 @@ async function requireSupportedHost(action, options) {
 }
 
 export async function installGuard(options = {}) {
-  if (options.shutdownGuard) {
-    console.log('shutdown-guard (Tier 2) is not yet implemented');
-    return;
-  }
   if (!await requireSupportedHost('install', options)) return;
   const hours = activeHours(options.activeHours);
+  const scripts = [applyScript(options.statePath ?? tier1StatePath(), hours)];
+  if (options.shutdownGuard) scripts.push(shutdownGuardInstallScript(options));
   console.log('Administrator access is needed to apply the host-stability guard.');
   console.log('A UAC prompt will appear. Approve it to update Windows Update and power settings.');
   const result = await (options.runElevatedOperation ?? runElevated)(
-    'install host-stability guard',
-    applyScript(options.statePath ?? guardStatePath(), hours),
-    { timeoutMs: options.elevationTimeoutMs },
+    'install host-stability guard', scripts.join('\r\n'), { timeoutMs: options.elevationTimeoutMs },
   );
   if (!result.ok) throw new Error(`Host-stability guard could not be installed: ${result.reason}`);
-  console.log(`Host-stability guard installed (active hours ${hours.start}:00-${hours.end}:00; hibernate off).`);
+  console.log(`Host-stability guard installed (active hours ${hours.start}:00-${hours.end}:00; hibernate off${options.shutdownGuard ? '; shutdown guard enabled' : ''}).`);
 }
 
 export async function uninstallGuard(options = {}) {
   if (!await requireSupportedHost('uninstall', options)) return;
-  const path = options.statePath ?? guardStatePath();
-  if (!(options.stateExists ?? existsSync)(path)) {
-    console.log('Host-stability guard uninstall: no saved Tier-1 state; nothing to restore.');
+  const tier1Path = options.statePath ?? tier1StatePath();
+  const hasTier1 = (options.stateExists ?? existsSync)(tier1Path);
+  const hasTier2 = options.shutdownGuard || (options.stateExists ?? existsSync)(options.shutdownStatePath ?? shutdownStatePath());
+  if (!hasTier1 && !hasTier2) {
+    console.log('Host-stability guard uninstall: no saved state; nothing to restore.');
     return;
   }
   console.log('Administrator access is needed to restore the prior host settings.');
+  const scripts = [];
+  if (hasTier1) scripts.push(restoreScript(tier1Path));
+  if (hasTier2) scripts.push(shutdownGuardUninstallScript(options));
   const result = await (options.runElevatedOperation ?? runElevated)(
-    'uninstall host-stability guard',
-    restoreScript(path),
-    { timeoutMs: options.elevationTimeoutMs },
+    'uninstall host-stability guard', scripts.join('\r\n'), { timeoutMs: options.elevationTimeoutMs },
   );
   if (!result.ok) throw new Error(`Host-stability guard could not be uninstalled: ${result.reason}`);
-  console.log('Host-stability guard uninstalled; prior Tier-1 settings restored.');
+  console.log('Host-stability guard uninstalled; prior settings restored.');
+}
+
+function atomicWriteJson(path, value, options = {}) {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  (options.writeFile ?? writeFileSync)(temporary, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
+  (options.rename ?? renameSync)(temporary, path);
+}
+
+export function readLiveLeases(options = {}) {
+  const directory = options.leasesPath ?? leasesPath();
+  const now = options.now ?? Date.now();
+  const timeoutMs = options.leaseTimeoutMs ?? DEFAULT_LEASE_TIMEOUT_MS;
+  const live = [];
+  let names;
+  try { names = (options.readdir ?? readdirSync)(directory); } catch { return live; }
+  for (const name of names) {
+    if (!/^[0-9a-f-]{36}\.json$/i.test(name)) continue;
+    const path = winJoin(directory, name);
+    let fd;
+    try {
+      fd = (options.open ?? openSync)(path, 'r');
+      const stat = (options.fstat ?? fstatSync)(fd);
+      if (!stat.isFile()) throw new Error('not a regular file');
+      const lease = JSON.parse((options.readFile ?? readFileSync)(fd, 'utf8'));
+      if (lease.version !== 1 || lease.sessionId !== winBasename(name, '.json') || !Number.isFinite(lease.heartbeat)
+        || lease.heartbeat > now + timeoutMs || now - lease.heartbeat > timeoutMs) {
+        throw new Error('invalid or stale lease');
+      }
+      live.push(lease);
+    } catch {
+      try { (options.unlink ?? unlinkSync)(path); } catch { /* retry next pass */ }
+    } finally {
+      if (fd !== undefined) (options.close ?? closeSync)(fd);
+    }
+  }
+  return live;
+}
+
+async function windowsServiceController(options = {}) {
+  const run = async (script) => {
+    const result = await capturePowerShell(script, options);
+    if (result.status !== 0) throw new Error(result.stderr.trim() || result.error?.message || 'vmicshutdown operation failed');
+    return result.stdout.trim();
+  };
+  return {
+    async inspect() {
+      const output = await run("$s = Get-CimInstance Win32_Service -Filter \"Name='vmicshutdown'\"; if ($null -eq $s) { throw 'vmicshutdown was not found' }; [Console]::Out.Write(([ordered]@{ startupType = $s.StartMode; wasRunning = ($s.State -eq 'Running') } | ConvertTo-Json -Compress))");
+      const value = JSON.parse(output);
+      const startupType = { Auto: 'Automatic', Manual: 'Manual', Disabled: 'Disabled' }[value.startupType];
+      if (!startupType) throw new Error(`Unsupported vmicshutdown startup type: ${value.startupType}`);
+      return { startupType, wasRunning: value.wasRunning };
+    },
+    disable: () => run("Set-Service -Name 'vmicshutdown' -StartupType Disabled; Stop-Service -Name 'vmicshutdown' -Force -ErrorAction SilentlyContinue"),
+    restore: (state) => {
+      if (!['Automatic', 'Manual', 'Disabled'].includes(state.startupType)) {
+        throw new Error(`Invalid saved vmicshutdown startup type: ${state.startupType}`);
+      }
+      return run(`Set-Service -Name 'vmicshutdown' -StartupType ${state.startupType}; ${state.wasRunning ? "Start-Service -Name 'vmicshutdown'" : "Stop-Service -Name 'vmicshutdown' -Force -ErrorAction SilentlyContinue"}`);
+    },
+  };
+}
+
+export async function reconcileShutdownGuard(options = {}) {
+  const statePath = options.shutdownStatePath ?? shutdownStatePath();
+  const service = options.service ?? await windowsServiceController(options);
+  const live = readLiveLeases(options);
+  let state;
+  try {
+    state = JSON.parse((options.readFile ?? readFileSync)(statePath, 'utf8'));
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error(`Invalid shutdown guard state: ${error.message}`);
+    state = { version: 1, service: null };
+  }
+  if (state.version !== 1 || !Object.hasOwn(state, 'service')) throw new Error('Invalid shutdown guard state');
+
+  if (live.length) {
+    if (state.service === null) {
+      const snapshot = await service.inspect();
+      if (snapshot.startupType === 'Disabled') {
+        throw new Error('Refusing to snapshot vmicshutdown while it is already Disabled');
+      }
+      // Compare-and-set against the authoritative file immediately before persisting.
+      const current = JSON.parse((options.readFile ?? readFileSync)(statePath, 'utf8'));
+      if (current.service === null) {
+        current.service = snapshot;
+        atomicWriteJson(statePath, current, options);
+        state = current;
+      } else {
+        state = current;
+      }
+    }
+    await service.disable();
+    return { live: live.length, action: 'disabled' };
+  }
+  if (state.service !== null) {
+    await service.restore(state.service);
+    state.service = null;
+    atomicWriteJson(statePath, state, options);
+    return { live: 0, action: 'restored' };
+  }
+  return { live: 0, action: 'unchanged' };
+}
+
+export async function createGuardLease(options = {}) {
+  if (!await requireSupportedHost('on', options)) return null;
+  const directory = options.leasesPath ?? leasesPath();
+  const sessionId = options.sessionId ?? randomUUID();
+  if (!/^[0-9a-f-]{36}$/i.test(sessionId)) throw new Error('Invalid guard session identifier');
+  (options.mkdir ?? mkdirSync)(directory, { recursive: true });
+  const path = winJoin(directory, `${sessionId}.json`);
+  const heartbeat = () => atomicWriteJson(path, { version: 1, sessionId, heartbeat: (options.now ?? Date.now)() }, options);
+  heartbeat();
+  const timer = (options.setInterval ?? setInterval)(heartbeat, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
+  let released = false;
+  return {
+    sessionId,
+    heartbeat,
+    release() {
+      if (released) return;
+      released = true;
+      (options.clearInterval ?? clearInterval)(timer);
+      try { (options.unlink ?? unlinkSync)(path); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    },
+  };
+}
+
+export async function guardOff(sessionId, options = {}) {
+  if (!await requireSupportedHost('off', options)) return;
+  if (!/^[0-9a-f-]{36}$/i.test(sessionId ?? '')) throw new Error('guard off requires the session identifier printed by guard on');
+  try { (options.unlink ?? unlinkSync)(winJoin(options.leasesPath ?? leasesPath(), `${sessionId}.json`)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => { const timer = setTimeout(resolve, milliseconds); timer.unref?.(); });
+}
+
+export async function runGuardWatch(options = {}) {
+  if (!await requireSupportedHost('watch', options)) return;
+  const wait = options.delay ?? delay;
+  // Let sessions recreate their leases after boot before either task can restore a pending
+  // snapshot. Recovery runs at the grace boundary; the watchdog starts one cadence later.
+  if (!options.once) await wait((options.recoveryGraceMs ?? DEFAULT_RECOVERY_GRACE_MS) + (options.cadenceMs ?? DEFAULT_HEARTBEAT_MS));
+  do {
+    try { await reconcileShutdownGuard(options); } catch (error) { console.error(`runnerize guard-watch: ${error.message}`); }
+    if (options.once) break;
+    await wait(options.cadenceMs ?? DEFAULT_HEARTBEAT_MS);
+  } while (true);
+}
+
+export async function runGuardRecover(options = {}) {
+  if (!await requireSupportedHost('recover', options)) return;
+  await (options.delay ?? delay)(options.recoveryGraceMs ?? DEFAULT_RECOVERY_GRACE_MS);
+  return reconcileShutdownGuard(options);
 }
 
 export async function guardStatus(options = {}) {
@@ -191,7 +430,7 @@ export async function guardStatus(options = {}) {
     console.log('Host-stability guard status: NOOP (this host is not a Microsoft Hyper-V guest).');
     return;
   }
-  const path = options.statePath ?? guardStatePath();
+  const path = options.statePath ?? tier1StatePath();
   const script = [
     `function Read-Value($path, $name) { $key = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue; if ($null -eq $key) { return $null }; return $key.GetValue($name, $null) }`,
     `$power = Read-Value ${powershellLiteral(POWER_KEY)} 'HibernateEnabled'`,
@@ -205,4 +444,5 @@ export async function guardStatus(options = {}) {
   console.log(`NoAutoRebootWithLoggedOnUsers: ${state.noAutoRebootWithLoggedOnUsers ?? 'absent'}`);
   console.log(`Active hours policy: enabled=${state.setActiveHours ?? 'absent'} start=${state.activeHoursStart ?? 'absent'} end=${state.activeHoursEnd ?? 'absent'}`);
   console.log(`Hibernate: ${state.hibernateOn ? 'on' : 'off'}`);
+  console.log(`Shutdown guard: ${(options.stateExists ?? existsSync)(options.shutdownStatePath ?? shutdownStatePath()) ? 'installed' : 'not installed'}`);
 }

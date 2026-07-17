@@ -562,6 +562,67 @@ test('drain deadline stops minting, force-reaps runners, and invokes the drain h
   });
 });
 
+test('host shutdown guard is off by default and releases its lease through the drain hook', async () => {
+  const flavor = new FakeFlavor();
+  let acquired = 0;
+  let released = 0;
+  const github = {
+    user: { login: 'me', type: 'User' },
+    repos: [{ full_name: 'me/guard', private: true }],
+  };
+  await runSession({
+    flavor,
+    options: { acquireGuardLease: async () => { acquired += 1; return { release: () => { released += 1; } }; } },
+    github,
+  }, async ({ start, controller }) => {
+    const dispatcher = start();
+    await tick(30);
+    controller.abort();
+    await dispatcher;
+    assert.equal(acquired, 0);
+    assert.equal(released, 0);
+  });
+
+  await runSession({
+    flavor: new FakeFlavor(),
+    options: {
+      hostGuard: true,
+      acquireGuardLease: async () => { acquired += 1; return { release: () => { released += 1; } }; },
+    },
+    github,
+  }, async ({ start, controller }) => {
+    const dispatcher = start();
+    assert.ok(await waitFor(() => acquired === 1));
+    controller.abort();
+    await dispatcher;
+    assert.equal(released, 1);
+  });
+});
+
+test('guard release failure does not bypass the caller drain hook', async () => {
+  const flavor = new FakeFlavor();
+  let drained = 0;
+  await runSession({
+    flavor,
+    options: {
+      hostGuard: true,
+      acquireGuardLease: async () => ({ release: () => { throw new Error('locked'); } }),
+      onDrain: () => { drained += 1; },
+    },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/guard-error', private: true }],
+    },
+  }, async ({ start, controller, events }) => {
+    const dispatcher = start();
+    await tick(20);
+    controller.abort();
+    await dispatcher;
+    assert.equal(drained, 1);
+    assert.equal(events('guard_release_error').length, 1);
+  });
+});
+
 test('startup reconciliation reaps host resources before polling', async () => {
   const flavor = new FakeFlavor();
   let orphanReaps = 0;
