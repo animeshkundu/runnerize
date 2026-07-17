@@ -153,12 +153,14 @@ runs-on: [self-hosted, macos, arm64]
 ```
 
 `npx runnerize service install` audits the Mac first. On Apple Silicon it installs
-tart automatically through Homebrew when possible, without sudo. It does not pull
+tart automatically through Homebrew when possible, without sudo. On recent Homebrew
+it trusts the `cirruslabs/cli` tap first, which is required before the tart formula
+and its `softnet` dependency will install. It does not pull
 a base image automatically because macOS images are tens of gigabytes; instead it
 prints numbered copy-paste commands for Homebrew/tart gaps, the one-time image
-pull, SSH credentials, and GitHub login. The launchd agent is still installed when
-another backend is usable, so completing a guided step later enables the macOS
-flavor without reinstalling.
+pull, SSH credentials, and GitHub login. The launchd agent is installed only when
+at least one backend is usable. After adding or changing a backend, rerun `npx
+runnerize service install`; installation is idempotent and refreshes the agent.
 
 Set `RUNNERIZE_MACOS_IMAGE` to a local tart VM name or remote image reference,
 for example `ghcr.io/cirruslabs/macos-sequoia-base:latest`, then run `tart pull
@@ -172,8 +174,10 @@ Configuration:
 
 - `RUNNERIZE_MACOS_IMAGE` (required): tart base image name or reference.
 - `RUNNERIZE_MACOS_SSH_USER` (default `admin`): SSH user in the base image.
-- `RUNNERIZE_MACOS_SSH_KEY` (optional): path to a private SSH key. Without it,
-  SSH uses the agent and default identity files.
+- `RUNNERIZE_MACOS_SSH_KEY` (optional): absolute path to a private SSH key. Expand
+  `~` before setting it because launchd does not perform shell expansion. The
+  installer also expands a leading `~/` before writing the plist. Without it, SSH
+  uses the agent and default identity files.
 - `RUNNERIZE_MACOS_RUNNER_DIR` (optional): actions-runner directory inside the
   VM. Baking the runner into the base image is faster than downloading it for
   every job.
@@ -188,7 +192,17 @@ configured user, and include `bash`, `curl`, and `tar`. If
 - `runnerize service install` writes a **launchd** agent
   (`~/Library/LaunchAgents/io.runnerize.dispatcher.plist`, `RunAtLoad` +
   `KeepAlive`) and bootstraps it. Logs go to `~/Library/Logs/runnerize.log`.
-  No admin needed for a user LaunchAgent.
+  No admin is needed, and installs through `sudo` are rejected.
+- The service gets an explicit PATH containing the selected Node and detected
+  `gh`, `tart`, `podman`, and `docker` directories plus Homebrew and system paths.
+- The zero-dependency package is copied to `~/Library/Application
+  Support/runnerize/app`. A version-manager Node is replaced by checksum-verified
+  Node v24.18.0 under `node/v24.18.0`; stable system Node paths are reused.
+- The resolved GitHub token is snapshotted at install to
+  `credentials/gh-token`, mode `0600` inside a `0700` directory, and is never put
+  in the plist. Rerun service install after rotating the credential.
+- `runnerize service uninstall` removes the agent, app, pinned Node, credential,
+  readiness state, and `~/Library/Logs/runnerize.log`.
 
 ---
 

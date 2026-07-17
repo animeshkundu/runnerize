@@ -82,6 +82,52 @@ test('ensureImage rejects when no container runtime is available', async () => {
   }
 });
 
+test('ensureImage bounds a hung pull with a timeout instead of stalling forever', async () => {
+  const runner = await freshImport('../../src/runner.js');
+  const previous = process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS;
+  process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS = '40';
+  const stub = new SpawnStub((child) => {
+    const args = child.args ?? [];
+    if (args.includes('--version')) { child.emitStdout('docker 27\n'); child.close(0); return; }
+    if (args.includes('inspect')) { child.emitStderr('no such image\n'); child.close(1); return; }
+    // pull: deliberately never emit output or close, simulating a hung `docker pull`.
+  }).install();
+  // The production pull timeout is unref'd (it must not keep the dispatcher alive on
+  // shutdown). Because the fake pull child produces no I/O, that timer is the only pending
+  // work, so hold the loop open until it fires; otherwise the runner cancels this test.
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    await assert.rejects(() => runner.ensureImage('example/image:latest'), /timed out after 40ms/);
+    assert.ok(stub.find('pull'), 'attempted the pull before timing out');
+  } finally {
+    clearInterval(keepAlive);
+    stub.restore();
+    if (previous === undefined) delete process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS;
+    else process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS = previous;
+  }
+});
+
+test('ensureImage ignores a malformed pull-timeout env and does not kill a normal pull', async () => {
+  const runner = await freshImport('../../src/runner.js');
+  const previous = process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS;
+  process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS = '-100';
+  const stub = new SpawnStub((child) => {
+    const args = child.args ?? [];
+    if (args.includes('--version')) { child.emitStdout('docker 27\n'); child.close(0); return; }
+    if (args.includes('inspect')) { child.emitStderr('no such image\n'); child.close(1); return; }
+    if (args.includes('pull')) { child.emitStdout('pulled\n'); child.close(0); return; }
+    child.close(0);
+  }).install();
+  try {
+    await runner.ensureImage('example/image:latest');
+    assert.ok(stub.find('pull'), 'pulled without an immediate-kill from the negative timeout');
+  } finally {
+    stub.restore();
+    if (previous === undefined) delete process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS;
+    else process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS = previous;
+  }
+});
+
 test('ensureImage validates its argument', async () => {
   const runner = await freshImport('../../src/runner.js');
   await assert.rejects(() => runner.ensureImage(''), TypeError);
