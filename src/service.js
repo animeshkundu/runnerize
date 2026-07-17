@@ -25,7 +25,7 @@ const MACOS_ENVIRONMENT_KEYS = [
   'RUNNERIZE_MACOS_RUNNER_DIR',
   'RUNNERIZE_MACOS_RUNNER_VERSION',
 ];
-const windowsPowerShellPath = join(
+export const windowsPowerShellPath = join(
   process.env.SystemRoot || 'C:\\Windows',
   'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
 );
@@ -286,7 +286,7 @@ function uninstallLaunchd() {
   console.log(`Removed ${agentPath}`);
 }
 
-function powershellLiteral(value) {
+export function powershellLiteral(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
@@ -606,7 +606,7 @@ function writeStartupLauncher(spec) {
   return startupPath;
 }
 
-async function runElevated(operation, command, { timeoutMs = ELEVATION_TIMEOUT_MS } = {}) {
+export async function runElevated(operation, command, { timeoutMs = ELEVATION_TIMEOUT_MS } = {}) {
   const elevatedScript = [
     "$ErrorActionPreference = 'Stop'",
     'try {',

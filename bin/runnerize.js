@@ -10,6 +10,7 @@ import {
 import { runDispatcher } from '../src/dispatcher.js';
 import { detectFlavors, FLAVOR_KEYS } from '../src/sandbox/index.js';
 import { installService, preflightRun, uninstallService } from '../src/service.js';
+import { guardStatus, installGuard, uninstallGuard } from '../src/guard.js';
 
 const HELP = `runnerize - on-demand ephemeral GitHub Actions runners
 
@@ -18,6 +19,7 @@ Usage:
   runnerize status
   runnerize remove
   runnerize service install|uninstall [--no-elevate]
+  runnerize guard install [--shutdown-guard] | uninstall | status
   runnerize --help
 
 Options:
@@ -28,6 +30,7 @@ Options:
   --no-keep-awake        Allow the host to sleep while the dispatcher runs
   --dry-run              Count and display demand without minting runners
   --no-elevate           Never prompt for administrator access during service setup
+  --shutdown-guard       Reserved for the Tier-2 shutdown guard (not yet implemented)
   -h, --help             Show this help
 `;
 
@@ -215,6 +218,23 @@ async function main() {
       const options = { noElevate: flags.includes('--no-elevate') };
       if (action === 'install') await installService(options);
       else await uninstallService(options);
+      return;
+    }
+    case 'guard': {
+      const [action, ...flags] = args;
+      if (!['install', 'uninstall', 'status'].includes(action)) {
+        throw new Error('Usage: runnerize guard install [--shutdown-guard] | uninstall | status');
+      }
+      if (action === 'install') {
+        if (flags.some((flag) => flag !== '--shutdown-guard') || flags.length > 1) {
+          throw new Error('Usage: runnerize guard install [--shutdown-guard]');
+        }
+        await installGuard({ shutdownGuard: flags.includes('--shutdown-guard') });
+      } else {
+        if (flags.length) throw new Error(`Unexpected argument: ${flags[0]}`);
+        if (action === 'uninstall') await uninstallGuard();
+        else await guardStatus();
+      }
       return;
     }
     default:
