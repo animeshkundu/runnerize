@@ -4,7 +4,7 @@ On-demand, **stateless** self-hosted GitHub Actions runners for your **private**
 
 A single **dispatcher** watches your owned-private repos for queued jobs and, per job, mints a **just-in-time (JIT) runner** and runs it inside a **throwaway rootless container**. The runner takes exactly one job, then auto-deregisters and the container is destroyed. Nothing persists; the job never sees your host credentials or caches.
 
-> Status: Linux is working and live-validated with rootless Podman. The native Windows Sandbox backend is working and validated on Windows 11 24H2. The macOS `tart` backend is implemented; hardware validation on Apple Silicon is pending.
+> Status: Linux is working and live-validated with rootless Podman. The native Windows Sandbox backend is working and validated on Windows 11 24H2. The macOS service lifecycle is validated on Apple Silicon (install, launchd run, a real Linux-container job, npx-cache-independent durability, and uninstall); the native `tart` macOS backend is installed and detected, with a full macOS guest job still pending hardware validation.
 
 ## Why
 
@@ -79,7 +79,7 @@ jobs:
 |---|---|---|---|
 | `linux` | any (Linux / WSL / Colima) | rootless container, fat image | **working** |
 | `windows` | Windows 11 Pro/Enterprise | Windows Sandbox (disposable) | **working**; validated on Windows 11 24H2 |
-| `macos` | Apple Silicon | `tart` VM | **implemented**; hardware validation pending |
+| `macos` | Apple Silicon | `tart` VM | **implemented**; service lifecycle validated on Apple Silicon, tart guest job pending |
 
 ## Known limitations
 

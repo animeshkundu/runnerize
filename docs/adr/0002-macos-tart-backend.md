@@ -1,6 +1,6 @@
 # 2. Tart backend for the native `macos` flavor
 
-Status: Accepted (2026-07-16)
+Status: Accepted (2026-07-16); service lifecycle validated on Apple Silicon (2026-07-17)
 
 ## Context
 
@@ -37,4 +37,4 @@ The VM is always disposable. No runner state, workspace, or registration materia
 - At most two macOS guests run concurrently per host, even when the global `--max` is higher.
 - Startup includes clone and boot latency. A base image with a pre-baked actions runner substantially reduces per-job setup time.
 - Hosts without Apple Silicon or a working tart installation never advertise the flavor.
-- The implementation was validated with hermetic process-lifecycle tests but was not tested on macOS hardware when accepted. A real Apple Silicon Mac is required to confirm tart image, networking, SSH, runner bootstrap, job execution, and cleanup behavior.
+- The launchd service lifecycle was validated on Apple Silicon hardware: `service install` (checksum-verified pinned Node, injected PATH, 0600 credential file, materialized app), the running dispatcher under launchd (Linux-container backend, a real one-job runner, credential read from the file without invoking `gh`), npx-cache-independent durability, `service uninstall` cleanup, and tart-backed `macos` flavor detection. A full native macOS guest job (image pull, boot, SSH, runner bootstrap, job execution, and VM cleanup) still requires validation on a host with sufficient RAM.
