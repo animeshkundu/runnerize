@@ -83,9 +83,10 @@ test('linux.launch resolves { startedJob: true } after a job-start line and clea
   });
 });
 
-test('linux.launch: onStarted fires exactly once even across multiple job lines', async () => {
+test('linux.launch: onStarted fires exactly once and failure diagnostics stay silent on success', async () => {
   await withLinuxLaunch(async (linux) => {
     let started = 0;
+    let diagnostics = 0;
     const stub = containerStub((child) => {
       child.startJob();
       child.emitStdout('Running job: another\n');
@@ -96,9 +97,12 @@ test('linux.launch: onStarted fires exactly once even across multiple job lines'
       const result = await linux.launch('cfg', {
         idleTimeoutMs: 5000,
         onStarted: () => { started += 1; },
+        onFailureDiagnostics: () => { diagnostics += 1; },
       });
       assert.deepEqual(result, { startedJob: true });
+      assert.equal(Object.keys(result).length, 1, 'the return contract stays exact');
       assert.equal(started, 1, 'onStarted is invoked exactly once');
+      assert.equal(diagnostics, 0, 'failure diagnostics are not emitted on success');
     } finally {
       stub.restore();
     }
@@ -132,16 +136,30 @@ test('linux.launch: idle watchdog force-settles and releases when a job never st
   });
 });
 
-test('linux.launch: idle watchdog tears the container down and settles fast when the child exits', async () => {
+test('linux.launch: idle watchdog reports bounded diagnostics and preserves its return contract', async () => {
   await withLinuxLaunch(async (linux) => {
+    const stdout = `${'o'.repeat(70 * 1024)}stdout-tail`;
+    const stderr = `${'e'.repeat(70 * 1024)}stderr-tail`;
+    const diagnostics = [];
     const stub = containerStub((child) => {
+      child.emitStdout(stdout);
+      child.emitStderr(stderr);
       // No job line. When the watchdog signals us, exit like a real container would.
       const origKill = child.kill.bind(child);
       child.kill = (sig) => { const r = origKill(sig); queueMicrotask(() => child.close(143)); return r; };
     }).install();
     try {
-      const result = await withKeepAlive(linux.launch('cfg', { idleTimeoutMs: 30 }));
+      const result = await withKeepAlive(linux.launch('cfg', {
+        idleTimeoutMs: 30,
+        onFailureDiagnostics: (output) => diagnostics.push(output),
+      }));
       assert.deepEqual(result, { startedJob: false });
+      assert.equal(Object.keys(result).length, 1, 'diagnostics are not added to the return object');
+      assert.equal(diagnostics.length, 1, 'failure diagnostics are emitted once');
+      assert.ok(Buffer.byteLength(diagnostics[0].stdout) <= 64 * 1024, 'stdout is bounded');
+      assert.ok(Buffer.byteLength(diagnostics[0].stderr) <= 64 * 1024, 'stderr is bounded');
+      assert.match(diagnostics[0].stdout, /stdout-tail$/, 'stdout retains the most recent output');
+      assert.match(diagnostics[0].stderr, /stderr-tail$/, 'stderr retains the most recent output');
       // stopContainer issued `rm -f <name>` against the runtime.
       const teardown = stub.children.find((c) => (c.args ?? []).includes('rm') && (c.args ?? []).includes('-f'));
       assert.ok(teardown, 'watchdog force-removed the container');
@@ -151,17 +169,26 @@ test('linux.launch: idle watchdog tears the container down and settles fast when
   });
 });
 
-test('linux.launch: rejects when the container exits non-zero without starting a job', async () => {
+test('linux.launch: rejects with diagnostics when the container exits non-zero', async () => {
   await withLinuxLaunch(async (linux) => {
+    const diagnostics = [];
     const stub = containerStub((child) => {
+      child.emitStdout('runner setup started\n');
       child.emitStderr('podman: image pull failed\n');
       child.close(125);
     }).install();
     try {
       await assert.rejects(
-        () => linux.launch('cfg', { idleTimeoutMs: 5000 }),
+        () => linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          onFailureDiagnostics: (output) => diagnostics.push(output),
+        }),
         /exited with code 125/,
       );
+      assert.deepEqual(diagnostics, [{
+        stdout: 'runner setup started\n',
+        stderr: 'podman: image pull failed\n',
+      }]);
     } finally {
       stub.restore();
     }

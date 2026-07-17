@@ -7,20 +7,37 @@ import { randomBytes } from 'node:crypto';
 
 const WORKFLOW_DIR = '.github/workflows';
 
+function yamlString(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function workflowLabels(labels) {
+  if (!Array.isArray(labels) || labels.length === 0) {
+    throw new TypeError('labels must be a non-empty array');
+  }
+  return labels.map((label) => {
+    if (typeof label !== 'string' || label.length === 0 || /[\r\n\0]/.test(label)) {
+      throw new TypeError('each label must be a non-empty single-line string');
+    }
+    return yamlString(label);
+  });
+}
+
 export function e2eRunId() {
   return `${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
 }
 
 /** The self-hosted workflow we push. `on: push` to its own branch queues exactly one job. */
-export function workflowYaml(branch, jobEcho) {
+export function workflowYaml(branch, jobEcho, labels) {
+  const runsOn = workflowLabels(labels).join(', ');
   return [
     'name: runnerize-e2e',
     'on:',
     '  push:',
-    `    branches: ['${branch}']`,
+    `    branches: [${yamlString(branch)}]`,
     'jobs:',
     '  smoke:',
-    '    runs-on: [self-hosted, linux, x64]',
+    `    runs-on: [${runsOn}]`,
     '    steps:',
     `      - run: echo "${jobEcho}"`,
     '',
@@ -33,7 +50,7 @@ export function workflowYaml(branch, jobEcho) {
  * the workflow file lands directly under `.github/workflows/` — GitHub does not scan
  * workflows in subdirectories. Returns { branch, path, headSha }.
  */
-export async function queueSelfHostedJob(api, repo, { branch, jobEcho }) {
+export async function queueSelfHostedJob(api, repo, { branch, jobEcho, labels }) {
   if (branch.includes('/')) {
     throw new Error(`e2e branch must be flat (no "/"), got ${branch}; else the workflow path nests into a subdir`);
   }
@@ -59,7 +76,7 @@ export async function queueSelfHostedJob(api, repo, { branch, jobEcho }) {
   const put = await api('PUT', `/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}`, {
     body: {
       message: `ci(e2e): queue runnerize self-hosted smoke on ${branch}`,
-      content: Buffer.from(workflowYaml(branch, jobEcho), 'utf8').toString('base64'),
+      content: Buffer.from(workflowYaml(branch, jobEcho, labels), 'utf8').toString('base64'),
       branch,
     },
   });
