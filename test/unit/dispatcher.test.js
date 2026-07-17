@@ -439,6 +439,71 @@ test('abort drains in-flight assigned runners instead of killing them', async ()
   });
 });
 
+test('drain deadline stops minting, force-reaps runners, and invokes the drain hook', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  let hookCalls = 0;
+  await runSession({
+    flavor,
+    options: {
+      maxConcurrent: 2,
+      drainTimeoutMs: 20,
+      onDrain: () => { hookCalls += 1; },
+    },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/deadline', private: true }],
+      runs: { 'me/deadline': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: Array.from({ length: 4 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+    },
+  }, async ({ start, controller, flavor, events }) => {
+    const dispatcherPromise = start();
+    assert.ok(await waitFor(() => flavor.launches.length === 2));
+    controller.abort();
+    await dispatcherPromise;
+    assert.equal(hookCalls, 1);
+    assert.equal(flavor.launches.length, 2, 'no runners mint after draining starts');
+    assert.ok(flavor.launches.every((launch) => launch.stopped), 'deadline force-stops every in-flight runner');
+    assert.equal(events('dispatcher_stopped').length, 1);
+  });
+});
+
+test('startup reconciliation reaps host resources before polling', async () => {
+  const flavor = new FakeFlavor();
+  let orphanReaps = 0;
+  flavor.reapOrphans = async () => { orphanReaps += 1; return 1; };
+  await runSession({
+    flavor,
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/startup', private: true }],
+    },
+  }, async ({ start, events }) => {
+    start();
+    assert.ok(await waitFor(() => events('reconcile_complete').length === 1));
+    assert.equal(orphanReaps, 1);
+  });
+});
+
+test('dispatcher forwards the configured runner maximum lifetime', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior();
+  await runSession({
+    flavor,
+    options: { runnerMaxLifetimeMs: 1234 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/lifetime', private: true }],
+      runs: { 'me/lifetime': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: [{ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] }] },
+    },
+  }, async ({ start, flavor }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 1));
+    assert.equal(flavor.launches[0].maxLifetimeMs, 1234);
+  });
+});
+
 test('a repo poll error does not wedge the loop; it recovers on the next cycle', async () => {
   const flavor = new FakeFlavor();
   flavor.behavior = holdingBehavior();

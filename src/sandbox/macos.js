@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { latestRunnerVersion } from '../runner.js';
 
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+const DEFAULT_MAX_LIFETIME_MS = 6 * 60 * 60_000;
 const COMMAND_TIMEOUT_MS = 300_000;
 const READINESS_TIMEOUT_MS = 120_000;
 const READINESS_POLL_MS = 2_000;
@@ -146,7 +147,7 @@ exec ./run.sh --jitconfig "$JITCFG"
 `;
 }
 
-async function observeRunner(child, idleTimeoutMs, onStarted) {
+async function observeRunner(child, idleTimeoutMs, maxLifetimeMs, onStarted) {
   return new Promise((resolve, reject) => {
     let startedJob = false;
     let stdoutRemainder = '';
@@ -159,6 +160,7 @@ async function observeRunner(child, idleTimeoutMs, onStarted) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(lifetimeTimer);
       callback();
     };
     const observeOutput = (text, remainder) => {
@@ -178,6 +180,11 @@ async function observeRunner(child, idleTimeoutMs, onStarted) {
       child.kill('SIGKILL');
       settle(() => resolve({ startedJob: false }));
     }, idleTimeoutMs);
+    const lifetimeTimer = setTimeout(() => {
+      child.kill('SIGKILL');
+      settle(() => reject(new Error(`runner exceeded maximum lifetime of ${maxLifetimeMs}ms`)));
+    }, maxLifetimeMs);
+    lifetimeTimer.unref?.();
 
     child.stdout?.on('data', (chunk) => {
       stdoutRemainder = observeOutput(chunk.toString(), stdoutRemainder);
@@ -214,12 +221,32 @@ export const macos = {
     }
   },
 
-  async launch(encodedJitConfig, { idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS, onStarted } = {}) {
+  async reapOrphans() {
+    const { stdout } = await collect('tart', ['list', '--format', 'json'], { timeoutMs: CLEANUP_TIMEOUT_MS });
+    const entries = JSON.parse(stdout);
+    const names = entries.map((entry) => entry.name ?? entry.Name)
+      .filter((name) => typeof name === 'string' && name.startsWith('runnerize-'));
+    for (const name of names) {
+      try { await collect('tart', ['stop', name], { timeoutMs: CLEANUP_TIMEOUT_MS }); } catch { /* stopped */ }
+      try { await collect('tart', ['delete', name], { timeoutMs: CLEANUP_TIMEOUT_MS }); } catch { /* gone */ }
+    }
+    return names.length;
+  },
+
+  async launch(encodedJitConfig, {
+    idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+    maxLifetimeMs = DEFAULT_MAX_LIFETIME_MS,
+    onStarted,
+    onControl,
+  } = {}) {
     if (!encodedJitConfig || typeof encodedJitConfig !== 'string') {
       throw new TypeError('encodedJitConfig must be a non-empty string');
     }
     if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
       throw new RangeError('idleTimeoutMs must be a positive number');
+    }
+    if (!Number.isFinite(maxLifetimeMs) || maxLifetimeMs <= 0) {
+      throw new RangeError('maxLifetimeMs must be a positive number');
     }
     if (process.platform !== 'darwin') throw new Error('the macos flavor requires macOS');
     if (process.arch !== 'arm64') throw new Error('the macos flavor requires Apple Silicon (arm64)');
@@ -247,6 +274,7 @@ export const macos = {
         // It may already be stopped.
       }
     };
+    onControl?.({ name: vmName, stop });
 
     try {
       await collect('tart', ['clone', image, vmName]);
@@ -259,7 +287,7 @@ export const macos = {
       child.stdin?.on('error', () => {});
       const script = bootstrapScript(encodedJitConfig, runnerDir, version);
       child.stdin?.end(script);
-      return await observeRunner(child, idleTimeoutMs, onStarted);
+      return await observeRunner(child, idleTimeoutMs, maxLifetimeMs, onStarted);
     } finally {
       await stop();
       try {
