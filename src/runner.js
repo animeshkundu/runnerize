@@ -9,18 +9,38 @@ const API_URL = 'https://api.github.com/repos/actions/runner/releases/latest';
 const USER_AGENT = 'runnerize/0.1';
 
 function run(command, args, options = {}) {
+  const { timeoutMs, ...spawnOptions } = options;
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...options });
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptions });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const settle = (callback) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      callback();
+    };
+    // Without a timeout a hung `docker pull`/`inspect` (a large image over a slow or stalled
+    // network) leaves this promise pending forever, which strands the dispatcher's launch and
+    // never releases its concurrency slot. Bound it so a hang becomes a rejected launch instead.
+    const timer = Number.isFinite(timeoutMs) && timeoutMs > 0 ? setTimeout(() => {
+      child.kill('SIGKILL');
+      settle(() => reject(new Error(`${command} timed out after ${timeoutMs}ms`)));
+    }, timeoutMs) : null;
+    timer?.unref?.();
     child.stdout?.on('data', (chunk) => { stdout += chunk; });
     child.stderr?.on('data', (chunk) => { stderr += chunk; });
-    child.once('error', reject);
-    child.once('close', (code) => {
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`${command} exited with code ${code}: ${stderr.trim()}`));
-    });
+    child.once('error', (error) => settle(() => reject(error)));
+    child.once('close', (code) => settle(() => (code === 0
+      ? resolve({ stdout, stderr })
+      : reject(new Error(`${command} exited with code ${code}: ${stderr.trim()}`)))));
   });
+}
+
+function positiveMsOrDefault(raw, fallback) {
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 async function releaseMetadata() {
@@ -161,9 +181,11 @@ export async function ensureImage(image) {
   if (!image || typeof image !== 'string') throw new TypeError('image must be a non-empty string');
   const runtime = await commandAvailable('podman') ? 'podman' : await commandAvailable('docker') ? 'docker' : null;
   if (!runtime) throw new Error('podman or docker is required for the linux flavor');
+  const inspectTimeoutMs = positiveMsOrDefault(process.env.RUNNERIZE_IMAGE_INSPECT_TIMEOUT_MS, 30_000);
+  const pullTimeoutMs = positiveMsOrDefault(process.env.RUNNERIZE_IMAGE_PULL_TIMEOUT_MS, 20 * 60_000);
   try {
-    await run(runtime, ['image', 'inspect', image]);
+    await run(runtime, ['image', 'inspect', image], { timeoutMs: inspectTimeoutMs });
   } catch {
-    await run(runtime, ['pull', image]);
+    await run(runtime, ['pull', image], { timeoutMs: pullTimeoutMs });
   }
 }
