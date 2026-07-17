@@ -297,7 +297,8 @@ test('non-elevated lease heartbeat uses one owned file and releases it', async (
   let heartbeat;
   const lease = await createGuardLease(hyperVOptions({
     sessionId: '11111111-1111-1111-1111-111111111111',
-    leasesPath: 'leases',
+    guardRoot: 'C:\\ProgramData\\runnerize\\guard',
+    leasesPath: 'C:\\ProgramData\\runnerize\\guard\\leases',
     now: () => 42,
     mkdir: () => {},
     writeFile: (path, value) => writes.push({ path, value }),
@@ -310,7 +311,7 @@ test('non-elevated lease heartbeat uses one owned file and releases it', async (
   lease.release();
   lease.release();
   assert.equal(writes.filter((entry) => entry.value).length, 2);
-  assert.deepEqual(removed, ['leases\\11111111-1111-1111-1111-111111111111.json']);
+  assert.deepEqual(removed, ['C:\\ProgramData\\runnerize\\guard\\leases\\11111111-1111-1111-1111-111111111111.json']);
 });
 
 test('status is read-only and reports current Tier-1 state', async () => {

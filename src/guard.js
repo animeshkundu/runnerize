@@ -3,7 +3,8 @@ import {
   closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { basename, dirname, join } from 'node:path';
+import { dirname } from 'node:path';
+import { basename as winBasename, join as winJoin } from 'node:path/win32';
 import { platform } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
@@ -24,19 +25,19 @@ const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
 const packageRoot = dirname(dirname(binPath));
 
 function guardRoot() {
-  return join(process.env.ProgramData || 'C:\\ProgramData', 'runnerize', 'guard');
+  return winJoin(process.env.ProgramData || 'C:\\ProgramData', 'runnerize', 'guard');
 }
 
 function tier1StatePath() {
-  return join(guardRoot(), 'tier1-state.json');
+  return winJoin(guardRoot(), 'tier1-state.json');
 }
 
 function shutdownStatePath() {
-  return join(guardRoot(), 'state.json');
+  return winJoin(guardRoot(), 'state.json');
 }
 
 function leasesPath() {
-  return join(guardRoot(), 'leases');
+  return winJoin(guardRoot(), 'leases');
 }
 
 function captureSpawn(command, args, { spawnChild = spawn, timeoutMs = PROBE_TIMEOUT_MS } = {}) {
@@ -146,25 +147,25 @@ function restoreScript(path) {
 
 function taskSpec(taskName, command, options = {}) {
   const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
-  const root = options.guardAppRoot ?? join(guardRoot(), 'app');
-  return { taskName, execute: process.execPath, argument: `${quote(join(root, 'bin', 'runnerize.js'))} ${command}` };
+  const root = options.guardAppRoot ?? winJoin(guardRoot(), 'app');
+  return { taskName, execute: process.execPath, argument: `${quote(winJoin(root, 'bin', 'runnerize.js'))} ${command}` };
 }
 
 function copyShutdownGuardAppScript(options = {}) {
-  const root = options.guardAppRoot ?? join(guardRoot(), 'app');
+  const root = options.guardAppRoot ?? winJoin(guardRoot(), 'app');
   const source = options.packageRoot ?? packageRoot;
   return [
     `New-Item -ItemType Directory -Path ${powershellLiteral(root)} -Force | Out-Null`,
-    `Copy-Item -LiteralPath ${powershellLiteral(join(source, 'bin'))} -Destination ${powershellLiteral(root)} -Recurse -Force`,
-    `Copy-Item -LiteralPath ${powershellLiteral(join(source, 'src'))} -Destination ${powershellLiteral(root)} -Recurse -Force`,
-    `Copy-Item -LiteralPath ${powershellLiteral(join(source, 'package.json'))} -Destination ${powershellLiteral(root)} -Force`,
+    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'bin'))} -Destination ${powershellLiteral(root)} -Recurse -Force`,
+    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'src'))} -Destination ${powershellLiteral(root)} -Recurse -Force`,
+    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'package.json'))} -Destination ${powershellLiteral(root)} -Force`,
   ].join('\r\n');
 }
 
 export function shutdownGuardInstallScript(options = {}) {
   const root = options.guardRoot ?? guardRoot();
-  const leases = options.leasesPath ?? join(root, 'leases');
-  const state = options.shutdownStatePath ?? join(root, 'state.json');
+  const leases = options.leasesPath ?? winJoin(root, 'leases');
+  const state = options.shutdownStatePath ?? winJoin(root, 'state.json');
   const watch = taskSpec(WATCH_TASK, 'guard-watch', options);
   return [
     `New-Item -ItemType Directory -Path ${powershellLiteral(leases)} -Force | Out-Null`,
@@ -176,7 +177,7 @@ export function shutdownGuardInstallScript(options = {}) {
     `Set-Acl -LiteralPath ${powershellLiteral(root)} -AclObject $rootAcl`,
     copyShutdownGuardAppScript(options),
     `$appAcl = Get-Acl -LiteralPath ${powershellLiteral(root)}`,
-    `Set-Acl -LiteralPath ${powershellLiteral(options.guardAppRoot ?? join(root, 'app'))} -AclObject $appAcl`,
+    `Set-Acl -LiteralPath ${powershellLiteral(options.guardAppRoot ?? winJoin(root, 'app'))} -AclObject $appAcl`,
     `$leaseAcl = New-Object System.Security.AccessControl.DirectorySecurity`,
     `$leaseAcl.SetAccessRuleProtection($true, $false)`,
     `$leaseAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM','FullControl','ContainerInherit,ObjectInherit','None','Allow')))`,
@@ -207,7 +208,7 @@ function restoreShutdownServiceScript(path = shutdownStatePath()) {
 
 export function shutdownGuardUninstallScript(options = {}) {
   const root = options.guardRoot ?? guardRoot();
-  const state = options.shutdownStatePath ?? join(root, 'state.json');
+  const state = options.shutdownStatePath ?? winJoin(root, 'state.json');
   return [
     systemTasksRemovalScript([WATCH_TASK, RECOVER_TASK]),
     restoreShutdownServiceScript(state),
@@ -278,14 +279,14 @@ export function readLiveLeases(options = {}) {
   try { names = (options.readdir ?? readdirSync)(directory); } catch { return live; }
   for (const name of names) {
     if (!/^[0-9a-f-]{36}\.json$/i.test(name)) continue;
-    const path = join(directory, name);
+    const path = winJoin(directory, name);
     let fd;
     try {
       fd = (options.open ?? openSync)(path, 'r');
       const stat = (options.fstat ?? fstatSync)(fd);
       if (!stat.isFile()) throw new Error('not a regular file');
       const lease = JSON.parse((options.readFile ?? readFileSync)(fd, 'utf8'));
-      if (lease.version !== 1 || lease.sessionId !== basename(name, '.json') || !Number.isFinite(lease.heartbeat)
+      if (lease.version !== 1 || lease.sessionId !== winBasename(name, '.json') || !Number.isFinite(lease.heartbeat)
         || lease.heartbeat > now + timeoutMs || now - lease.heartbeat > timeoutMs) {
         throw new Error('invalid or stale lease');
       }
@@ -370,7 +371,7 @@ export async function createGuardLease(options = {}) {
   const sessionId = options.sessionId ?? randomUUID();
   if (!/^[0-9a-f-]{36}$/i.test(sessionId)) throw new Error('Invalid guard session identifier');
   (options.mkdir ?? mkdirSync)(directory, { recursive: true });
-  const path = join(directory, `${sessionId}.json`);
+  const path = winJoin(directory, `${sessionId}.json`);
   const heartbeat = () => atomicWriteJson(path, { version: 1, sessionId, heartbeat: (options.now ?? Date.now)() }, options);
   heartbeat();
   const timer = (options.setInterval ?? setInterval)(heartbeat, options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
@@ -390,7 +391,7 @@ export async function createGuardLease(options = {}) {
 export async function guardOff(sessionId, options = {}) {
   if (!await requireSupportedHost('off', options)) return;
   if (!/^[0-9a-f-]{36}$/i.test(sessionId ?? '')) throw new Error('guard off requires the session identifier printed by guard on');
-  try { (options.unlink ?? unlinkSync)(join(options.leasesPath ?? leasesPath(), `${sessionId}.json`)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  try { (options.unlink ?? unlinkSync)(winJoin(options.leasesPath ?? leasesPath(), `${sessionId}.json`)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
 }
 
 function delay(milliseconds) {
