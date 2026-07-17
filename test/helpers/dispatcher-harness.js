@@ -23,13 +23,15 @@ export class FakeFlavor {
     this.launch = this.launch.bind(this);
   }
 
-  async launch(encodedJitConfig, { idleTimeoutMs, onStarted } = {}) {
+  async launch(encodedJitConfig, { idleTimeoutMs, maxLifetimeMs, onStarted, onControl } = {}) {
     let resolve;
     let reject;
     const done = new Promise((res, rej) => { resolve = res; reject = rej; });
     const launch = {
       encodedJitConfig,
       idleTimeoutMs,
+      maxLifetimeMs,
+      stopped: false,
       started: false,
       markStarted() { if (!this.started) { this.started = true; onStarted?.(); } },
       succeed(result = { startedJob: true }) { resolve(result); },
@@ -37,6 +39,13 @@ export class FakeFlavor {
       fail(error) { reject(error instanceof Error ? error : new Error(String(error))); },
     };
     this.launches.push(launch);
+    onControl?.({
+      name: `runnerize-fake-${this.launches.length}`,
+      stop: async () => {
+        launch.stopped = true;
+        launch.succeed({ startedJob: launch.started });
+      },
+    });
     // Run the scripted behavior on a microtask so the dispatcher can register the launch.
     queueMicrotask(() => this.behavior(launch, this));
     return done;
@@ -54,6 +63,7 @@ export function installFakeFlavor(fake) {
       launch: linux.launch,
       labels: linux.labels,
       maxConcurrent: linux.maxConcurrent,
+      reapOrphans: linux.reapOrphans,
     },
     windows: windows.available,
     macos: macos.available,
@@ -63,6 +73,7 @@ export function installFakeFlavor(fake) {
   linux.launch = fake.launch;
   linux.labels = fake.labels;
   linux.maxConcurrent = fake.maxConcurrent;
+  linux.reapOrphans = fake.reapOrphans?.bind(fake) ?? (async () => 0);
   windows.available = async () => false;
   macos.available = async () => false;
 
@@ -72,6 +83,7 @@ export function installFakeFlavor(fake) {
     linux.labels = saved.linux.labels;
     if (saved.linux.maxConcurrent === undefined) delete linux.maxConcurrent;
     else linux.maxConcurrent = saved.linux.maxConcurrent;
+    linux.reapOrphans = saved.linux.reapOrphans;
     windows.available = saved.windows;
     macos.available = saved.macos;
   };

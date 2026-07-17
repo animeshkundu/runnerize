@@ -184,6 +184,7 @@ async function runForeground(args) {
       event: 'shutdown_requested',
       signal: signalName,
     }));
+    // Aborting the dispatcher poll signal begins its bounded graceful drain.
     controller.abort();
   };
 

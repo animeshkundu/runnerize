@@ -10,6 +10,12 @@ import { FakeFlavor, installFakeFlavor, waitFor, tick } from '../helpers/dispatc
 // abort, await the drain) so nothing leaks into the next test through the shared
 // singletons / module state.
 async function runSession({ github, flavor, options = {} }, body) {
+  const drainWaiters = [];
+  const drainDelay = () => new Promise((resolve) => { drainWaiters.push(resolve); });
+  const expireDrain = async () => {
+    for (const resolve of drainWaiters.splice(0)) resolve();
+    await Promise.resolve();
+  };
   const prevToken = process.env.GH_TOKEN;
   process.env.GH_TOKEN = 'test-token';
   // 304s would let stale cached bodies leak across tests that reuse repo names; the mint
@@ -29,6 +35,7 @@ async function runSession({ github, flavor, options = {} }, body) {
       idleTimeoutMs: 120_000,
       reconcileMs: 10_000_000, // effectively "reconcile once at startup" unless overridden
       signal: controller.signal,
+      drainDelay,
       ...options,
       ...extra,
     });
@@ -36,7 +43,15 @@ async function runSession({ github, flavor, options = {} }, body) {
   };
 
   try {
-    return await body({ stub, flavor, controller, start, logs, events: (name) => logs.filter((l) => l.event === name) });
+    return await body({
+      stub,
+      flavor,
+      controller,
+      start,
+      expireDrain,
+      logs,
+      events: (name) => logs.filter((l) => l.event === name),
+    });
   } finally {
     console.log = originalLog;
     controller.abort();
@@ -436,6 +451,73 @@ test('abort drains in-flight assigned runners instead of killing them', async ()
       tick(2000).then(() => { throw new Error('drain never completed'); }),
     ]);
     assert.ok(events('dispatcher_stopped').length >= 1, 'dispatcher stopped cleanly after draining');
+  });
+});
+
+test('drain deadline stops minting, force-reaps runners, and invokes the drain hook', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  let hookCalls = 0;
+  await runSession({
+    flavor,
+    options: {
+      maxConcurrent: 2,
+      drainTimeoutMs: 20,
+      onDrain: () => { hookCalls += 1; },
+    },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/deadline', private: true }],
+      runs: { 'me/deadline': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: Array.from({ length: 4 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+    },
+  }, async ({ start, controller, expireDrain, flavor, events }) => {
+    const dispatcherPromise = start();
+    assert.ok(await waitFor(() => flavor.launches.length === 2));
+    controller.abort();
+    assert.ok(await waitFor(() => events('dispatcher_draining').length === 1));
+    await expireDrain();
+    await dispatcherPromise;
+    assert.equal(hookCalls, 1);
+    assert.equal(flavor.launches.length, 2, 'no runners mint after draining starts');
+    assert.ok(flavor.launches.every((launch) => launch.stopped), 'deadline force-stops every in-flight runner');
+    assert.equal(events('dispatcher_stopped').length, 1);
+  });
+});
+
+test('startup reconciliation reaps host resources before polling', async () => {
+  const flavor = new FakeFlavor();
+  let orphanReaps = 0;
+  flavor.reapOrphans = async () => { orphanReaps += 1; return 1; };
+  await runSession({
+    flavor,
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/startup', private: true }],
+    },
+  }, async ({ start, events }) => {
+    start();
+    assert.ok(await waitFor(() => events('reconcile_complete').length === 1));
+    assert.equal(orphanReaps, 1);
+  });
+});
+
+test('dispatcher forwards the configured runner maximum lifetime', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior();
+  await runSession({
+    flavor,
+    options: { runnerMaxLifetimeMs: 1234 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/lifetime', private: true }],
+      runs: { 'me/lifetime': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: [{ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] }] },
+    },
+  }, async ({ start, flavor }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 1));
+    assert.equal(flavor.launches[0].maxLifetimeMs, 1234);
   });
 });
 

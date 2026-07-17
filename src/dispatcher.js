@@ -12,6 +12,18 @@ import { keepHostAwake } from './keepawake.js';
 
 const RUNNER_NAME_PREFIX = runnerNamePrefix();
 const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
+const DEFAULT_DRAIN_TIMEOUT_MS = 15 * 60_000;
+const DEFAULT_RUNNER_MAX_LIFETIME_MS = 6 * 60 * 60_000;
+const DRAIN_HOOK_TIMEOUT_MS = 30_000;
+
+function environmentDuration(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (Number.isFinite(value)) return value;
+  console.warn(`${name} must be numeric; using ${fallback}ms.`);
+  return fallback;
+}
 
 class Semaphore {
   #capacity;
@@ -80,19 +92,23 @@ function belongsToFlavor(runner, flavors) {
   return flavors.some((flavor) => flavor.labels.every((label) => labels.has(label.toLowerCase())));
 }
 
-async function reconcile(repos, flavors, signal) {
+async function reconcile(repos, flavors, signal, { host = false } = {}) {
   let removed = 0;
+  const protectedRunnerNames = new Set();
 
   for (const repo of repos) {
     if (signal?.aborted) break;
 
     try {
       const runners = await listRunners(repo.full_name, { signal });
-      const stale = runners.filter(
-        (runner) => runner.status === 'offline'
-          && runner.name.startsWith(RUNNER_NAME_PREFIX)
+      const hostRunners = runners.filter(
+        (runner) => runner.name.startsWith(RUNNER_NAME_PREFIX)
           && belongsToFlavor(runner, flavors),
       );
+      for (const runner of hostRunners) {
+        if (runner.status !== 'offline') protectedRunnerNames.add(runner.name);
+      }
+      const stale = hostRunners.filter((runner) => runner.status === 'offline');
 
       for (const runner of stale) {
         if (signal?.aborted) break;
@@ -102,6 +118,17 @@ async function reconcile(repos, flavors, signal) {
       }
     } catch (error) {
       log('reconcile_error', { repo: repo.full_name, ...errorFields(error) });
+    }
+  }
+
+  if (host) {
+    for (const flavor of flavors) {
+      try {
+        const count = await flavor.reapOrphans?.({ protectedRunnerNames });
+        removed += count ?? 0;
+      } catch (error) {
+        log('host_reconcile_error', { flavor: flavor.key, ...errorFields(error) });
+      }
     }
   }
 
@@ -121,18 +148,28 @@ export async function runDispatcher({
   pollIntervalMs = 15_000,
   idleTimeoutMs = 120_000,
   reconcileMs = 300_000,
+  drainTimeoutMs = environmentDuration('RUNNERIZE_DRAIN_TIMEOUT_MS', DEFAULT_DRAIN_TIMEOUT_MS),
+  runnerMaxLifetimeMs = environmentDuration('RUNNERIZE_RUNNER_MAX_LIFETIME_MS', DEFAULT_RUNNER_MAX_LIFETIME_MS),
   only,
   keepAwake = true,
   signal,
+  onDrain,
+  drainDelay = abortableDelay,
 } = {}) {
-  for (const [name, value] of Object.entries({ pollIntervalMs, idleTimeoutMs, reconcileMs })) {
+  for (const [name, value] of Object.entries({
+    pollIntervalMs,
+    idleTimeoutMs,
+    reconcileMs,
+    drainTimeoutMs,
+    runnerMaxLifetimeMs,
+  })) {
     if (!Number.isFinite(value) || value < 1) {
       throw new TypeError(`${name} must be a positive number`);
     }
   }
 
   const semaphore = new Semaphore(maxConcurrent);
-  const launches = new Set();
+  const launches = new Map();
   const activeByFlavor = new Map();
   const unassignedByFlavor = new Map();
   const unassignedByRepoFlavor = new Map();
@@ -183,7 +220,7 @@ export async function runDispatcher({
 
       const now = Date.now();
       if (lastReconcile === 0 || now - lastReconcile >= reconcileMs) {
-        await reconcile(repos, flavors, signal);
+        await reconcile(repos, flavors, signal, { host: lastReconcile === 0 });
         lastReconcile = Date.now();
       }
       if (signal?.aborted) break;
@@ -261,17 +298,28 @@ export async function runDispatcher({
                 encodedJitConfig,
                 runnerId: generatedRunnerId,
                 runnerName,
-              } = await generateJitConfig(target.repo, flavor.labels, { signal });
+              } = await generateJitConfig(target.repo, flavor.labels);
+              // JIT creation is deliberately non-abortable: if GitHub creates a runner,
+              // the response must arrive so this process can launch or deregister it.
               runnerId = generatedRunnerId;
               // Once registered, the runner must launch even if shutdown arrived while
               // GitHub was generating its config; otherwise an orphan is left behind.
               log('runner_launching', { repo: target.repo, flavor: flavor.key, runnerName });
 
+              const lifecycle = launches.get(launchPromise);
+              lifecycle.runnerName = runnerName;
+              lifecycle.runnerId = runnerId;
+
               let result;
               try {
                 result = await flavor.launch(encodedJitConfig, {
                   idleTimeoutMs,
+                  maxLifetimeMs: runnerMaxLifetimeMs,
                   onStarted: decrementUnassignedOnce,
+                  onControl: ({ name, stop }) => {
+                    lifecycle.resourceName = name;
+                    lifecycle.stop = stop;
+                  },
                 });
                 if (!result?.startedJob) {
                   throw new Error('runner exited without starting a job');
@@ -279,7 +327,7 @@ export async function runDispatcher({
               } catch (error) {
                 repoBackoffUntil.set(target.repo, Date.now() + LAUNCH_FAILURE_BACKOFF_MS);
                 try {
-                  await deleteRunner(target.repo, runnerId, { signal });
+                  await deleteRunner(target.repo, runnerId);
                 } catch (deleteError) {
                   log('runner_deregister_error', {
                     repo: target.repo,
@@ -311,15 +359,78 @@ export async function runDispatcher({
               launches.delete(launchPromise);
             }
           })();
-          launches.add(launchPromise);
+          launches.set(launchPromise, {
+            repo: target.repo,
+            flavor: flavor.key,
+            runnerName: 'registration pending',
+          });
         }
       }
 
       await abortableDelay(pollDelay(pollIntervalMs, repos.length), signal);
     }
   } finally {
-    log('dispatcher_draining', { inflight: launches.size });
-    await Promise.allSettled([...launches]);
+    log('dispatcher_draining', { inflight: launches.size, timeoutMs: drainTimeoutMs });
+    // Extension point for releasing external ownership leases before waiting on jobs.
+    if (onDrain) {
+      const hookAbort = new AbortController();
+      try {
+        await Promise.race([
+          Promise.resolve().then(onDrain),
+          abortableDelay(Math.min(DRAIN_HOOK_TIMEOUT_MS, drainTimeoutMs), hookAbort.signal)
+            .then(() => { throw new Error('drain hook timed out'); }),
+        ]);
+      } catch (error) {
+        log('drain_hook_error', errorFields(error));
+      } finally {
+        hookAbort.abort();
+      }
+    }
+
+    const pending = [...launches.keys()];
+    if (pending.length) {
+      let deadlineExpired = false;
+      const drainAbort = new AbortController();
+      await Promise.race([
+        Promise.allSettled(pending).then(() => drainAbort.abort()),
+        drainDelay(drainTimeoutMs, drainAbort.signal).then(() => {
+          if (!drainAbort.signal.aborted) deadlineExpired = true;
+        }),
+      ]);
+
+      if (deadlineExpired && launches.size) {
+        const remaining = [...launches.entries()];
+        for (const [, lifecycle] of remaining) {
+          console.warn(`Drain deadline expired; force-reaping ${lifecycle.runnerName} (${lifecycle.resourceName ?? lifecycle.flavor})`);
+          try {
+            await lifecycle.stop?.();
+          } catch (error) {
+            log('runner_force_reap_error', {
+              runner: lifecycle.runnerName,
+              ...errorFields(error),
+            });
+          }
+          if (lifecycle.runnerId) {
+            try {
+              await deleteRunner(lifecycle.repo, lifecycle.runnerId);
+            } catch (error) {
+              log('runner_deregister_error', {
+                repo: lifecycle.repo,
+                flavor: lifecycle.flavor,
+                runnerId: lifecycle.runnerId,
+                ...errorFields(error),
+              });
+            }
+          }
+        }
+        const reapAbort = new AbortController();
+        await Promise.race([
+          Promise.allSettled(remaining.map(([promise]) => promise))
+            .then(() => reapAbort.abort()),
+          abortableDelay(5_000, reapAbort.signal),
+        ]);
+      }
+    }
     wakeLock?.dispose();
     log('dispatcher_stopped');
   }

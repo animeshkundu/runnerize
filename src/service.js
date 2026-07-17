@@ -112,7 +112,9 @@ function nativeGitHubCredentialAvailable() {
 
 async function installSystemd() {
   await preflightRun();
-  const unitPath = join(homedir(), '.config', 'systemd', 'user', `${SERVICE_NAME}.service`);
+  const unitName = `${SERVICE_NAME}.service`;
+  const wasActive = captureResult('systemctl', ['--user', 'is-active', '--quiet', unitName]).status === 0;
+  const unitPath = join(homedir(), '.config', 'systemd', 'user', unitName);
   const environmentFile = process.env.RUNNERIZE_SYSTEMD_ENV_FILE
     ? `EnvironmentFile=-${process.env.RUNNERIZE_SYSTEMD_ENV_FILE}\n`
     : '';
@@ -135,7 +137,13 @@ WantedBy=default.target
 `, { mode: 0o644 });
 
   run('systemctl', ['--user', 'daemon-reload']);
-  run('systemctl', ['--user', 'enable', '--now', `${SERVICE_NAME}.service`]);
+  run('systemctl', ['--user', 'enable', unitName]);
+  if (wasActive) {
+    console.log('Restarting the running dispatcher to load the new version…');
+    run('systemctl', ['--user', 'restart', unitName]);
+  } else {
+    run('systemctl', ['--user', 'start', unitName]);
+  }
   console.log(`Installed and started ${unitPath}`);
   console.log('To run before login, enable user lingering: loginctl enable-linger "$USER"');
   console.log(`View logs: journalctl --user -u ${SERVICE_NAME} -f`);
@@ -727,6 +735,17 @@ async function auditWindowsPrerequisites({ noElevate = false, elevationTimeoutMs
   return { rebootRequired };
 }
 
+function scheduledTaskIsRunning(taskName) {
+  const script = `$task = Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue; if ($null -eq $task -or $task.State -ne 'Running') { exit 1 }`;
+  return captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ]).status === 0;
+}
+
+function deferScheduledTaskRestart(taskName) {
+  console.warn(`${taskName} is running; Windows Task Scheduler cannot signal a graceful drain. The new version will load after the dispatcher next exits or the host restarts.`);
+}
+
 function scheduledTaskPrincipal(taskName) {
   const script = `$task = Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 1 }; [Console]::Out.Write($task.Principal.UserId)`;
   const result = captureResult(powershellPath, [
@@ -949,10 +968,13 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
   if (commandExists('wsb.exe')) {
     try {
       await getToken();
+      const windowsTaskName = 'runnerize-windows';
+      const wasRunning = scheduledTaskIsRunning(windowsTaskName);
       const installation = materializeWindowsApp();
       persistWindowsTokenIfNeeded();
       const launcher = writeWindowsLauncher();
       const trigger = await installLogonTrigger(windowsTriggerSpec(launcher), { noElevate, elevationTimeoutMs });
+      if (wasRunning) deferScheduledTaskRestart(windowsTaskName);
       console.log(`Windows logon trigger: ${trigger.kind} (${trigger.detail})`);
       console.log(`Windows dispatcher log: ${windowsDataPath('runnerize-windows.log')}`);
       console.log(`runnerize package: ${installation.root}`);

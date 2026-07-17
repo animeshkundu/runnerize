@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { ensureRunnerBinary } from '../runner.js';
 
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+const DEFAULT_MAX_LIFETIME_MS = 6 * 60 * 60_000;
 const WSB_TIMEOUT_MS = 60_000;
 const EXEC_READY_TIMEOUT_MS = 90_000;
 const EXEC_READY_POLL_MS = 2_000;
@@ -141,9 +142,10 @@ async function readJobStarted(logFile) {
   }
 }
 
-async function observeRunner(execPromise, controlDir, idleTimeoutMs, onStarted) {
+async function observeRunner(execPromise, controlDir, idleTimeoutMs, maxLifetimeMs, onStarted) {
   const logFile = path.join(controlDir, 'runner.log');
-  const deadline = Date.now() + idleTimeoutMs;
+  const idleDeadline = Date.now() + idleTimeoutMs;
+  const lifetimeDeadline = Date.now() + maxLifetimeMs;
   let startedJob = false;
   const execOutcome = execPromise.then(
     () => ({ exited: true, error: null }),
@@ -156,11 +158,13 @@ async function observeRunner(execPromise, controlDir, idleTimeoutMs, onStarted) 
       onStarted?.();
     }
 
-    const remaining = deadline - Date.now();
-    if (!startedJob && remaining <= 0) return { startedJob: false };
+    const lifetimeRemaining = lifetimeDeadline - Date.now();
+    if (lifetimeRemaining <= 0) throw new Error(`runner exceeded maximum lifetime of ${maxLifetimeMs}ms`);
+    const idleRemaining = idleDeadline - Date.now();
+    if (!startedJob && idleRemaining <= 0) return { startedJob: false };
     const outcome = await Promise.race([
       execOutcome,
-      delay(startedJob ? LOG_POLL_MS : Math.min(LOG_POLL_MS, remaining))
+      delay(Math.min(LOG_POLL_MS, lifetimeRemaining, startedJob ? Infinity : idleRemaining))
         .then(() => ({ exited: false, error: null })),
     ]);
     if (!outcome.exited) continue;
@@ -193,12 +197,27 @@ export const windows = {
     }
   },
 
-  async launch(encodedJitConfig, { idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS, onStarted } = {}) {
+  async reapOrphans({ protectedRunnerNames = new Set() } = {}) {
+    if (protectedRunnerNames.size) return 0;
+    const ids = await runningSandboxIds();
+    await Promise.all(ids.map((id) => stopSandbox(id)));
+    return ids.length;
+  },
+
+  async launch(encodedJitConfig, {
+    idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+    maxLifetimeMs = DEFAULT_MAX_LIFETIME_MS,
+    onStarted,
+    onControl,
+  } = {}) {
     if (!encodedJitConfig || typeof encodedJitConfig !== 'string') {
       throw new TypeError('encodedJitConfig must be a non-empty string');
     }
     if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
       throw new RangeError('idleTimeoutMs must be a positive number');
+    }
+    if (!Number.isFinite(maxLifetimeMs) || maxLifetimeMs <= 0) {
+      throw new RangeError('maxLifetimeMs must be a positive number');
     }
     if (process.platform !== 'win32') throw new Error('the windows flavor requires Windows');
 
@@ -210,6 +229,7 @@ export const windows = {
       await writeFile(path.join(controlDir, 'jit-config.txt'), encodedJitConfig, { mode: 0o600 });
       await writeFile(path.join(controlDir, 'run-runner.ps1'), RUNNER_SCRIPT, { mode: 0o600 });
       await startSandbox(sandboxId);
+      onControl?.({ name: sandboxId, stop: () => stopSandbox(sandboxId) });
       await waitForExec(sandboxId);
       await collect('wsb.exe', [
         'share', '--id', sandboxId, '--host-path', runnerDir,
@@ -223,7 +243,7 @@ export const windows = {
         'exec', '--id', sandboxId, '--run-as', 'System',
         '--command', 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\runnerize\\control\\run-runner.ps1',
       ], { timeoutMs: 0 });
-      return await observeRunner(execPromise, controlDir, idleTimeoutMs, onStarted);
+      return await observeRunner(execPromise, controlDir, idleTimeoutMs, maxLifetimeMs, onStarted);
     } finally {
       try {
         await stopSandbox(sandboxId);

@@ -25,6 +25,19 @@ async function withWindowsLaunch(fn) {
   }
 }
 
+test('windows orphan reconciliation preserves resources while a host runner is active', async () => {
+  const restoreProcess = overrideProcess({ platform: 'win32' });
+  const stub = new SpawnStub(() => { throw new Error('reconciliation must not enumerate sandboxes'); }).install();
+  try {
+    const { windows } = await freshImport('../../src/sandbox/windows.js');
+    assert.equal(await windows.reapOrphans({ protectedRunnerNames: new Set(['host-1']) }), 0);
+    assert.equal(stub.children.length, 0);
+  } finally {
+    stub.restore();
+    restoreProcess();
+  }
+});
+
 function commandOf(child) {
   return child.args[child.args.indexOf('--command') + 1];
 }

@@ -10,6 +10,7 @@ import { ensureImage, ensureRunnerBinary } from '../runner.js';
 // bare short name; docker is lenient, so this stays correct there too).
 const DEFAULT_IMAGE = 'docker.io/catthehacker/ubuntu:full-latest';
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+const DEFAULT_MAX_LIFETIME_MS = 6 * 60 * 60_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const KILL_GRACE_MS = 1_000;
 const FORCE_SETTLE_MS = 7_000;
@@ -161,7 +162,7 @@ function invocation(target, runtimeArgs, env) {
   return {
     command: 'wsl.exe',
     args: ['-d', target.distro, '-e', 'bash', '-lc', commandLine],
-    env: { ...env, WSLENV: `${existing}JITCFG` },
+    env: { ...env, WSLENV: `${existing}JITCFG:MAX_LIFETIME_SECONDS` },
   };
 }
 
@@ -173,6 +174,17 @@ async function stopContainer(target, name) {
   } catch {
     // It may have exited between the watchdog firing and cleanup.
   }
+}
+
+async function listRunnerContainers(target) {
+  const call = invocation(target, [
+    'ps', '-a', '--filter', 'name=^runnerize-', '--format', '{{.Names}}',
+  ], process.env);
+  const { stdout } = await collect(call.command, call.args, {
+    env: call.env,
+    timeoutMs: CLEANUP_TIMEOUT_MS,
+  });
+  return stdout.split(/\r?\n/).map((name) => name.trim()).filter((name) => name.startsWith('runnerize-'));
 }
 
 // Keep runner-output heuristics here so lifecycle wording changes have one update point.
@@ -188,7 +200,7 @@ cp -a /rsrc/. "$workdir/"
 cd "$workdir"
 rm -rf _work _diag .runner .credentials*
 export RUNNER_ALLOW_RUNASROOT=1
-exec ./run.sh --jitconfig "$JITCFG"
+exec timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-21600}s" ./run.sh --jitconfig "$JITCFG"
 `;
 
 export const linux = {
@@ -199,9 +211,20 @@ export const linux = {
     return Boolean(await backend());
   },
 
+  async reapOrphans({ protectedRunnerNames = new Set() } = {}) {
+    if (protectedRunnerNames.size) return 0;
+    const target = await backend();
+    if (!target) return 0;
+    const names = await listRunnerContainers(target);
+    await Promise.all(names.map((name) => stopContainer(target, name)));
+    return names.length;
+  },
+
   async launch(encodedJitConfig, {
     idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+    maxLifetimeMs = DEFAULT_MAX_LIFETIME_MS,
     onStarted,
+    onControl,
     onFailureDiagnostics,
   } = {}) {
     if (!encodedJitConfig || typeof encodedJitConfig !== 'string') {
@@ -209,6 +232,9 @@ export const linux = {
     }
     if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
       throw new RangeError('idleTimeoutMs must be a positive number');
+    }
+    if (!Number.isFinite(maxLifetimeMs) || maxLifetimeMs <= 0) {
+      throw new RangeError('maxLifetimeMs must be a positive number');
     }
 
     const target = await backend();
@@ -243,12 +269,16 @@ export const linux = {
 
     const name = `runnerize-${randomUUID()}`;
     const args = [
-      'run', '--rm', '--name', name, '-e', 'JITCFG',
+      'run', '--rm', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
       '-v', `${mountedRunner}:/rsrc:ro`,
       '-v', `${mountedScript}:/inner.sh:ro`,
       image, 'bash', '/inner.sh',
     ];
-    const env = { ...process.env, JITCFG: encodedJitConfig };
+    const env = {
+      ...process.env,
+      JITCFG: encodedJitConfig,
+      MAX_LIFETIME_SECONDS: String(Math.max(1, Math.ceil(maxLifetimeMs / 1000))),
+    };
     const call = invocation(target, args, env);
 
     try {
@@ -266,6 +296,7 @@ export const linux = {
         let settled = false;
         let forceTimer;
         let killTimer;
+        let lifetimeExpired = false;
 
         const failureDiagnostics = () => {
           try {
@@ -281,6 +312,7 @@ export const linux = {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          clearTimeout(lifetimeTimer);
           if (forceTimer) clearTimeout(forceTimer);
           if (killTimer) clearTimeout(killTimer);
           if (failed) failureDiagnostics();
@@ -297,20 +329,31 @@ export const linux = {
           }
           return nextRemainder;
         };
-        const timer = setTimeout(() => {
-          if (startedJob) return;
-          timedOut = true;
+        const terminate = () => {
           void stopContainer(target, name);
           child.kill('SIGTERM');
           killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
           killTimer.unref?.();
           forceTimer = setTimeout(() => settle(
-            () => resolve({ startedJob: false }),
+            () => lifetimeExpired
+              ? reject(new Error(`runner exceeded maximum lifetime of ${maxLifetimeMs}ms`))
+              : resolve({ startedJob: false }),
             { failed: true },
           ), FORCE_SETTLE_MS);
           forceTimer.unref?.();
+        };
+        onControl?.({ name, stop: async () => { terminate(); await stopContainer(target, name); } });
+        const timer = setTimeout(() => {
+          if (startedJob) return;
+          timedOut = true;
+          terminate();
         }, idleTimeoutMs);
         timer.unref?.();
+        const lifetimeTimer = setTimeout(() => {
+          lifetimeExpired = true;
+          terminate();
+        }, maxLifetimeMs);
+        lifetimeTimer.unref?.();
 
         child.stdout.on('data', (chunk) => {
           stdout = appendBounded(stdout, chunk);
@@ -323,10 +366,11 @@ export const linux = {
         });
         child.once('error', (error) => settle(() => reject(error), { failed: true }));
         child.once('close', (code) => settle(() => {
-          if (timedOut) resolve({ startedJob: false });
+          if (lifetimeExpired) reject(new Error(`runner exceeded maximum lifetime of ${maxLifetimeMs}ms`));
+          else if (timedOut) resolve({ startedJob: false });
           else if (code === 0) resolve({ startedJob });
           else reject(new Error(`${target.runtime} runner container exited with code ${code}: ${stderr.toString().trim()}`));
-        }, { failed: timedOut || code !== 0 }));
+        }, { failed: lifetimeExpired || timedOut || code !== 0 }));
       });
     } finally {
       if (target.distro) await removeWslFile(target.distro, mountedScript);

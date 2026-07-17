@@ -5,6 +5,19 @@ import { SpawnStub } from '../helpers/process-stub.js';
 import { freshImport } from '../helpers/fresh-module.js';
 import { withKeepAlive } from '../helpers/dispatcher-harness.js';
 
+test('macOS orphan reconciliation preserves resources while a host runner is active', async () => {
+  const restoreProcess = overrideProcess({ platform: 'darwin', arch: 'arm64' });
+  const stub = new SpawnStub(() => { throw new Error('reconciliation must not enumerate VMs'); }).install();
+  try {
+    const { macos } = await freshImport('../../src/sandbox/macos.js');
+    assert.equal(await macos.reapOrphans({ protectedRunnerNames: new Set(['host-1']) }), 0);
+    assert.equal(stub.children.length, 0);
+  } finally {
+    stub.restore();
+    restoreProcess();
+  }
+});
+
 function withEnv(values, fn) {
   const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
   for (const [key, value] of Object.entries(values)) {
