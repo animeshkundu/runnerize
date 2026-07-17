@@ -144,6 +144,7 @@ export async function runDispatcher({
   keepAwake = true,
   signal,
   onDrain,
+  drainDelay = abortableDelay,
 } = {}) {
   for (const [name, value] of Object.entries({
     pollIntervalMs,
@@ -370,7 +371,7 @@ export async function runDispatcher({
       let deadlineExpired = false;
       await Promise.race([
         Promise.allSettled(pending),
-        abortableDelay(drainTimeoutMs).then(() => { deadlineExpired = true; }),
+        drainDelay(drainTimeoutMs).then(() => { deadlineExpired = true; }),
       ]);
 
       if (deadlineExpired && launches.size) {

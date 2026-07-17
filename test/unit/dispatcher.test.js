@@ -10,6 +10,12 @@ import { FakeFlavor, installFakeFlavor, waitFor, tick } from '../helpers/dispatc
 // abort, await the drain) so nothing leaks into the next test through the shared
 // singletons / module state.
 async function runSession({ github, flavor, options = {} }, body) {
+  const drainWaiters = [];
+  const drainDelay = () => new Promise((resolve) => { drainWaiters.push(resolve); });
+  const expireDrain = async () => {
+    for (const resolve of drainWaiters.splice(0)) resolve();
+    await Promise.resolve();
+  };
   const prevToken = process.env.GH_TOKEN;
   process.env.GH_TOKEN = 'test-token';
   // 304s would let stale cached bodies leak across tests that reuse repo names; the mint
@@ -29,6 +35,7 @@ async function runSession({ github, flavor, options = {} }, body) {
       idleTimeoutMs: 120_000,
       reconcileMs: 10_000_000, // effectively "reconcile once at startup" unless overridden
       signal: controller.signal,
+      drainDelay,
       ...options,
       ...extra,
     });
@@ -36,7 +43,15 @@ async function runSession({ github, flavor, options = {} }, body) {
   };
 
   try {
-    return await body({ stub, flavor, controller, start, logs, events: (name) => logs.filter((l) => l.event === name) });
+    return await body({
+      stub,
+      flavor,
+      controller,
+      start,
+      expireDrain,
+      logs,
+      events: (name) => logs.filter((l) => l.event === name),
+    });
   } finally {
     console.log = originalLog;
     controller.abort();
@@ -456,10 +471,12 @@ test('drain deadline stops minting, force-reaps runners, and invokes the drain h
       runs: { 'me/deadline': [{ id: 1, status: 'queued' }] },
       jobs: { 1: Array.from({ length: 4 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
     },
-  }, async ({ start, controller, flavor, events }) => {
+  }, async ({ start, controller, expireDrain, flavor, events }) => {
     const dispatcherPromise = start();
     assert.ok(await waitFor(() => flavor.launches.length === 2));
     controller.abort();
+    assert.ok(await waitFor(() => events('dispatcher_draining').length === 1));
+    await expireDrain();
     await dispatcherPromise;
     assert.equal(hookCalls, 1);
     assert.equal(flavor.launches.length, 2, 'no runners mint after draining starts');
