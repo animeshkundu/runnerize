@@ -1,7 +1,6 @@
 import { execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname as osHostname } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -328,13 +327,38 @@ export async function countQueuedMatchingJobs(
   return count;
 }
 
+export function sanitizeHostname(hostname = osHostname()) {
+  const name = hostname
+    .split('.', 1)[0]
+    .replace(/[^A-Za-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 40);
+  return name || 'runner';
+}
+
+export function runnerNamePrefix() {
+  return `${sanitizeHostname()}-`;
+}
+
 export async function generateJitConfig(fullName, labels, { signal } = {}) {
+  const prefix = runnerNamePrefix();
+  const runners = await listRunners(fullName, { signal });
+  const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const runnerNamePattern = new RegExp(`^${escapedPrefix}(\\d+)$`);
+  const usedCounts = new Set(runners.flatMap((runner) => {
+    const match = runner.name.match(runnerNamePattern);
+    return match ? [Number(match[1])] : [];
+  }));
+  let count = 1;
+  while (usedCounts.has(count)) count += 1;
+
   const data = assertSuccess(await api(
     'POST',
     `/repos/${repoPath(fullName)}/actions/runners/generate-jitconfig`,
     {
       body: {
-        name: `runnerize-${randomBytes(4).toString('hex')}`,
+        name: `${prefix}${count}`,
         runner_group_id: 1,
         labels,
         work_folder: '_work',

@@ -82,8 +82,8 @@ export async function waitForRun(api, repo, branch, predicate, { timeoutMs = 120
   }
 }
 
-/** Best-effort teardown: cancel/delete runs, delete the branch, delete leaked runners. */
-export async function cleanupE2E(api, repo, { branch, runnerNamePrefix = 'runnerize-' } = {}) {
+/** Best-effort teardown: cancel/delete runs and delete the branch. */
+export async function cleanupE2E(api, repo, { branch } = {}) {
   const problems = [];
 
   // Delete workflow runs on the branch (must be completed to delete; cancel first).

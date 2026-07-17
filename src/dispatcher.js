@@ -5,11 +5,12 @@ import {
   isStillPrivate,
   listOwnedPrivateRepos,
   listRunners,
+  runnerNamePrefix,
 } from './github.js';
 import { detectFlavors } from './sandbox/index.js';
 import { keepHostAwake } from './keepawake.js';
 
-const RUNNER_NAME_PREFIX = 'runnerize-';
+const RUNNER_NAME_PREFIX = runnerNamePrefix();
 const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
 
 class Semaphore {
