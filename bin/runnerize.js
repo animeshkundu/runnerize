@@ -19,7 +19,7 @@ Usage:
   runnerize run [--max <n>] [--interval <ms>] [--idle-timeout <ms>] [--only <csv>] [--no-keep-awake] [--dry-run]
   runnerize status
   runnerize remove
-  runnerize service install|uninstall [--no-elevate]
+  runnerize service install|uninstall [--no-elevate] [--no-guard]
   runnerize guard install [--shutdown-guard] | uninstall | status
   runnerize --help
 
@@ -31,6 +31,7 @@ Options:
   --no-keep-awake        Allow the host to sleep while the dispatcher runs
   --dry-run              Count and display demand without minting runners
   --no-elevate           Never prompt for administrator access during service setup
+  --no-guard             Skip host-stability guard setup during service install or uninstall
   --shutdown-guard       Reserved for the Tier-2 shutdown guard (not yet implemented)
   -h, --help             Show this help
 `;
@@ -213,10 +214,15 @@ async function main() {
       return;
     case 'service': {
       const [action, ...flags] = args;
-      if (!['install', 'uninstall'].includes(action) || flags.some((flag) => flag !== '--no-elevate') || flags.length > 1) {
-        throw new Error('Usage: runnerize service install|uninstall [--no-elevate]');
+      if (!['install', 'uninstall'].includes(action)
+        || flags.some((flag) => !['--no-elevate', '--no-guard'].includes(flag))
+        || new Set(flags).size !== flags.length) {
+        throw new Error('Usage: runnerize service install|uninstall [--no-elevate] [--no-guard]');
       }
-      const options = { noElevate: flags.includes('--no-elevate') };
+      const options = {
+        noElevate: flags.includes('--no-elevate'),
+        noGuard: flags.includes('--no-guard'),
+      };
       if (action === 'install') await installService(options);
       else await uninstallService(options);
       return;
