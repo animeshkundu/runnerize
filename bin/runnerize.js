@@ -245,7 +245,20 @@ async function main() {
       } else if (action === 'on') {
         if (flags.length) throw new Error(`Unexpected argument: ${flags[0]}`);
         const lease = await createGuardLease();
-        if (lease) console.log(`Shutdown guard lease: ${lease.sessionId}`);
+        if (lease) {
+          console.log(`Holding shutdown-guard lease ${lease.sessionId}; press Ctrl-C to release.`);
+          await new Promise((resolve) => {
+            let released = false;
+            const stop = () => {
+              if (released) return;
+              released = true;
+              lease.release();
+              resolve();
+            };
+            process.once('SIGINT', stop);
+            process.once('SIGTERM', stop);
+          });
+        }
       } else if (action === 'off') {
         if (flags.length !== 1) throw new Error('Usage: runnerize guard off <session-id>');
         await guardOff(flags[0]);

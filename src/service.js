@@ -577,20 +577,31 @@ function systemdStartCommand() {
   return 'export XDG_RUNTIME_DIR=/run/user/$(id -u); export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; systemctl --user start runnerize';
 }
 
+function isolatedScheduledTasksScript(command) {
+  const encoded = Buffer.from(`$ErrorActionPreference = 'Stop'; ${command}`, 'utf16le').toString('base64');
+  return `& ${powershellLiteral(windowsPowerShellPath)} -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${powershellLiteral(encoded)}; if ($LASTEXITCODE -ne 0) { throw 'Scheduled task operation failed' }`;
+}
+
+export function systemTasksRemovalScript(taskNames) {
+  return isolatedScheduledTasksScript(taskNames.flatMap((taskName) => [
+    `Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue`,
+    `Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue`,
+  ]).join('; '));
+}
+
 export function systemStartupTaskScript(spec) {
   const registration = [
     `$taskName = ${powershellLiteral(spec.taskName)}`,
     `$action = New-ScheduledTaskAction -Execute ${powershellLiteral(spec.execute)} -Argument ${powershellLiteral(spec.argument)}`,
     '$trigger = New-ScheduledTaskTrigger -AtStartup',
     '$principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\\SYSTEM" -LogonType ServiceAccount -RunLevel Highest',
-    '$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
+    '$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
     'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop',
     'Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null',
   ].join('; ');
-  const encoded = Buffer.from(`$ErrorActionPreference = 'Stop'; ${registration}`, 'utf16le').toString('base64');
   // Isolate the CIM-backed ScheduledTasks cmdlets in their own PowerShell process. Commands
   // appended after them can crash Windows PowerShell while it exits on affected hosts.
-  return `& ${powershellLiteral(windowsPowerShellPath)} -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${powershellLiteral(encoded)}; if ($LASTEXITCODE -ne 0) { throw 'Scheduled task registration failed' }`;
+  return isolatedScheduledTasksScript(registration);
 }
 
 function taskSchedulerScript(spec, windowsUser) {

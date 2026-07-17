@@ -436,7 +436,11 @@ export async function runDispatcher({
     log('dispatcher_draining', { inflight: launches.size, timeoutMs: drainTimeoutMs });
     // Extension point for releasing external ownership leases before waiting on jobs.
     const drainHook = async () => {
-      guardLease?.release();
+      try {
+        guardLease?.release();
+      } catch (error) {
+        log('guard_release_error', errorFields(error));
+      }
       await onDrain?.();
     };
     if (guardLease || onDrain) {

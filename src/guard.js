@@ -1,12 +1,14 @@
 import { spawn } from 'node:child_process';
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync,
+  closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { platform } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { powershellLiteral, runElevated, systemStartupTaskScript, windowsPowerShellPath } from './service.js';
+import {
+  powershellLiteral, runElevated, systemStartupTaskScript, systemTasksRemovalScript, windowsPowerShellPath,
+} from './service.js';
 
 const WINDOWS_UPDATE_KEY = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate';
 const AU_KEY = `${WINDOWS_UPDATE_KEY}\\AU`;
@@ -164,9 +166,7 @@ export function shutdownGuardInstallScript(options = {}) {
   const leases = options.leasesPath ?? join(root, 'leases');
   const state = options.shutdownStatePath ?? join(root, 'state.json');
   const watch = taskSpec(WATCH_TASK, 'guard-watch', options);
-  const recover = taskSpec(RECOVER_TASK, 'guard-recover', options);
   return [
-    copyShutdownGuardAppScript(options),
     `New-Item -ItemType Directory -Path ${powershellLiteral(leases)} -Force | Out-Null`,
     `$rootAcl = New-Object System.Security.AccessControl.DirectorySecurity`,
     `$rootAcl.SetAccessRuleProtection($true, $false)`,
@@ -174,6 +174,9 @@ export function shutdownGuardInstallScript(options = {}) {
     `$rootAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\\Administrators','FullControl','ContainerInherit,ObjectInherit','None','Allow')))`,
     `$rootAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('Authenticated Users','ReadAndExecute','None','None','Allow')))`,
     `Set-Acl -LiteralPath ${powershellLiteral(root)} -AclObject $rootAcl`,
+    copyShutdownGuardAppScript(options),
+    `$appAcl = Get-Acl -LiteralPath ${powershellLiteral(root)}`,
+    `Set-Acl -LiteralPath ${powershellLiteral(options.guardAppRoot ?? join(root, 'app'))} -AclObject $appAcl`,
     `$leaseAcl = New-Object System.Security.AccessControl.DirectorySecurity`,
     `$leaseAcl.SetAccessRuleProtection($true, $false)`,
     `$leaseAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM','FullControl','ContainerInherit,ObjectInherit','None','Allow')))`,
@@ -183,7 +186,7 @@ export function shutdownGuardInstallScript(options = {}) {
     `Set-Acl -LiteralPath ${powershellLiteral(leases)} -AclObject $leaseAcl`,
     `if (-not (Test-Path -LiteralPath ${powershellLiteral(state)})) { [System.IO.File]::WriteAllText(${powershellLiteral(state)}, '{"version":1,"service":null}', [System.Text.UTF8Encoding]::new($false)) }`,
     systemStartupTaskScript(watch),
-    systemStartupTaskScript(recover),
+    systemTasksRemovalScript([RECOVER_TASK]),
     `& schtasks.exe /Run /TN ${powershellLiteral(WATCH_TASK)} | Out-Null`,
   ].join('\r\n');
 }
@@ -194,6 +197,7 @@ function restoreShutdownServiceScript(path = shutdownStatePath()) {
     'if (Test-Path -LiteralPath $statePath) {',
     '  $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json',
     '  if ($null -ne $state.service) {',
+    "    if ($state.service.startupType -notin @('Automatic','Manual','Disabled')) { throw 'Invalid saved vmicshutdown startup type' }",
     "    Set-Service -Name 'vmicshutdown' -StartupType $state.service.startupType",
     "    if ($state.service.wasRunning) { Start-Service -Name 'vmicshutdown' } else { Stop-Service -Name 'vmicshutdown' -Force -ErrorAction SilentlyContinue }",
     '  }',
@@ -205,10 +209,9 @@ export function shutdownGuardUninstallScript(options = {}) {
   const root = options.guardRoot ?? guardRoot();
   const state = options.shutdownStatePath ?? join(root, 'state.json');
   return [
+    systemTasksRemovalScript([WATCH_TASK, RECOVER_TASK]),
     restoreShutdownServiceScript(state),
-    `Get-ScheduledTask -TaskName ${powershellLiteral(WATCH_TASK)} -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue`,
-    `Get-ScheduledTask -TaskName ${powershellLiteral(WATCH_TASK)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue`,
-    `Get-ScheduledTask -TaskName ${powershellLiteral(RECOVER_TASK)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue`,
+    `Remove-Item -LiteralPath ${powershellLiteral(state)} -Force -ErrorAction SilentlyContinue`,
     `Remove-Item -LiteralPath ${powershellLiteral(root)} -Recurse -Force -ErrorAction SilentlyContinue`,
   ].join('\r\n');
 }
@@ -276,9 +279,12 @@ export function readLiveLeases(options = {}) {
   for (const name of names) {
     if (!/^[0-9a-f-]{36}\.json$/i.test(name)) continue;
     const path = join(directory, name);
+    let fd;
     try {
-      if ((options.lstat ?? lstatSync)(path).isSymbolicLink()) throw new Error('symbolic link');
-      const lease = JSON.parse((options.readFile ?? readFileSync)(path, 'utf8'));
+      fd = (options.open ?? openSync)(path, 'r');
+      const stat = (options.fstat ?? fstatSync)(fd);
+      if (!stat.isFile()) throw new Error('not a regular file');
+      const lease = JSON.parse((options.readFile ?? readFileSync)(fd, 'utf8'));
       if (lease.version !== 1 || lease.sessionId !== basename(name, '.json') || !Number.isFinite(lease.heartbeat)
         || lease.heartbeat > now + timeoutMs || now - lease.heartbeat > timeoutMs) {
         throw new Error('invalid or stale lease');
@@ -286,6 +292,8 @@ export function readLiveLeases(options = {}) {
       live.push(lease);
     } catch {
       try { (options.unlink ?? unlinkSync)(path); } catch { /* retry next pass */ }
+    } finally {
+      if (fd !== undefined) (options.close ?? closeSync)(fd);
     }
   }
   return live;
@@ -306,7 +314,12 @@ async function windowsServiceController(options = {}) {
       return { startupType, wasRunning: value.wasRunning };
     },
     disable: () => run("Set-Service -Name 'vmicshutdown' -StartupType Disabled; Stop-Service -Name 'vmicshutdown' -Force -ErrorAction SilentlyContinue"),
-    restore: (state) => run(`Set-Service -Name 'vmicshutdown' -StartupType ${state.startupType}; ${state.wasRunning ? "Start-Service -Name 'vmicshutdown'" : "Stop-Service -Name 'vmicshutdown' -Force -ErrorAction SilentlyContinue"}`),
+    restore: (state) => {
+      if (!['Automatic', 'Manual', 'Disabled'].includes(state.startupType)) {
+        throw new Error(`Invalid saved vmicshutdown startup type: ${state.startupType}`);
+      }
+      return run(`Set-Service -Name 'vmicshutdown' -StartupType ${state.startupType}; ${state.wasRunning ? "Start-Service -Name 'vmicshutdown'" : "Stop-Service -Name 'vmicshutdown' -Force -ErrorAction SilentlyContinue"}`);
+    },
   };
 }
 
@@ -325,8 +338,19 @@ export async function reconcileShutdownGuard(options = {}) {
 
   if (live.length) {
     if (state.service === null) {
-      state.service = await service.inspect();
-      atomicWriteJson(statePath, state, options);
+      const snapshot = await service.inspect();
+      if (snapshot.startupType === 'Disabled') {
+        throw new Error('Refusing to snapshot vmicshutdown while it is already Disabled');
+      }
+      // Compare-and-set against the authoritative file immediately before persisting.
+      const current = JSON.parse((options.readFile ?? readFileSync)(statePath, 'utf8'));
+      if (current.service === null) {
+        current.service = snapshot;
+        atomicWriteJson(statePath, current, options);
+        state = current;
+      } else {
+        state = current;
+      }
     }
     await service.disable();
     return { live: live.length, action: 'disabled' };

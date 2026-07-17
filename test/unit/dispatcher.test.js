@@ -599,6 +599,30 @@ test('host shutdown guard is off by default and releases its lease through the d
   });
 });
 
+test('guard release failure does not bypass the caller drain hook', async () => {
+  const flavor = new FakeFlavor();
+  let drained = 0;
+  await runSession({
+    flavor,
+    options: {
+      hostGuard: true,
+      acquireGuardLease: async () => ({ release: () => { throw new Error('locked'); } }),
+      onDrain: () => { drained += 1; },
+    },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/guard-error', private: true }],
+    },
+  }, async ({ start, controller, events }) => {
+    const dispatcher = start();
+    await tick(20);
+    controller.abort();
+    await dispatcher;
+    assert.equal(drained, 1);
+    assert.equal(events('guard_release_error').length, 1);
+  });
+});
+
 test('startup reconciliation reaps host resources before polling', async () => {
   const flavor = new FakeFlavor();
   let orphanReaps = 0;

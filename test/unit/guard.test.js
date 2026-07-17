@@ -136,7 +136,7 @@ test('install and uninstall NOOP outside Windows and outside Hyper-V', async () 
   assert.ok(physical.some((line) => /NOOP/.test(line)));
 });
 
-test('--shutdown-guard installs Tier-1 and both SYSTEM startup tasks in one elevation', async () => {
+test('--shutdown-guard installs Tier-1 and the SYSTEM startup watchdog in one elevation', async () => {
   let command;
   await installGuard(hyperVOptions({
     shutdownGuard: true,
@@ -146,11 +146,12 @@ test('--shutdown-guard installs Tier-1 and both SYSTEM startup tasks in one elev
   assert.match(command, /runnerize-guard-watch/);
   const taskScripts = [...command.matchAll(/-EncodedCommand '([^']+)'/g)]
     .map((match) => Buffer.from(match[1], 'base64').toString('utf16le'));
-  assert.equal(taskScripts.length, 2);
-  assert.ok(taskScripts.some((script) => /runnerize-guard-recover/.test(script)));
-  assert.ok(taskScripts.every((script) => /New-ScheduledTaskTrigger -AtStartup/.test(script)));
-  assert.ok(taskScripts.every((script) => /LogonType ServiceAccount -RunLevel Highest/.test(script)));
-  assert.ok(taskScripts.every((script) => /NT AUTHORITY\\SYSTEM/.test(script)));
+  const registration = taskScripts.find((script) => /runnerize-guard-watch/.test(script));
+  assert.ok(registration);
+  assert.match(registration, /New-ScheduledTaskTrigger -AtStartup/);
+  assert.match(registration, /LogonType ServiceAccount -RunLevel Highest/);
+  assert.match(registration, /RestartCount 999/);
+  assert.match(registration, /NT AUTHORITY\\SYSTEM/);
   assert.match(command, /CREATOR OWNER/);
   assert.match(command, /Authenticated Users/);
 });
@@ -165,10 +166,32 @@ test('SYSTEM task script uses startup, highest service-account principals', () =
   });
   const taskScripts = [...script.matchAll(/-EncodedCommand '([^']+)'/g)]
     .map((match) => Buffer.from(match[1], 'base64').toString('utf16le'));
-  assert.equal(taskScripts.length, 2);
-  assert.ok(taskScripts.every((value) => /-AtStartup/.test(value)));
-  assert.ok(taskScripts.every((value) => /-LogonType ServiceAccount -RunLevel Highest/.test(value)));
-  assert.ok(taskScripts.every((value) => /ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/.test(value)));
+  const registration = taskScripts.find((value) => /runnerize-guard-watch/.test(value));
+  assert.ok(registration);
+  assert.match(registration, /-AtStartup/);
+  assert.match(registration, /-LogonType ServiceAccount -RunLevel Highest/);
+  assert.match(registration, /ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/);
+  assert.match(registration, /RestartInterval \(New-TimeSpan -Minutes 1\) -RestartCount 999/);
+  assert.ok(!taskScripts.some((value) => /Register-ScheduledTask.*runnerize-guard-recover/.test(value)));
+  assert.ok(script.indexOf('Set-Acl -LiteralPath') < script.indexOf("Copy-Item -LiteralPath 'C:\\runnerize\\bin'"));
+  assert.match(script, /Set-Acl -LiteralPath 'C:\\ProgramData\\runnerize\\guard\\app' -AclObject \$appAcl/);
+});
+
+test('shutdown uninstall stops tasks before restoring and deleting state', async () => {
+  let script;
+  await uninstallGuard(hyperVOptions({
+    shutdownGuard: true,
+    stateExists: () => false,
+    shutdownStatePath: 'C:\\ProgramData\\runnerize\\guard\\state.json',
+    runElevatedOperation: async (_operation, command) => { script = command; return { ok: true }; },
+  }));
+  const taskCommand = [...script.matchAll(/-EncodedCommand '([^']+)'/g)]
+    .map((match) => Buffer.from(match[1], 'base64').toString('utf16le'))
+    .find((command) => /Stop-ScheduledTask/.test(command));
+  const tasks = taskCommand ? script.indexOf('-EncodedCommand') : -1;
+  const restore = script.indexOf("Set-Service -Name 'vmicshutdown'");
+  const remove = script.indexOf("Remove-Item -LiteralPath 'C:\\ProgramData\\runnerize\\guard\\state.json'");
+  assert.ok(tasks >= 0 && tasks < restore && restore < remove);
 });
 
 test('reference-count reconcile snapshots on first acquire, enforces, and restores on last release', async () => {
@@ -180,7 +203,9 @@ test('reference-count reconcile snapshots on first acquire, enforces, and restor
     leasesPath: 'leases',
     shutdownStatePath: 'state.json',
     readdir: () => leases.map((lease) => `${lease.sessionId}.json`),
-    lstat: () => ({ isSymbolicLink: () => false }),
+    open: (path) => path,
+    fstat: () => ({ isFile: () => true }),
+    close: () => {},
     readFile: (path) => path === 'state.json' ? state : JSON.stringify(leases.find((lease) => path.includes(lease.sessionId))),
     writeFile: (_path, value) => { state = value; },
     rename: () => {},
@@ -201,6 +226,25 @@ test('reference-count reconcile snapshots on first acquire, enforces, and restor
   assert.equal(JSON.parse(state).service, null);
 });
 
+test('reconcile refuses a Disabled first snapshot', async () => {
+  await assert.rejects(() => reconcileShutdownGuard({
+    now: 100,
+    leasesPath: 'leases',
+    shutdownStatePath: 'state.json',
+    readdir: () => ['11111111-1111-1111-1111-111111111111.json'],
+    open: (path) => path,
+    fstat: () => ({ isFile: () => true }),
+    close: () => {},
+    readFile: (path) => path === 'state.json'
+      ? JSON.stringify({ version: 1, service: null })
+      : JSON.stringify({ version: 1, sessionId: '11111111-1111-1111-1111-111111111111', heartbeat: 100 }),
+    service: {
+      inspect: async () => ({ startupType: 'Disabled', wasRunning: false }),
+      disable: async () => { throw new Error('not called'); },
+    },
+  }), /Refusing to snapshot/);
+});
+
 test('stale and malformed leases are reaped and trigger restoration', async () => {
   const removed = [];
   const files = new Map([
@@ -212,7 +256,9 @@ test('stale and malformed leases are reaped and trigger restoration', async () =
     leaseTimeoutMs: 20,
     leasesPath: 'leases',
     readdir: () => [...files.keys()],
-    lstat: () => ({ isSymbolicLink: () => false }),
+    open: (path) => path,
+    fstat: () => ({ isFile: () => true }),
+    close: () => {},
     readFile: (path) => files.get(path.split(/[\\/]/).at(-1)),
     unlink: (path) => removed.push(path),
   };
