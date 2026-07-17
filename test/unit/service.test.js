@@ -40,6 +40,15 @@ function successfulHarness(options = {}) {
       if (command.includes('WindowsIdentity]::GetCurrent().User.Value')) return 'S-1-5-21-1234\n';
       if (command.includes('[System.Environment]::OSVersion.Version.Build')) return `${options.windowsBuild ?? (options.noWsb ? 26000 : 26100)}\n`;
       const elevatedLaunch = command.includes('Start-Process -FilePath');
+      const runningProbe = command.includes("$task.State -ne 'Running'");
+      if (runningProbe) {
+        if (options.windowsTaskRunning) return '';
+        const error = new Error('task is not running');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = '';
+        throw error;
+      }
       const confirmation = command.includes('[Console]::Out.Write($task.Principal.UserId)');
       const specMatch = command.includes('$a = $task.Actions | Select-Object -First 1');
       if (specMatch) {
@@ -224,6 +233,59 @@ function commandOf(call) {
   return call.args.slice(call.args.indexOf('-e') + 1);
 }
 
+async function withLinuxService({ active = false } = {}, action) {
+  const calls = [];
+  const home = mkdtempSync(join(tmpdir(), 'runnerize-linux-service-'));
+  const oldToken = process.env.GH_TOKEN;
+  process.env.GH_TOKEN = 'test-token';
+  const exec = (file, args, options = {}) => {
+    calls.push({ kind: 'exec', file, args, options });
+    if (file === 'systemctl' && args.includes('is-active')) {
+      if (active) return '';
+      const error = new Error('inactive');
+      error.status = 3;
+      throw error;
+    }
+    return '';
+  };
+  const spawn = (file, args, options = {}) => {
+    calls.push({ kind: 'spawn', file, args, options });
+    if (file === 'sh') return { status: 0, stdout: '', stderr: '' };
+    if (file === 'podman' && args[0] === 'info') return { status: 0, stdout: '', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const restore = installStubs({ exec, spawn, platformName: 'linux', home });
+  try {
+    const service = await freshImport('../../src/service.js');
+    await action(service, calls);
+  } finally {
+    restore();
+    rmSync(home, { recursive: true, force: true });
+    if (oldToken === undefined) delete process.env.GH_TOKEN;
+    else process.env.GH_TOKEN = oldToken;
+  }
+}
+
+test('systemd reinstall restarts an active dispatcher', async () => {
+  await withLinuxService({ active: true }, async (service, calls) => {
+    await service.installService();
+    assert.ok(calls.some((call) => call.file === 'systemctl'
+      && call.args.join(' ') === '--user restart runnerize.service'));
+    assert.ok(!calls.some((call) => call.file === 'systemctl'
+      && call.args.join(' ') === '--user start runnerize.service'));
+  });
+});
+
+test('systemd first install starts without restarting', async () => {
+  await withLinuxService({}, async (service, calls) => {
+    await service.installService();
+    assert.ok(calls.some((call) => call.file === 'systemctl'
+      && call.args.join(' ') === '--user start runnerize.service'));
+    assert.ok(!calls.some((call) => call.file === 'systemctl'
+      && call.args.join(' ') === '--user restart runnerize.service'));
+  });
+});
+
 test('Windows install skips docker-desktop, reuses PATH Node, and delegates service install', async () => {
   await withWindowsService({ cachedNode: false }, async (service, harness, appData) => {
     await service.installService();
@@ -263,6 +325,23 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     assert.match(launcher, /run --only windows/);
     assert.match(launcher, /runnerize-windows\.log/);
     assert.ok(existsSync(join(appData, 'runnerize', 'app', 'bin', 'runnerize.js')));
+  });
+});
+
+test('Windows reinstall restarts an active dispatcher task after registration', async () => {
+  await withWindowsService({ windowsTaskRunning: true }, async (service, harness) => {
+    await service.installService();
+    const restart = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe')
+      && call.args.at(-1).includes("Stop-ScheduledTask -TaskName 'runnerize-windows'"));
+    assert.ok(restart, 'active dispatcher task is stopped and relaunched');
+    assert.match(restart.args.at(-1), /Start-ScheduledTask -TaskName 'runnerize-windows'/);
+  });
+});
+
+test('Windows first install does not restart an inactive dispatcher task', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    assert.ok(!harness.calls.some((call) => call.args.at(-1)?.includes("Stop-ScheduledTask -TaskName 'runnerize-windows'")));
   });
 });
 
