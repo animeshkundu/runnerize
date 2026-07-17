@@ -2,7 +2,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { guardStatus, installGuard, isHyperVGuest, uninstallGuard } from '../../src/guard.js';
+import {
+  createGuardLease,
+  guardStatus,
+  installGuard,
+  isHyperVGuest,
+  readLiveLeases,
+  reconcileShutdownGuard,
+  runGuardRecover,
+  shutdownGuardInstallScript,
+  uninstallGuard,
+} from '../../src/guard.js';
 
 function spawnStub({ stdout = '', stderr = '', status = 0 } = {}) {
   const calls = [];
@@ -126,16 +136,135 @@ test('install and uninstall NOOP outside Windows and outside Hyper-V', async () 
   assert.ok(physical.some((line) => /NOOP/.test(line)));
 });
 
-test('--shutdown-guard scaffold prints its Tier-2 message without probing or elevating', async () => {
-  let called = false;
-  const logs = await logsDuring(() => installGuard({
+test('--shutdown-guard installs Tier-1 and both SYSTEM startup tasks in one elevation', async () => {
+  let command;
+  await installGuard(hyperVOptions({
     shutdownGuard: true,
-    platformName: 'win32',
-    spawnChild: () => { called = true; throw new Error('not called'); },
-    runElevatedOperation: async () => { called = true; return { ok: true }; },
+    runElevatedOperation: async (_operation, script) => { command = script; return { ok: true }; },
   }));
-  assert.equal(called, false);
-  assert.deepEqual(logs, ['shutdown-guard (Tier 2) is not yet implemented']);
+  assert.match(command, /NoAutoRebootWithLoggedOnUsers/);
+  assert.match(command, /runnerize-guard-watch/);
+  const taskScripts = [...command.matchAll(/-EncodedCommand '([^']+)'/g)]
+    .map((match) => Buffer.from(match[1], 'base64').toString('utf16le'));
+  assert.equal(taskScripts.length, 2);
+  assert.ok(taskScripts.some((script) => /runnerize-guard-recover/.test(script)));
+  assert.ok(taskScripts.every((script) => /New-ScheduledTaskTrigger -AtStartup/.test(script)));
+  assert.ok(taskScripts.every((script) => /LogonType ServiceAccount -RunLevel Highest/.test(script)));
+  assert.ok(taskScripts.every((script) => /NT AUTHORITY\\SYSTEM/.test(script)));
+  assert.match(command, /CREATOR OWNER/);
+  assert.match(command, /Authenticated Users/);
+});
+
+test('SYSTEM task script uses startup, highest service-account principals', () => {
+  const script = shutdownGuardInstallScript({
+    guardRoot: 'C:\\ProgramData\\runnerize\\guard',
+    leasesPath: 'C:\\ProgramData\\runnerize\\guard\\leases',
+    shutdownStatePath: 'C:\\ProgramData\\runnerize\\guard\\state.json',
+    guardAppRoot: 'C:\\ProgramData\\runnerize\\guard\\app',
+    packageRoot: 'C:\\runnerize',
+  });
+  const taskScripts = [...script.matchAll(/-EncodedCommand '([^']+)'/g)]
+    .map((match) => Buffer.from(match[1], 'base64').toString('utf16le'));
+  assert.equal(taskScripts.length, 2);
+  assert.ok(taskScripts.every((value) => /-AtStartup/.test(value)));
+  assert.ok(taskScripts.every((value) => /-LogonType ServiceAccount -RunLevel Highest/.test(value)));
+  assert.ok(taskScripts.every((value) => /ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/.test(value)));
+});
+
+test('reference-count reconcile snapshots on first acquire, enforces, and restores on last release', async () => {
+  let leases = [{ version: 1, sessionId: '11111111-1111-1111-1111-111111111111', heartbeat: 100 }];
+  let state = JSON.stringify({ version: 1, service: null });
+  const calls = [];
+  const options = {
+    now: 100,
+    leasesPath: 'leases',
+    shutdownStatePath: 'state.json',
+    readdir: () => leases.map((lease) => `${lease.sessionId}.json`),
+    lstat: () => ({ isSymbolicLink: () => false }),
+    readFile: (path) => path === 'state.json' ? state : JSON.stringify(leases.find((lease) => path.includes(lease.sessionId))),
+    writeFile: (_path, value) => { state = value; },
+    rename: () => {},
+    service: {
+      inspect: async () => { calls.push('inspect'); return { startupType: 'Manual', wasRunning: true }; },
+      disable: async () => { calls.push('disable'); },
+      restore: async (snapshot) => { calls.push(['restore', snapshot]); },
+    },
+  };
+  await reconcileShutdownGuard(options);
+  assert.deepEqual(calls, ['inspect', 'disable']);
+  assert.deepEqual(JSON.parse(state).service, { startupType: 'Manual', wasRunning: true });
+  await reconcileShutdownGuard(options);
+  assert.deepEqual(calls, ['inspect', 'disable', 'disable'], 'additional leases never overwrite the snapshot');
+  leases = [];
+  await reconcileShutdownGuard(options);
+  assert.deepEqual(calls.at(-1), ['restore', { startupType: 'Manual', wasRunning: true }]);
+  assert.equal(JSON.parse(state).service, null);
+});
+
+test('stale and malformed leases are reaped and trigger restoration', async () => {
+  const removed = [];
+  const files = new Map([
+    ['11111111-1111-1111-1111-111111111111.json', JSON.stringify({ version: 1, sessionId: '11111111-1111-1111-1111-111111111111', heartbeat: 1 })],
+    ['22222222-2222-2222-2222-222222222222.json', '{bad'],
+  ]);
+  const options = {
+    now: 100,
+    leaseTimeoutMs: 20,
+    leasesPath: 'leases',
+    readdir: () => [...files.keys()],
+    lstat: () => ({ isSymbolicLink: () => false }),
+    readFile: (path) => files.get(path.split(/[\\/]/).at(-1)),
+    unlink: (path) => removed.push(path),
+  };
+  assert.deepEqual(readLiveLeases(options), []);
+  assert.equal(removed.length, 2);
+});
+
+test('guard recovery waits for grace then reconciles pending state', async () => {
+  const events = [];
+  let state = JSON.stringify({ version: 1, service: { startupType: 'Automatic', wasRunning: true } });
+  await runGuardRecover(hyperVOptions({
+    delay: async (ms) => events.push(['delay', ms]),
+    recoveryGraceMs: 123,
+    shutdownStatePath: 'state.json',
+    leasesPath: 'leases',
+    readdir: () => [],
+    readFile: () => state,
+    writeFile: (_path, value) => { state = value; },
+    rename: () => {},
+    service: {
+      inspect: async () => { throw new Error('not called'); },
+      disable: async () => { throw new Error('not called'); },
+      restore: async (value) => events.push(['restore', value]),
+    },
+  }));
+  assert.deepEqual(events, [
+    ['delay', 123],
+    ['restore', { startupType: 'Automatic', wasRunning: true }],
+  ]);
+  assert.equal(JSON.parse(state).service, null);
+});
+
+test('non-elevated lease heartbeat uses one owned file and releases it', async () => {
+  const writes = [];
+  const removed = [];
+  let heartbeat;
+  const lease = await createGuardLease(hyperVOptions({
+    sessionId: '11111111-1111-1111-1111-111111111111',
+    leasesPath: 'leases',
+    now: () => 42,
+    mkdir: () => {},
+    writeFile: (path, value) => writes.push({ path, value }),
+    rename: (_source, target) => writes.push({ target }),
+    setInterval: (fn) => { heartbeat = fn; return 7; },
+    clearInterval: (timer) => assert.equal(timer, 7),
+    unlink: (path) => removed.push(path),
+  }));
+  heartbeat();
+  lease.release();
+  lease.release();
+  assert.equal(writes.filter((entry) => entry.value).length, 2);
+  assert.deepEqual(removed, ['leases\\11111111-1111-1111-1111-111111111111.json']);
 });
 
 test('status is read-only and reports current Tier-1 state', async () => {

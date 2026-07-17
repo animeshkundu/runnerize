@@ -9,6 +9,7 @@ import {
 } from './github.js';
 import { detectFlavors } from './sandbox/index.js';
 import { keepHostAwake } from './keepawake.js';
+import { createGuardLease } from './guard.js';
 
 const RUNNER_NAME_PREFIX = runnerNamePrefix();
 const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
@@ -198,6 +199,8 @@ export async function runDispatcher({
   random = Math.random,
   signal,
   onDrain,
+  hostGuard = process.env.RUNNERIZE_GUARD_HOST === '1',
+  acquireGuardLease = createGuardLease,
   drainDelay = abortableDelay,
 } = {}) {
   for (const [name, value] of Object.entries({
@@ -253,6 +256,7 @@ export async function runDispatcher({
   };
 
   const wakeLock = keepAwake ? keepHostAwake() : null;
+  const guardLease = hostGuard ? await acquireGuardLease() : null;
   log('dispatcher_started', { maxConcurrent, pollIntervalMs, idleTimeoutMs });
 
   try {
@@ -431,11 +435,15 @@ export async function runDispatcher({
   } finally {
     log('dispatcher_draining', { inflight: launches.size, timeoutMs: drainTimeoutMs });
     // Extension point for releasing external ownership leases before waiting on jobs.
-    if (onDrain) {
+    const drainHook = async () => {
+      guardLease?.release();
+      await onDrain?.();
+    };
+    if (guardLease || onDrain) {
       const hookAbort = new AbortController();
       try {
         await Promise.race([
-          Promise.resolve().then(onDrain),
+          Promise.resolve().then(drainHook),
           abortableDelay(Math.min(DRAIN_HOOK_TIMEOUT_MS, drainTimeoutMs), hookAbort.signal)
             .then(() => { throw new Error('drain hook timed out'); }),
         ]);
