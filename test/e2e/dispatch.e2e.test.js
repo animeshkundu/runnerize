@@ -23,7 +23,7 @@ import { e2eRunId, queueSelfHostedJob, waitForRun, cleanupE2E } from '../helpers
 const TOKEN = process.env.E2E_GH_TOKEN;
 const REPO = process.env.E2E_REPO;
 const TIMEOUT_MS = Number(process.env.E2E_TIMEOUT_MS ?? 900_000);
-const LABELS = ['self-hosted', 'linux', 'x64'];
+const BASE_LABELS = ['self-hosted', 'linux', 'x64'];
 
 // Set GH_TOKEN so the production modules resolve the E2E token, then import them fresh.
 if (TOKEN) process.env.GH_TOKEN = TOKEN;
@@ -101,10 +101,12 @@ test('JIT runner claims a queued private-repo job, runs it to success, and auto-
   //    Flat branch name (no slash) so the workflow file lands directly under
   //    .github/workflows/ where GitHub will scan it.
   const runId = e2eRunId();
+  const e2eLabel = `e2e-${runId}`;
+  const labels = [...BASE_LABELS, e2eLabel];
   const branch = `runnerize-e2e-${runId}`;
   const marker = `runnerize-e2e-${runId}`;
   created.branch = branch;
-  await queueSelfHostedJob(api, REPO, { branch, jobEcho: marker });
+  await queueSelfHostedJob(api, REPO, { branch, jobEcho: marker, labels });
 
   // 2) Wait for GitHub to surface the queued run, and confirm the tool counts the demand.
   const queuedRun = await waitForRun(
@@ -118,7 +120,7 @@ test('JIT runner claims a queued private-repo job, runs it to success, and auto-
   // beat behind the run appearing, so poll briefly before asserting.
   let demand = 0;
   for (let i = 0; i < 15; i += 1) {
-    demand = await github.countQueuedMatchingJobs(REPO, LABELS, { isDefault: true });
+    demand = await github.countQueuedMatchingJobs(REPO, labels, { isDefault: true });
     if (demand >= 1) break;
     await new Promise((r) => setTimeout(r, 2_000));
   }
@@ -126,14 +128,40 @@ test('JIT runner claims a queued private-repo job, runs it to success, and auto-
 
   // 3) Drive the real mint + launch path: generate a JIT config and launch one runner in
   //    a throwaway rootless container. This is the exact sequence the dispatcher runs.
-  const jit = await github.generateJitConfig(REPO, LABELS);
+  const jit = await github.generateJitConfig(REPO, labels);
   assert.match(jit.encodedJitConfig, /.+/, 'received an encoded JIT config');
   assert.ok(jit.runnerId, 'received a runner id');
   created.runnerIds.push(jit.runnerId);
 
+  let runnerOutput;
   const launchResult = await container.linux.launch(jit.encodedJitConfig, {
     idleTimeoutMs: Math.min(TIMEOUT_MS, 600_000),
+    onFailureDiagnostics: (output) => { runnerOutput = output; },
   });
+  if (!launchResult.startedJob) {
+    const intendedRunner = (await github.listRunners(REPO)).find((runner) => runner.id === jit.runnerId);
+    const jobsResponse = await api('GET', `/repos/${REPO}/actions/runs/${queuedRun.id}/jobs?per_page=100`);
+    const queuedJob = jobsResponse.data?.jobs?.find((job) => job.name === 'smoke')
+      ?? jobsResponse.data?.jobs?.[0];
+    console.error('runner output:', {
+      stdout: runnerOutput?.stdout ?? '',
+      stderr: runnerOutput?.stderr ?? '',
+    });
+    console.error('intended runner:', intendedRunner ? {
+      id: intendedRunner.id,
+      name: intendedRunner.name,
+      status: intendedRunner.status,
+      labels: intendedRunner.labels,
+    } : { id: jit.runnerId, name: jit.runnerName, status: 'not registered', labels: [] });
+    console.error('queued job:', queuedJob ? {
+      id: queuedJob.id,
+      status: queuedJob.status,
+      conclusion: queuedJob.conclusion,
+      labels: queuedJob.labels,
+      runner_id: queuedJob.runner_id,
+      runner_name: queuedJob.runner_name,
+    } : { id: undefined, status: 'not found' });
+  }
   assert.deepEqual(launchResult, { startedJob: true }, 'the JIT runner picked up and ran the job');
 
   // 4) The run must reach a successful conclusion.

@@ -13,6 +13,14 @@ const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const KILL_GRACE_MS = 1_000;
 const FORCE_SETTLE_MS = 7_000;
+const DIAGNOSTICS_MAX_BYTES = 64 * 1024;
+
+function appendBounded(current, chunk) {
+  const combined = Buffer.concat([current, Buffer.from(chunk)]);
+  return combined.length <= DIAGNOSTICS_MAX_BYTES
+    ? combined
+    : combined.subarray(combined.length - DIAGNOSTICS_MAX_BYTES);
+}
 
 function collect(command, args, options = {}) {
   const { timeoutMs, ...spawnOptions } = options;
@@ -191,7 +199,11 @@ export const linux = {
     return Boolean(await backend());
   },
 
-  async launch(encodedJitConfig, { idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS, onStarted } = {}) {
+  async launch(encodedJitConfig, {
+    idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+    onStarted,
+    onFailureDiagnostics,
+  } = {}) {
     if (!encodedJitConfig || typeof encodedJitConfig !== 'string') {
       throw new TypeError('encodedJitConfig must be a non-empty string');
     }
@@ -248,18 +260,30 @@ export const linux = {
         let startedJob = false;
         let stdoutRemainder = '';
         let stderrRemainder = '';
-        let stderr = '';
+        let stdout = Buffer.alloc(0);
+        let stderr = Buffer.alloc(0);
         let timedOut = false;
         let settled = false;
         let forceTimer;
         let killTimer;
 
-        const settle = (callback) => {
+        const failureDiagnostics = () => {
+          try {
+            onFailureDiagnostics?.({
+              stdout: stdout.toString(),
+              stderr: stderr.toString(),
+            });
+          } catch {
+            // Diagnostics must not change the launch outcome.
+          }
+        };
+        const settle = (callback, { failed = false } = {}) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
           if (forceTimer) clearTimeout(forceTimer);
           if (killTimer) clearTimeout(killTimer);
+          if (failed) failureDiagnostics();
           callback();
         };
         const observeOutput = (text, remainder) => {
@@ -280,25 +304,29 @@ export const linux = {
           child.kill('SIGTERM');
           killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
           killTimer.unref?.();
-          forceTimer = setTimeout(() => settle(() => resolve({ startedJob: false })), FORCE_SETTLE_MS);
+          forceTimer = setTimeout(() => settle(
+            () => resolve({ startedJob: false }),
+            { failed: true },
+          ), FORCE_SETTLE_MS);
           forceTimer.unref?.();
         }, idleTimeoutMs);
         timer.unref?.();
 
         child.stdout.on('data', (chunk) => {
+          stdout = appendBounded(stdout, chunk);
           stdoutRemainder = observeOutput(chunk.toString(), stdoutRemainder);
         });
         child.stderr.on('data', (chunk) => {
           const text = chunk.toString();
-          stderr += text;
+          stderr = appendBounded(stderr, chunk);
           stderrRemainder = observeOutput(text, stderrRemainder);
         });
-        child.once('error', (error) => settle(() => reject(error)));
+        child.once('error', (error) => settle(() => reject(error), { failed: true }));
         child.once('close', (code) => settle(() => {
           if (timedOut) resolve({ startedJob: false });
           else if (code === 0) resolve({ startedJob });
-          else reject(new Error(`${target.runtime} runner container exited with code ${code}: ${stderr.trim()}`));
-        }));
+          else reject(new Error(`${target.runtime} runner container exited with code ${code}: ${stderr.toString().trim()}`));
+        }, { failed: timedOut || code !== 0 }));
       });
     } finally {
       if (target.distro) await removeWslFile(target.distro, mountedScript);
