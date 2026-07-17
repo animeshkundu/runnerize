@@ -328,13 +328,11 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
   });
 });
 
-test('Windows reinstall restarts an active dispatcher task after registration', async () => {
+test('Windows reinstall never hard-stops an active dispatcher task', async () => {
   await withWindowsService({ windowsTaskRunning: true }, async (service, harness) => {
     await service.installService();
-    const restart = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe')
-      && call.args.at(-1).includes("Stop-ScheduledTask -TaskName 'runnerize-windows'"));
-    assert.ok(restart, 'active dispatcher task is stopped and relaunched');
-    assert.match(restart.args.at(-1), /Start-ScheduledTask -TaskName 'runnerize-windows'/);
+    assert.ok(!harness.calls.some((call) => call.args.at(-1)?.includes('Stop-ScheduledTask')),
+      'Task Scheduler stop would bypass graceful drain');
   });
 });
 

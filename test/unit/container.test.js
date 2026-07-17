@@ -266,6 +266,12 @@ test('INNER_SCRIPT invariant: operates on a throwaway workdir, never the read-on
   assert.match(inner, /run\.sh --jitconfig "\$JITCFG"/, 'launches run.sh with the jit config from env');
 });
 
+test('WSL forwards the max lifetime and the inner script has a defensive default', async () => {
+  const source = await readContainerSource();
+  assert.match(source, /WSLENV: `\$\{existing\}JITCFG:MAX_LIFETIME_SECONDS`/);
+  assert.match(extractInnerScript(source), /MAX_LIFETIME_SECONDS:-21600/);
+});
+
 test('mounted INNER_SCRIPT is readable by a non-owner container user', async () => {
   const source = await readContainerSource();
   assert.match(source, /chmod 644 "\$script"/, 'WSL script is world-readable');

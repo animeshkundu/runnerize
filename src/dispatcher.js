@@ -14,6 +14,16 @@ const RUNNER_NAME_PREFIX = runnerNamePrefix();
 const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
 const DEFAULT_DRAIN_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_RUNNER_MAX_LIFETIME_MS = 6 * 60 * 60_000;
+const DRAIN_HOOK_TIMEOUT_MS = 30_000;
+
+function environmentDuration(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (Number.isFinite(value)) return value;
+  console.warn(`${name} must be numeric; using ${fallback}ms.`);
+  return fallback;
+}
 
 class Semaphore {
   #capacity;
@@ -138,8 +148,8 @@ export async function runDispatcher({
   pollIntervalMs = 15_000,
   idleTimeoutMs = 120_000,
   reconcileMs = 300_000,
-  drainTimeoutMs = Number(process.env.RUNNERIZE_DRAIN_TIMEOUT_MS || DEFAULT_DRAIN_TIMEOUT_MS),
-  runnerMaxLifetimeMs = Number(process.env.RUNNERIZE_RUNNER_MAX_LIFETIME_MS || DEFAULT_RUNNER_MAX_LIFETIME_MS),
+  drainTimeoutMs = environmentDuration('RUNNERIZE_DRAIN_TIMEOUT_MS', DEFAULT_DRAIN_TIMEOUT_MS),
+  runnerMaxLifetimeMs = environmentDuration('RUNNERIZE_RUNNER_MAX_LIFETIME_MS', DEFAULT_RUNNER_MAX_LIFETIME_MS),
   only,
   keepAwake = true,
   signal,
@@ -288,7 +298,9 @@ export async function runDispatcher({
                 encodedJitConfig,
                 runnerId: generatedRunnerId,
                 runnerName,
-              } = await generateJitConfig(target.repo, flavor.labels, { signal });
+              } = await generateJitConfig(target.repo, flavor.labels);
+              // JIT creation is deliberately non-abortable: if GitHub creates a runner,
+              // the response must arrive so this process can launch or deregister it.
               runnerId = generatedRunnerId;
               // Once registered, the runner must launch even if shutdown arrived while
               // GitHub was generating its config; otherwise an orphan is left behind.
@@ -315,7 +327,7 @@ export async function runDispatcher({
               } catch (error) {
                 repoBackoffUntil.set(target.repo, Date.now() + LAUNCH_FAILURE_BACKOFF_MS);
                 try {
-                  await deleteRunner(target.repo, runnerId, { signal });
+                  await deleteRunner(target.repo, runnerId);
                 } catch (deleteError) {
                   log('runner_deregister_error', {
                     repo: target.repo,
@@ -360,18 +372,30 @@ export async function runDispatcher({
   } finally {
     log('dispatcher_draining', { inflight: launches.size, timeoutMs: drainTimeoutMs });
     // Extension point for releasing external ownership leases before waiting on jobs.
-    try {
-      await onDrain?.();
-    } catch (error) {
-      log('drain_hook_error', errorFields(error));
+    if (onDrain) {
+      const hookAbort = new AbortController();
+      try {
+        await Promise.race([
+          Promise.resolve().then(onDrain),
+          abortableDelay(Math.min(DRAIN_HOOK_TIMEOUT_MS, drainTimeoutMs), hookAbort.signal)
+            .then(() => { throw new Error('drain hook timed out'); }),
+        ]);
+      } catch (error) {
+        log('drain_hook_error', errorFields(error));
+      } finally {
+        hookAbort.abort();
+      }
     }
 
     const pending = [...launches.keys()];
     if (pending.length) {
       let deadlineExpired = false;
+      const drainAbort = new AbortController();
       await Promise.race([
-        Promise.allSettled(pending),
-        drainDelay(drainTimeoutMs).then(() => { deadlineExpired = true; }),
+        Promise.allSettled(pending).then(() => drainAbort.abort()),
+        drainDelay(drainTimeoutMs, drainAbort.signal).then(() => {
+          if (!drainAbort.signal.aborted) deadlineExpired = true;
+        }),
       ]);
 
       if (deadlineExpired && launches.size) {
@@ -399,9 +423,11 @@ export async function runDispatcher({
             }
           }
         }
+        const reapAbort = new AbortController();
         await Promise.race([
-          Promise.allSettled(remaining.map(([promise]) => promise)),
-          abortableDelay(5_000),
+          Promise.allSettled(remaining.map(([promise]) => promise))
+            .then(() => reapAbort.abort()),
+          abortableDelay(5_000, reapAbort.signal),
         ]);
       }
     }

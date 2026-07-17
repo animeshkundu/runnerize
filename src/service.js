@@ -742,15 +742,8 @@ function scheduledTaskIsRunning(taskName) {
   ]).status === 0;
 }
 
-function restartScheduledTask(taskName) {
-  console.log('Restarting the running dispatcher to load the new version…');
-  const script = `$ErrorActionPreference = 'Stop'; Stop-ScheduledTask -TaskName ${powershellLiteral(taskName)}; Start-ScheduledTask -TaskName ${powershellLiteral(taskName)}`;
-  const result = captureResult(powershellPath, [
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-  ]);
-  if (result.status !== 0) {
-    console.warn(`Could not restart ${taskName}; it will load the new version at the next start.`);
-  }
+function deferScheduledTaskRestart(taskName) {
+  console.warn(`${taskName} is running; Windows Task Scheduler cannot signal a graceful drain. The new version will load after the dispatcher next exits or the host restarts.`);
 }
 
 function scheduledTaskPrincipal(taskName) {
@@ -981,7 +974,7 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
       persistWindowsTokenIfNeeded();
       const launcher = writeWindowsLauncher();
       const trigger = await installLogonTrigger(windowsTriggerSpec(launcher), { noElevate, elevationTimeoutMs });
-      if (wasRunning) restartScheduledTask(windowsTaskName);
+      if (wasRunning) deferScheduledTaskRestart(windowsTaskName);
       console.log(`Windows logon trigger: ${trigger.kind} (${trigger.detail})`);
       console.log(`Windows dispatcher log: ${windowsDataPath('runnerize-windows.log')}`);
       console.log(`runnerize package: ${installation.root}`);

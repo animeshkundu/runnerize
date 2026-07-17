@@ -180,6 +180,7 @@ async function observeRunner(child, idleTimeoutMs, maxLifetimeMs, onStarted) {
       child.kill('SIGKILL');
       settle(() => resolve({ startedJob: false }));
     }, idleTimeoutMs);
+    timer.unref?.();
     const lifetimeTimer = setTimeout(() => {
       child.kill('SIGKILL');
       settle(() => reject(new Error(`runner exceeded maximum lifetime of ${maxLifetimeMs}ms`)));
@@ -221,7 +222,8 @@ export const macos = {
     }
   },
 
-  async reapOrphans() {
+  async reapOrphans({ protectedRunnerNames = new Set() } = {}) {
+    if (protectedRunnerNames.size) return 0;
     const { stdout } = await collect('tart', ['list', '--format', 'json'], { timeoutMs: CLEANUP_TIMEOUT_MS });
     const entries = JSON.parse(stdout);
     const names = entries.map((entry) => entry.name ?? entry.Name)
@@ -265,13 +267,23 @@ export const macos = {
     const vmName = `runnerize-${randomUUID()}`;
     let tartRun;
     let stopped = false;
+    let deleted = false;
     const stop = async () => {
-      if (stopped) return;
-      stopped = true;
-      try {
-        await collect('tart', ['stop', vmName], { timeoutMs: CLEANUP_TIMEOUT_MS });
-      } catch {
-        // It may already be stopped.
+      if (!stopped) {
+        stopped = true;
+        try {
+          await collect('tart', ['stop', vmName], { timeoutMs: CLEANUP_TIMEOUT_MS });
+        } catch {
+          // It may already be stopped.
+        }
+      }
+      if (!deleted) {
+        deleted = true;
+        try {
+          await collect('tart', ['delete', vmName], { timeoutMs: CLEANUP_TIMEOUT_MS });
+        } catch (error) {
+          console.warn(`Failed to delete tart VM ${vmName}; remove it manually with \`tart delete ${vmName}\`. ${error.message}`);
+        }
       }
     };
     onControl?.({ name: vmName, stop });
@@ -290,11 +302,6 @@ export const macos = {
       return await observeRunner(child, idleTimeoutMs, maxLifetimeMs, onStarted);
     } finally {
       await stop();
-      try {
-        await collect('tart', ['delete', vmName], { timeoutMs: CLEANUP_TIMEOUT_MS });
-      } catch (error) {
-        console.warn(`Failed to delete tart VM ${vmName}; remove it manually with \`tart delete ${vmName}\`. ${error.message}`);
-      }
       tartRun?.child.kill('SIGTERM');
     }
   },

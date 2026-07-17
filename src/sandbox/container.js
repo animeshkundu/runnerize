@@ -162,7 +162,7 @@ function invocation(target, runtimeArgs, env) {
   return {
     command: 'wsl.exe',
     args: ['-d', target.distro, '-e', 'bash', '-lc', commandLine],
-    env: { ...env, WSLENV: `${existing}JITCFG` },
+    env: { ...env, WSLENV: `${existing}JITCFG:MAX_LIFETIME_SECONDS` },
   };
 }
 
@@ -200,7 +200,7 @@ cp -a /rsrc/. "$workdir/"
 cd "$workdir"
 rm -rf _work _diag .runner .credentials*
 export RUNNER_ALLOW_RUNASROOT=1
-exec timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS}s" ./run.sh --jitconfig "$JITCFG"
+exec timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-21600}s" ./run.sh --jitconfig "$JITCFG"
 `;
 
 export const linux = {
