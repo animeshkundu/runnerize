@@ -401,7 +401,7 @@ test('generateJitConfig returns { encodedJitConfig, runnerId, runnerName }', asy
     assert.equal(body.runner_group_id, 1, 'runner_group_id 1 is sent');
     assert.equal(body.work_folder, '_work');
     assert.deepEqual(body.labels, ['self-hosted', 'linux', 'x64']);
-    assert.match(body.name, /^runnerize-[0-9a-f]{8}$/, 'name is runnerize-<hex>');
+    assert.equal(body.name, `${gh.runnerNamePrefix()}1`, 'name uses the first available hostname slot');
   });
 });
 

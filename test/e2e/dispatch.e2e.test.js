@@ -62,12 +62,12 @@ before(async () => {
 
 after(async () => {
   if (!infraReady || !api) return;
-  // Delete any runnerize-* runners still registered (there should be none), then the
+  // Delete any runners from this host still registered (there should be none), then the
   // branch and its runs. Best-effort: log problems but never throw from teardown.
   try {
     const runners = await github.listRunners(REPO);
     for (const runner of runners) {
-      if (runner.name?.startsWith('runnerize-')) {
+      if (runner.name?.startsWith(github.runnerNamePrefix())) {
         await github.deleteRunner(REPO, runner.id).catch(() => {});
       }
     }
@@ -92,9 +92,9 @@ test('JIT runner claims a queued private-repo job, runs it to success, and auto-
   // 0) Sanity: the repo is private and owned by the token's user (the tool's invariant).
   assert.equal(await github.isStillPrivate(REPO), true, 'E2E_REPO must be a private repo owned by the token user');
 
-  // Baseline: no leaked runnerize-* runners before we start.
+  // Baseline: no leaked runners from this host before we start.
   const before = await github.listRunners(REPO);
-  const staleBefore = before.filter((r) => r.name?.startsWith('runnerize-'));
+  const staleBefore = before.filter((r) => r.name?.startsWith(github.runnerNamePrefix()));
   for (const r of staleBefore) await github.deleteRunner(REPO, r.id).catch(() => {});
 
   // 1) Queue exactly one self-hosted job by pushing a workflow to a fresh branch.
@@ -145,13 +145,13 @@ test('JIT runner claims a queued private-repo job, runs it to success, and auto-
   assert.ok(completed, 'the workflow run completed');
   assert.equal(completed.conclusion, 'success', 'the job concluded successfully');
 
-  // 5) The ephemeral runner auto-deregistered: 0 leaked runnerize-* registrations.
+  // 5) The ephemeral runner auto-deregistered: 0 leaked registrations from this host.
   //    Auto-deregistration lags a beat behind job completion and, under CI load, can take
   //    well over a minute — poll generously so a slow-but-eventual deregistration is not a flake.
   let leaked = [];
   for (let i = 0; i < 40; i += 1) {
     const runners = await github.listRunners(REPO);
-    leaked = runners.filter((r) => r.name?.startsWith('runnerize-'));
+    leaked = runners.filter((r) => r.name?.startsWith(github.runnerNamePrefix()));
     if (leaked.length === 0) break;
     await new Promise((r) => setTimeout(r, 3_000));
   }

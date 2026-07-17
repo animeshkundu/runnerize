@@ -6,6 +6,7 @@ import {
   getUser,
   listOwnedPrivateRepos,
   listRunners,
+  runnerNamePrefix,
 } from '../src/github.js';
 import { runDispatcher } from '../src/dispatcher.js';
 import { detectFlavors, FLAVOR_KEYS } from '../src/sandbox/index.js';
@@ -150,7 +151,7 @@ async function remove() {
   for (const repo of repos) {
     const runners = await listRunners(repo.full_name);
     for (const runner of runners) {
-      if (runner.status === 'offline' && runner.name.startsWith('runnerize-')) {
+      if (runner.status === 'offline' && runner.name.startsWith(runnerNamePrefix())) {
         await deleteRunner(repo.full_name, runner.id);
         removed += 1;
         console.log(`Removed offline ephemeral runner ${runner.name} from ${repo.full_name}`);

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runDispatcher } from '../../src/dispatcher.js';
+import { runnerNamePrefix } from '../../src/github.js';
 import { GitHubStub } from '../helpers/github-stub.js';
 import { FakeFlavor, installFakeFlavor, waitFor, tick } from '../helpers/dispatcher-harness.js';
 
@@ -332,8 +333,9 @@ test('re-checks privacy immediately before mint and fails closed (no mint, no JI
   });
 });
 
-test('reconcile deletes offline runnerize-* registrations but leaves foreign/online ones', async () => {
+test('reconcile deletes this host\'s offline registrations but leaves foreign/online ones', async () => {
   const flavor = new FakeFlavor();
+  const prefix = runnerNamePrefix();
   flavor.available = async () => true; // active flavor scopes reconcile; there is no demand to mint
   await runSession({
     flavor,
@@ -343,8 +345,8 @@ test('reconcile deletes offline runnerize-* registrations but leaves foreign/onl
       repos: [{ full_name: 'me/recon', private: true }],
       runners: {
         'me/recon': [
-          { id: 1, name: 'runnerize-stale', status: 'offline', labels: ['SELF-HOSTED', 'Linux', 'X64'] },
-          { id: 2, name: 'runnerize-live', status: 'online', labels: ['self-hosted', 'linux', 'x64'] },
+          { id: 1, name: `${prefix}1`, status: 'offline', labels: ['SELF-HOSTED', 'Linux', 'X64'] },
+          { id: 2, name: `${prefix}2`, status: 'online', labels: ['self-hosted', 'linux', 'x64'] },
           { id: 3, name: 'someones-runner', status: 'offline', labels: ['self-hosted', 'linux', 'x64'] },
         ],
       },
@@ -352,8 +354,8 @@ test('reconcile deletes offline runnerize-* registrations but leaves foreign/onl
   }, async ({ start, stub, events }) => {
     start();
     assert.ok(await waitFor(() => events('reconcile_complete').length >= 1), 'a reconcile pass ran');
-    assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/1$/), 1, 'the offline runnerize-* runner is removed');
-    assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/2$/), 0, 'the online runnerize-* runner is kept');
+    assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/1$/), 1, 'this host\'s offline runner is removed');
+    assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/2$/), 0, 'this host\'s online runner is kept');
     assert.equal(stub.countCalls('DELETE', /\/actions\/runners\/3$/), 0, 'a foreign runner is never touched');
   });
 });
