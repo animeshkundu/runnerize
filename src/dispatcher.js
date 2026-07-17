@@ -15,6 +15,8 @@ const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
 const DEFAULT_DRAIN_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_RUNNER_MAX_LIFETIME_MS = 6 * 60 * 60_000;
 const DRAIN_HOOK_TIMEOUT_MS = 30_000;
+const DEFAULT_POLL_MAX_INTERVAL_MS = 120_000;
+const POLL_JITTER = 0.25;
 
 function environmentDuration(name, fallback) {
   const raw = process.env[name];
@@ -65,20 +67,47 @@ function errorFields(error) {
   };
 }
 
-function abortableDelay(milliseconds, signal) {
+function createNotifier() {
+  const listeners = new Set();
+
+  return {
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    notify() {
+      const pending = [...listeners];
+      listeners.clear();
+      for (const listener of pending) listener();
+    },
+  };
+}
+
+function interruptibleDelay(milliseconds, notifier, signal) {
   if (signal?.aborted) return Promise.resolve();
 
   return new Promise((resolve) => {
+    let unsubscribe = () => {};
+    let wakeTimer;
     const timer = setTimeout(done, milliseconds);
 
     function done() {
       clearTimeout(timer);
+      clearTimeout(wakeTimer);
+      unsubscribe();
       signal?.removeEventListener('abort', done);
       resolve();
     }
 
+    unsubscribe = notifier?.subscribe(() => {
+      wakeTimer = setTimeout(done, 0);
+    }) ?? unsubscribe;
     signal?.addEventListener('abort', done, { once: true });
   });
+}
+
+function abortableDelay(milliseconds, signal) {
+  return interruptibleDelay(milliseconds, undefined, signal);
 }
 
 function runnerLabels(runner) {
@@ -135,9 +164,20 @@ async function reconcile(repos, flavors, signal, { host = false } = {}) {
   log('reconcile_complete', { repos: repos.length, removed });
 }
 
-function pollDelay(baseMilliseconds, repoCount) {
-  const multiplier = Math.max(1, Math.ceil(repoCount / 20));
-  return Math.min(baseMilliseconds * multiplier, 60_000);
+export function pollDelay({
+  floorMilliseconds,
+  capMilliseconds,
+  repoCount,
+  freeCapacity,
+  maxCapacity,
+  random = Math.random,
+}) {
+  const repoMultiplier = Math.max(1, Math.ceil(repoCount / 20));
+  const scaledFloor = Math.min(floorMilliseconds * repoMultiplier, capMilliseconds);
+  const load = 1 - freeCapacity / maxCapacity;
+  const adaptive = scaledFloor + (capMilliseconds - scaledFloor) * load;
+  const jittered = adaptive * (1 - POLL_JITTER + random() * POLL_JITTER * 2);
+  return Math.max(floorMilliseconds, Math.min(jittered, capMilliseconds));
 }
 
 /**
@@ -146,18 +186,23 @@ function pollDelay(baseMilliseconds, repoCount) {
 export async function runDispatcher({
   maxConcurrent = 4,
   pollIntervalMs = 15_000,
+  pollMaxIntervalMs = Number(
+    process.env.RUNNERIZE_POLL_MAX_INTERVAL_MS ?? DEFAULT_POLL_MAX_INTERVAL_MS,
+  ),
   idleTimeoutMs = 120_000,
   reconcileMs = 300_000,
   drainTimeoutMs = environmentDuration('RUNNERIZE_DRAIN_TIMEOUT_MS', DEFAULT_DRAIN_TIMEOUT_MS),
   runnerMaxLifetimeMs = environmentDuration('RUNNERIZE_RUNNER_MAX_LIFETIME_MS', DEFAULT_RUNNER_MAX_LIFETIME_MS),
   only,
   keepAwake = true,
+  random = Math.random,
   signal,
   onDrain,
   drainDelay = abortableDelay,
 } = {}) {
   for (const [name, value] of Object.entries({
     pollIntervalMs,
+    pollMaxIntervalMs,
     idleTimeoutMs,
     reconcileMs,
     drainTimeoutMs,
@@ -167,6 +212,10 @@ export async function runDispatcher({
       throw new TypeError(`${name} must be a positive number`);
     }
   }
+  if (pollMaxIntervalMs < pollIntervalMs) {
+    throw new TypeError('pollMaxIntervalMs must be at least pollIntervalMs');
+  }
+  if (typeof random !== 'function') throw new TypeError('random must be a function');
 
   const semaphore = new Semaphore(maxConcurrent);
   const launches = new Map();
@@ -174,8 +223,17 @@ export async function runDispatcher({
   const unassignedByFlavor = new Map();
   const unassignedByRepoFlavor = new Map();
   const repoBackoffUntil = new Map();
+  const slotFreed = createNotifier();
   let lastReconcile = 0;
   let lastRepoCount = 0;
+  const waitForNextPoll = (repoCount) => interruptibleDelay(pollDelay({
+    floorMilliseconds: pollIntervalMs,
+    capMilliseconds: pollMaxIntervalMs,
+    repoCount,
+    freeCapacity: semaphore.free(),
+    maxCapacity: maxConcurrent,
+    random,
+  }), slotFreed, signal);
 
   const unassignedKey = (repo, flavor) => `${flavor}\0${repo}`;
   const incrementUnassigned = (repo, flavor) => {
@@ -205,7 +263,7 @@ export async function runDispatcher({
         lastRepoCount = repos.length;
       } catch (error) {
         log('repo_poll_error', errorFields(error));
-        await abortableDelay(pollDelay(pollIntervalMs, lastRepoCount), signal);
+        await waitForNextPoll(lastRepoCount);
         continue;
       }
 
@@ -214,7 +272,7 @@ export async function runDispatcher({
         flavors = await detectFlavors(only);
       } catch (error) {
         log('flavor_detection_error', errorFields(error));
-        await abortableDelay(pollDelay(pollIntervalMs, repos.length), signal);
+        await waitForNextPoll(repos.length);
         continue;
       }
 
@@ -356,6 +414,7 @@ export async function runDispatcher({
               if (flavorActive === 0) activeByFlavor.delete(flavor.key);
               else activeByFlavor.set(flavor.key, flavorActive);
               semaphore.release();
+              slotFreed.notify();
               launches.delete(launchPromise);
             }
           })();
@@ -367,7 +426,7 @@ export async function runDispatcher({
         }
       }
 
-      await abortableDelay(pollDelay(pollIntervalMs, repos.length), signal);
+      await waitForNextPoll(repos.length);
     }
   } finally {
     log('dispatcher_draining', { inflight: launches.size, timeoutMs: drainTimeoutMs });
