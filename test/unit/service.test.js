@@ -198,7 +198,12 @@ async function withWindowsService(options, action) {
   const restore = installStubs(harness);
   try {
     const service = await freshImport('../../src/service.js');
-    await action(service, harness, appData);
+    const serviceWithGuardStubs = {
+      ...service,
+      installService: (installOptions = {}) => service.installService({ installGuardOperation: async () => {}, ...installOptions }),
+      uninstallService: (uninstallOptions = {}) => service.uninstallService({ uninstallGuardOperation: async () => {}, ...uninstallOptions }),
+    };
+    await action(serviceWithGuardStubs, harness, appData);
   } finally {
     restore();
     rmSync(appData, { recursive: true, force: true });
@@ -557,6 +562,59 @@ test('Windows install skips elevation when RUNNERIZE_NO_ELEVATE is non-empty', a
   await withWindowsService({ accessDenied: true, noElevateEnv: '1' }, async (service, harness) => {
     await service.installService();
     assert.ok(!harness.calls.some((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('Start-Process')));
+  });
+});
+
+test('Windows install applies the host-stability guard by default', async () => {
+  await withWindowsService({}, async (service) => {
+    const calls = [];
+    await service.installService({
+      elevationTimeoutMs: 1234,
+      installGuardOperation: async (options) => calls.push(options),
+    });
+    assert.deepEqual(calls, [{ elevationTimeoutMs: 1234 }]);
+  });
+});
+
+test('Windows install skips the host-stability guard with --no-guard', async () => {
+  await withWindowsService({}, async (service) => {
+    let called = false;
+    await service.installService({
+      noGuard: true,
+      installGuardOperation: async () => { called = true; },
+    });
+    assert.equal(called, false);
+  });
+});
+
+test('Windows install prints the guard manual step without elevation', async () => {
+  await withWindowsService({}, async (service) => {
+    const logs = [];
+    const originalLog = console.log;
+    let called = false;
+    console.log = (message = '') => logs.push(message);
+    try {
+      await service.installService({
+        noElevate: true,
+        installGuardOperation: async () => { called = true; },
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    assert.equal(called, false);
+    assert.ok(logs.some((line) => line.trim() === 'Host-stability guard (recommended on a Hyper-V guest)'));
+    assert.ok(logs.some((line) => line === '   runnerize guard install'));
+  });
+});
+
+test('Windows uninstall removes the host-stability guard by default', async () => {
+  await withWindowsService({}, async (service) => {
+    const calls = [];
+    await service.uninstallService({
+      elevationTimeoutMs: 1234,
+      uninstallGuardOperation: async (options) => calls.push(options),
+    });
+    assert.deepEqual(calls, [{ elevationTimeoutMs: 1234 }]);
   });
 });
 

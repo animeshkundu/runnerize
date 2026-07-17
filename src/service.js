@@ -4,6 +4,7 @@ import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getToken } from './github.js';
+import { installGuard, uninstallGuard } from './guard.js';
 
 const SERVICE_NAME = 'runnerize';
 const DEFAULT_WSL_NODE_VERSION = 'v24.18.0';
@@ -909,7 +910,7 @@ function wslKeepAwakeSpec(context) {
   };
 }
 
-async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
+async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard = false, installGuardOperation = installGuard } = {}) {
   const audit = await auditWindowsPrerequisites({ noElevate, elevationTimeoutMs });
   if (audit.rebootRequired) return;
 
@@ -975,6 +976,22 @@ async function installWindows({ noElevate = false, elevationTimeoutMs } = {}) {
   if (!statuses.some((status) => status.endsWith('=installed'))) {
     throw linuxError ?? new Error('No runnerize backend is available on this Windows host.');
   }
+  if (!noGuard) {
+    const manualSteps = [{
+      why: 'Windows Update auto-restarts can reboot this guest and kill the dispatcher; the guard defers them and disables hibernation.',
+      command: 'runnerize guard install',
+    }];
+    if (noElevate) {
+      printManualSteps('Host-stability guard (recommended on a Hyper-V guest)', manualSteps);
+    } else {
+      try {
+        await installGuardOperation({ elevationTimeoutMs });
+      } catch (error) {
+        console.warn(`Could not install the host-stability guard: ${error.message}`);
+        printManualSteps('Host-stability guard (recommended on a Hyper-V guest)', manualSteps);
+      }
+    }
+  }
   console.log('Uninstall: runnerize service uninstall');
 }
 
@@ -982,7 +999,7 @@ function bestEffort(command, args) {
   spawnSync(command, args, { stdio: 'ignore', windowsHide: true });
 }
 
-async function uninstallWindows({ noElevate = false, elevationTimeoutMs } = {}) {
+async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard = false, uninstallGuardOperation = uninstallGuard } = {}) {
   let context;
   try {
     context = resolveWslContext();
@@ -1035,6 +1052,13 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs } = {}) 
   for (const artifact of ['app', 'runnerize-windows.ps1', 'runnerize-wsl-keepawake.ps1', 'windows.token', 'runnerize-windows.log']) {
     rmSync(windowsDataPath(artifact), { recursive: true, force: true });
   }
+  if (!noGuard && !noElevate) {
+    try {
+      await uninstallGuardOperation({ elevationTimeoutMs });
+    } catch (error) {
+      console.warn(`Could not uninstall the host-stability guard: ${error.message}`);
+    }
+  }
   console.log('Removed the WSL systemd service, Windows logon triggers, package copies, credential, and logs where present.');
 }
 
@@ -1044,7 +1068,12 @@ function elevationDisabled(options) {
 
 export async function installService(options = {}) {
   if (platform() === 'darwin') return installLaunchd();
-  if (platform() === 'win32') return installWindows({ noElevate: elevationDisabled(options), elevationTimeoutMs: options.elevationTimeoutMs });
+  if (platform() === 'win32') return installWindows({
+    noElevate: elevationDisabled(options),
+    elevationTimeoutMs: options.elevationTimeoutMs,
+    noGuard: options.noGuard,
+    installGuardOperation: options.installGuardOperation,
+  });
   if (!commandExists('systemctl')) {
     throw new Error('systemd is required to install runnerize as a Linux/WSL service.');
   }
@@ -1053,6 +1082,11 @@ export async function installService(options = {}) {
 
 export async function uninstallService(options = {}) {
   if (platform() === 'darwin') return uninstallLaunchd();
-  if (platform() === 'win32') return uninstallWindows({ noElevate: elevationDisabled(options), elevationTimeoutMs: options.elevationTimeoutMs });
+  if (platform() === 'win32') return uninstallWindows({
+    noElevate: elevationDisabled(options),
+    elevationTimeoutMs: options.elevationTimeoutMs,
+    noGuard: options.noGuard,
+    uninstallGuardOperation: options.uninstallGuardOperation,
+  });
   return uninstallSystemd();
 }
