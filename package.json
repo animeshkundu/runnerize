@@ -1,6 +1,6 @@
 {
   "name": "runnerize",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Stateless, on-demand self-hosted GitHub Actions runners for your private repos: a dispatcher mints an ephemeral just-in-time runner per queued job and runs it in a throwaway rootless container.",
   "bin": {
     "runnerize": "bin/runnerize.js"
