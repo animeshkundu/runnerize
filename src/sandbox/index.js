@@ -15,5 +15,7 @@ export async function detectFlavors(only) {
       return false;
     }
   }));
-  return flavors.filter((_, index) => availability[index]);
+  return flavors
+    .filter((_, index) => availability[index])
+    .map((flavor) => ({ ...flavor, labels: [...flavor.labels] }));
 }

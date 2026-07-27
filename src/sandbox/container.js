@@ -15,6 +15,8 @@ const CLEANUP_TIMEOUT_MS = 5_000;
 const KILL_GRACE_MS = 1_000;
 const FORCE_SETTLE_MS = 7_000;
 const DIAGNOSTICS_MAX_BYTES = 64 * 1024;
+const KVM_PROBE_TIMEOUT_MS = 5_000;
+const BASE_LINUX_LABELS = ['self-hosted', 'linux', 'x64'];
 
 function appendBounded(current, chunk) {
   const combined = Buffer.concat([current, Buffer.from(chunk)]);
@@ -92,6 +94,20 @@ async function backend() {
   if (process.platform === 'win32') return wslRuntime();
   const runtime = await nativeRuntime();
   return runtime ? { runtime } : null;
+}
+
+async function hasUsableKvm(target) {
+  if (!target) return false;
+  const command = target.distro ? 'wsl.exe' : 'bash';
+  const args = target.distro
+    ? ['-d', target.distro, '-e', 'bash', '-c', 'exec 3<>/dev/kvm']
+    : ['-c', 'exec 3<>/dev/kvm'];
+  try {
+    await collect(command, args, { timeoutMs: KVM_PROBE_TIMEOUT_MS });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function shellQuote(value) {
@@ -205,10 +221,14 @@ exec timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-21600}s" .
 
 export const linux = {
   key: 'linux',
-  labels: ['self-hosted', 'linux', 'x64'],
+  labels: [...BASE_LINUX_LABELS],
+  kvm: false,
 
   async available() {
-    return Boolean(await backend());
+    const target = await backend();
+    linux.kvm = await hasUsableKvm(target);
+    linux.labels = linux.kvm ? [...BASE_LINUX_LABELS, 'kvm'] : [...BASE_LINUX_LABELS];
+    return Boolean(target);
   },
 
   async reapOrphans({ protectedRunnerNames = new Set() } = {}) {
@@ -239,6 +259,7 @@ export const linux = {
 
     const target = await backend();
     if (!target) throw new Error('podman or docker is required for the linux flavor');
+    const kvm = linux.kvm && await hasUsableKvm(target);
     const image = process.env.RUNNERIZE_LINUX_IMAGE || DEFAULT_IMAGE;
     if (target.distro) {
       const inspect = invocation(target, ['image', 'inspect', image], process.env);
@@ -272,6 +293,7 @@ export const linux = {
       'run', '--rm', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
       '-v', `${mountedRunner}:/rsrc:ro`,
       '-v', `${mountedScript}:/inner.sh:ro`,
+      ...(kvm ? ['--device', '/dev/kvm'] : []),
       image, 'bash', '/inner.sh',
     ];
     const env = {
