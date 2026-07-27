@@ -201,6 +201,38 @@ it to run before/without an interactive login: `loginctl enable-linger "$USER"`.
 Logs: `journalctl --user -u runnerize -f`. This is also the cleanest path *inside
 WSL* (systemd runs there) once Node is installed in the WSL distro.
 
+### KVM-accelerated Android tests
+
+runnerize enables KVM automatically when the linux execution environment has a
+usable `/dev/kvm`. Enable CPU virtualization in firmware and expose `/dev/kvm` to
+the Linux host or WSL2 distro. The account running the dispatcher must be able to
+open the device for both reading and writing, commonly by membership in the
+`kvm` group. Log out and back in after changing group membership. No environment
+flag is needed: if the access probe fails, runnerize silently keeps the existing
+linux labels and container arguments.
+
+A capable host advertises the additional `kvm` label and accepts targeted jobs:
+
+```yaml
+runs-on: [self-hosted, linux, x64, kvm]
+```
+
+The container receives only `--device /dev/kvm`; runnerize does not use
+`--privileged` or expose a host container socket. The rootless runtime must
+preserve the dispatcher's effective access to the device. If group-only access is
+not preserved by your runtime configuration, grant the dispatcher user direct
+read/write access through an appropriate host udev rule rather than broadening the
+container's privileges.
+
+Android tooling is an image concern. The default
+`docker.io/catthehacker/ubuntu:full-latest` image includes a JDK but does not
+include the Android SDK, emulator, or Gradle. Build a fat image with the required
+SDK platforms, system image, emulator, and build tools pre-installed, then set:
+
+```sh
+export RUNNERIZE_LINUX_IMAGE=registry.example.com/runnerize-android:latest
+```
+
 ---
 
 ## Migrating an existing self-hosted repo onto runnerize

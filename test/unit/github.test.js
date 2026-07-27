@@ -185,6 +185,28 @@ test('countQueuedMatchingJobs: bare [self-hosted] counts only for the default fl
   });
 });
 
+test('countQueuedMatchingJobs: a KVM-capable linux flavor counts generic and KVM jobs once each', async () => {
+  await withGithub({
+    user: { login: 'alice', type: 'User' },
+    repos: [{ full_name: 'alice/repo', private: true }],
+    runs: { 'alice/repo': [{ id: 8, status: 'queued' }] },
+    jobs: {
+      8: [
+        { status: 'queued', labels: ['self-hosted', 'linux', 'x64'] },
+        { status: 'queued', labels: ['self-hosted', 'linux', 'x64', 'kvm'] },
+        { status: 'queued', labels: ['self-hosted', 'windows', 'x64'] },
+      ],
+    },
+  }, async (gh) => {
+    const count = await gh.countQueuedMatchingJobs(
+      'alice/repo',
+      ['self-hosted', 'linux', 'x64', 'kvm'],
+      { isDefault: true },
+    );
+    assert.equal(count, 2, 'the added capability label does not become the OS discriminator');
+  });
+});
+
 test('countQueuedMatchingJobs: case-insensitive labels', async () => {
   await withGithub({
     user: { login: 'alice', type: 'User' },

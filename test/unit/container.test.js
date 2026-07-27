@@ -24,7 +24,11 @@ function containerStub(onContainer) {
       onContainer?.(child, stub);
       return;
     }
-    // Probe / teardown calls (podman --version, image inspect, rm -f name): succeed.
+    // KVM is absent unless a test opts in; all other probe / teardown calls succeed.
+    if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
+      child.close(1);
+      return;
+    }
     child.emitStdout('ok\n');
     child.close(0);
   });
@@ -77,6 +81,59 @@ test('linux.launch resolves { startedJob: true } after a job-start line and clea
       // JIT config is passed via env, never on argv.
       assert.equal(container.options.env.JITCFG, 'deadbeef');
       assert.ok(!container.args.includes('deadbeef'), 'the jit config never appears as an argv token');
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux passes through usable KVM and advertises the capability', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const stub = new SpawnStub((child) => {
+      const args = child.args ?? [];
+      if (args.includes('--name')) {
+        child.startJob();
+        child.close(0);
+        return;
+      }
+      child.emitStdout('ok\n');
+      child.close(0);
+    }).install();
+    try {
+      assert.equal(await linux.available(), true);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', 'kvm']);
+      await linux.launch('cfg', { idleTimeoutMs: 5000 });
+      const container = stub.find('--name');
+      assert.deepEqual(
+        container.args.slice(container.args.indexOf('--device'), container.args.indexOf('--device') + 2),
+        ['--device', '/dev/kvm'],
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux keeps labels and spawn args unchanged when KVM is unusable', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const stub = containerStub((child) => {
+      child.startJob();
+      child.close(0);
+    }).install();
+    try {
+      assert.equal(await linux.available(), true);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64']);
+      await linux.launch('cfg', { idleTimeoutMs: 5000 });
+      const container = stub.find('--name');
+      const name = container.args[container.args.indexOf('--name') + 1];
+      const runnerMount = container.args[container.args.indexOf('-v') + 1];
+      const scriptMount = container.args[container.args.lastIndexOf('-v') + 1];
+      assert.deepEqual(container.args, [
+        'run', '--rm', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
+        '-v', runnerMount,
+        '-v', scriptMount,
+        'example/image:latest', 'bash', '/inner.sh',
+      ]);
     } finally {
       stub.restore();
     }
@@ -213,6 +270,7 @@ test('linux.available: true when a container runtime is present, false when none
     const absent = new SpawnStub((child) => { child.fail(new Error('ENOENT')); }).install();
     try {
       assert.equal(await linux.available(), false);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64'], 'stale KVM capability is removed');
     } finally {
       absent.restore();
     }

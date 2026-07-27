@@ -37,16 +37,21 @@ test('native VM flavors expose their host concurrency caps', async () => {
   assert.equal(macos.maxConcurrent, 2, 'macOS licensing permits two concurrent guests');
 });
 
-test('detectFlavors returns only available flavors, by reference', async () => {
+test('detectFlavors returns only available flavors with snapshotted labels', async () => {
   await withAvailability({
-    linux: async () => true,
+    linux: async function available() {
+      this.labels = ['self-hosted', 'linux', 'x64', 'kvm'];
+      return true;
+    },
     windows: async () => true,
     macos: async () => false,
   }, async () => {
     const flavors = await detectFlavors();
     assert.deepEqual(flavors.map((f) => f.key), ['linux', 'windows']);
-    assert.equal(flavors[0], linux, 'returns the singleton by reference');
-    assert.equal(flavors[1], windows);
+    assert.notEqual(flavors[0], linux, 'returns a per-poll snapshot, not mutable singleton state');
+    assert.deepEqual(flavors[0].labels, ['self-hosted', 'linux', 'x64', 'kvm']);
+    linux.labels = ['self-hosted', 'linux', 'x64'];
+    assert.deepEqual(flavors[0].labels, ['self-hosted', 'linux', 'x64', 'kvm']);
   });
 });
 

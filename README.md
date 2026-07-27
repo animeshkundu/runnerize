@@ -56,6 +56,10 @@ jobs:
     runs-on: [self-hosted, linux, x64]
 ```
 
+For Android instrumented tests, a linux host with usable `/dev/kvm` automatically
+advertises `[self-hosted, linux, x64, kvm]` and passes only that device through to the
+container. See [KVM-accelerated Android tests](docs/DEPLOYMENT.md#kvm-accelerated-android-tests).
+
 ### Flags & env
 
 | | |

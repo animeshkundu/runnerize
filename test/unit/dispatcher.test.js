@@ -243,6 +243,36 @@ test('is count-based, never job-pinned: mints one runner per unit of demand, no 
   });
 });
 
+test('KVM capability is one linux flavor: demand is counted once and labels reach JIT minting', async () => {
+  const flavor = new FakeFlavor({ labels: ['self-hosted', 'linux', 'x64', 'kvm'] });
+  flavor.behavior = holdingBehavior();
+  await runSession({
+    flavor,
+    options: { maxConcurrent: 10 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/kvm', private: true }],
+      runs: { 'me/kvm': [{ id: 1, status: 'queued' }] },
+      jobs: {
+        1: [
+          { status: 'queued', labels: ['self-hosted', 'linux', 'x64'] },
+          { status: 'queued', labels: ['self-hosted', 'linux', 'x64', 'kvm'] },
+        ],
+      },
+    },
+  }, async ({ start, flavor, stub }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 2));
+    await tick(80);
+    assert.equal(flavor.launches.length, 2, 'the capable linux flavor does not double-count either job');
+    const jitPosts = stub.callsMatching('POST', '/generate-jitconfig');
+    assert.equal(jitPosts.length, 2);
+    for (const post of jitPosts) {
+      assert.deepEqual(JSON.parse(post.body).labels, ['self-hosted', 'linux', 'x64', 'kvm']);
+    }
+  });
+});
+
 test('damps double-mint across polls: inflight unassigned is subtracted from demand', async () => {
   const flavor = new FakeFlavor();
   flavor.behavior = holdingBehavior(); // hold launches so unassigned stays elevated

@@ -292,10 +292,10 @@ export async function countQueuedMatchingJobs(
 ) {
   const repo = repoPath(fullName);
   const normalizedFlavorLabels = new Set(flavorLabels.map((label) => label.toLowerCase()));
-  const genericLabels = new Set(['self-hosted', 'x64', 'arm64']);
-  const osLabel = flavorLabels
-    .map((label) => label.toLowerCase())
-    .find((label) => !genericLabels.has(label));
+  const genericLabels = new Set(['self-hosted', 'x64', 'arm64', 'kvm']);
+  const osLabel = ['linux', 'windows', 'macos']
+    .find((label) => normalizedFlavorLabels.has(label))
+    ?? flavorLabels.map((label) => label.toLowerCase()).find((label) => !genericLabels.has(label));
   const runsById = new Map();
 
   for (const status of ['queued', 'in_progress']) {

@@ -67,7 +67,8 @@ src/dispatcher.js       runDispatcher(): the count-based loop
 | `src/dispatcher.js` | The core loop. `Semaphore` class, count-based demand math, `unassignedBy*` inflight maps, per-repo launch-failure backoff, startup + periodic reconcile, graceful drain. | `runDispatcher` |
 | `src/sandbox/index.js` | Flavor registry. | `detectFlavors`, re-exports `linux`/`windows`/`macos` |
 | `src/sandbox/container.js` | The `linux` flavor (the only working one). Picks a backend (native podman/docker, or WSL distro on Windows), pulls the fat image, stages the runner + `INNER_SCRIPT`, spawns the `--rm` container, runs the **idle watchdog**, detects job start from runner output. | `linux` |
-| `src/sandbox/windows.js`, `macos.js` | Stub flavors: `available()` returns `false`, `launch()` throws. Fill these in to add a backend. | `windows`, `macos` |
+| `src/sandbox/windows.js` | The `windows` flavor. Gated on `process.platform === 'win32'` and a working `wsb.exe`, so it only offers itself where Windows Sandbox exists. | `windows` |
+| `src/sandbox/macos.js` | The `macos` flavor, via Tart VMs. Gated on darwin + arm64, a `RUNNERIZE_MACOS_IMAGE`, and the `tart` CLI: clones a base image, polls SSH readiness, streams output. Capped at 2 concurrent VMs to match Apple's licensing. | `macos` |
 | `src/runner.js` | Fetch `actions/runner` latest release, **SHA-256-verify** the asset (digest field → `.sha256` asset → release body), extract, `xattr -c` on mac, atomic-rename into `~/.runnerize/runners`; ensure the fat image is present. | `latestRunnerVersion`, `ensureRunnerBinary`, `ensureImage` |
 | `src/platform.js` | `detectOS`/`detectArch`/`isWSL`; a stable `machineId` (sha256 of `/etc/machine-id`, `IOPlatformUUID`, or `MachineGuid`; falls back to a hostname hash). | `detectOS`, `detectArch`, `isWSL`, `machineId` |
 | `src/service.js` | Boot-service install/uninstall: systemd **user** unit (`KillMode=mixed` so a daemon restart does not kill in-flight `run.sh` children), launchd LaunchAgent, Windows service via `nssm.exe`. | `installService`, `uninstallService` |
@@ -219,6 +220,27 @@ claim it passed.
 - **No attribution to any AI/assistant** anywhere.
 - **Commit style:** imperative subject ("Add idle-watchdog force-settle"), no
   attribution trailers. See `CONTRIBUTING.md`.
+
+---
+
+## Dependency policy
+
+Pin to the latest stable of everything, unless there is a reason not to, and write that
+reason down where the pin lives.
+
+- **The zero-dependency rule is the standing exception, and it wins.** This package ships
+  no runtime and no dev dependencies, and it stays that way. "Latest stable" therefore
+  applies to the things this repo actually pins: GitHub Actions and the Node version in
+  workflows. Do not read this policy as licence to add a package.
+- **Verify, do not assume.** Check the real latest at the moment you pin, with
+  `gh api repos/actions/<name>/releases/latest -q .tag_name`. Never carry a version forward
+  by copying a neighbouring workflow — that is exactly how a repo drifts several majors
+  behind without anyone noticing.
+- **Keep the three workflows consistent.** `ci.yml`, `pages.yml`, and `publish.yml` should
+  pin the same major of a shared action. A version that differs between them should be
+  deliberate and commented, not an accident of whichever file was edited last.
+- **`engines` is intentionally permissive** (`>=20`) so consumers are not forced to upgrade.
+  That is a reason not to take latest, and it stays.
 
 ---
 
