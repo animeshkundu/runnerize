@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { ensureRunnerBinary } from '../runner.js';
 
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
-const DEFAULT_MAX_LIFETIME_MS = 6 * 60 * 60_000;
+const DEFAULT_MAX_LIFETIME_MS = 7 * 24 * 60 * 60_000;
 const WSB_TIMEOUT_MS = 60_000;
 const EXEC_READY_TIMEOUT_MS = 90_000;
 const EXEC_READY_POLL_MS = 2_000;
