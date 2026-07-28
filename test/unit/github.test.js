@@ -91,6 +91,82 @@ test('getToken makes DPAPI decrypt failures terminating PowerShell errors', asyn
   }
 });
 
+test('macOS daemon reads the persisted credential without spawning gh', async () => {
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  const prevHealth = process.env.RUNNERIZE_HEALTH_FILE;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const os = await import('node:os');
+  const home = mkdtempSync(join(tmpdir(), 'runnerize-github-macos-daemon-'));
+  const tokenPath = join(home, 'Library', 'Application Support', 'runnerize', 'credentials', 'gh-token');
+  mkdirSync(join(home, 'Library', 'Application Support', 'runnerize', 'credentials'), { recursive: true });
+  writeFileSync(tokenPath, 'daemon-token\n');
+  process.env.RUNNERIZE_HEALTH_FILE = join(home, 'health.json');
+  const exec = new ExecFileStub(() => { throw new Error('gh must not run'); }).install();
+  const restorePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'darwin' });
+  const originalHomedir = os.homedir;
+  const require = (await import('node:module')).createRequire(import.meta.url);
+  const nativeOs = require('node:os');
+  nativeOs.homedir = () => home;
+  const { syncBuiltinESMExports } = await import('node:module');
+  syncBuiltinESMExports();
+  const gh = await freshImport('../../src/github.js');
+  try {
+    assert.equal(await gh.getToken(), 'daemon-token');
+    assert.equal(exec.calls.length, 0);
+  } finally {
+    exec.restore();
+    nativeOs.homedir = originalHomedir;
+    syncBuiltinESMExports();
+    Object.defineProperty(process, 'platform', restorePlatform);
+    rmSync(home, { recursive: true, force: true });
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+    if (prevHealth === undefined) delete process.env.RUNNERIZE_HEALTH_FILE; else process.env.RUNNERIZE_HEALTH_FILE = prevHealth;
+  }
+});
+
+test('getToken falls back to the persisted macOS credential', async () => {
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const os = await import('node:os');
+  const home = mkdtempSync(join(tmpdir(), 'runnerize-github-macos-'));
+  const tokenPath = join(home, 'Library', 'Application Support', 'runnerize', 'credentials', 'gh-token');
+  mkdirSync(join(home, 'Library', 'Application Support', 'runnerize', 'credentials'), { recursive: true });
+  writeFileSync(tokenPath, 'persisted-token\n');
+  const exec = new ExecFileStub(() => { throw new Error('not authenticated'); }).install();
+  const restorePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'darwin' });
+  const originalHomedir = os.homedir;
+  const require = (await import('node:module')).createRequire(import.meta.url);
+  const nativeOs = require('node:os');
+  nativeOs.homedir = () => home;
+  const { syncBuiltinESMExports } = await import('node:module');
+  syncBuiltinESMExports();
+  const gh = await freshImport('../../src/github.js');
+  try {
+    assert.equal(await gh.getToken(), 'persisted-token');
+  } finally {
+    exec.restore();
+    nativeOs.homedir = originalHomedir;
+    syncBuiltinESMExports();
+    Object.defineProperty(process, 'platform', restorePlatform);
+    rmSync(home, { recursive: true, force: true });
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+  }
+});
+
 test('getUser returns login and type', async () => {
   await withGithub({ user: { login: 'alice', type: 'User' } }, async (gh) => {
     assert.deepEqual(await gh.getUser(), { login: 'alice', type: 'User' });

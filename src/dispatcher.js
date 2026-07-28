@@ -1,3 +1,5 @@
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import {
   countQueuedMatchingJobs,
   deleteRunner,
@@ -258,6 +260,17 @@ export async function runDispatcher({
   const wakeLock = keepAwake ? keepHostAwake() : null;
   const guardLease = hostGuard ? await acquireGuardLease() : null;
   log('dispatcher_started', { maxConcurrent, pollIntervalMs, idleTimeoutMs });
+  if (process.env.RUNNERIZE_HEALTH_FILE) {
+    const healthFile = process.env.RUNNERIZE_HEALTH_FILE;
+    const temporary = `${healthFile}.${process.pid}.tmp`;
+    mkdirSync(dirname(healthFile), { recursive: true });
+    writeFileSync(temporary, JSON.stringify({
+      generation: process.env.RUNNERIZE_HEALTH_GENERATION,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+    }));
+    renameSync(temporary, healthFile);
+  }
 
   try {
     while (!signal?.aborted) {

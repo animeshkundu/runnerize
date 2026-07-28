@@ -85,6 +85,37 @@ function holdingBehavior({ markStarted = false } = {}) {
   return (launch) => { if (markStarted) launch.markStarted(); /* never settle */ };
 }
 
+test('runDispatcher writes the launchd health heartbeat atomically', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const directory = mkdtempSync(join(tmpdir(), 'runnerize-health-'));
+  const healthFile = join(directory, 'state', 'health.json');
+  const previousFile = process.env.RUNNERIZE_HEALTH_FILE;
+  const previousGeneration = process.env.RUNNERIZE_HEALTH_GENERATION;
+  process.env.RUNNERIZE_HEALTH_FILE = healthFile;
+  process.env.RUNNERIZE_HEALTH_GENERATION = 'install-generation';
+  const flavor = new FakeFlavor();
+  try {
+    await runSession({
+      flavor,
+      github: { user: { login: 'me', type: 'User' }, repos: [] },
+    }, async ({ start }) => {
+      start();
+      assert.ok(await waitFor(() => {
+        try { return JSON.parse(readFileSync(healthFile, 'utf8')).generation === 'install-generation'; } catch { return false; }
+      }));
+      const health = JSON.parse(readFileSync(healthFile, 'utf8'));
+      assert.equal(health.pid, process.pid);
+      assert.ok(!Number.isNaN(Date.parse(health.startedAt)));
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    if (previousFile === undefined) delete process.env.RUNNERIZE_HEALTH_FILE; else process.env.RUNNERIZE_HEALTH_FILE = previousFile;
+    if (previousGeneration === undefined) delete process.env.RUNNERIZE_HEALTH_GENERATION; else process.env.RUNNERIZE_HEALTH_GENERATION = previousGeneration;
+  }
+});
+
 test('runDispatcher validates its numeric options', async () => {
   const signal = new AbortController().signal;
   await assert.rejects(() => runDispatcher({ maxConcurrent: 0, signal }), TypeError);

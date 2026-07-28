@@ -1,7 +1,11 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, platform } from 'node:os';
-import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import {
+  closeSync, cpSync, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, readFileSync,
+  renameSync, rmSync, writeFileSync,
+} from 'node:fs';
+import { arch, homedir, platform } from 'node:os';
+import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getToken } from './github.js';
 import { installGuard, uninstallGuard } from './guard.js';
@@ -9,6 +13,9 @@ import { installGuard, uninstallGuard } from './guard.js';
 const SERVICE_NAME = 'runnerize';
 const DEFAULT_WSL_NODE_VERSION = 'v24.18.0';
 const DEFAULT_WSL_NODE_SHA256 = '55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742';
+const DEFAULT_MACOS_NODE_VERSION = DEFAULT_WSL_NODE_VERSION;
+const DEFAULT_MACOS_NODE_SHA256_ARM64 = 'e1a97e14c99c803e96c7339403282ea05a499c32f8d83defe9ef5ec66f979ed1';
+const DEFAULT_MACOS_NODE_SHA256_X64 = 'dfd0dbd3e721503434df7b7205e719f61b3a3a31b2bcf9729b8b91fea240f080';
 const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
 const packageRoot = dirname(dirname(binPath));
 const ELEVATION_TIMEOUT_MS = 55_000;
@@ -192,6 +199,11 @@ async function auditMacosPrerequisites() {
     if (commandExists('brew')) {
       console.log('tart was not found; installing it with Homebrew...');
       try {
+        // Recent Homebrew refuses to load a tap's formulae (tart depends on
+        // cirruslabs/cli/softnet) until the tap is trusted. Trust it first; this is a no-op on
+        // Homebrew versions that predate `brew trust`, where the install already worked.
+        console.log('Trusting the cirruslabs Homebrew tap so tart and its softnet dependency can install...');
+        spawnSync('brew', ['trust', 'cirruslabs/cli'], { stdio: 'ignore', windowsHide: true, timeout: PROBE_TIMEOUT_MS });
         run('brew', ['install', 'cirruslabs/cli/tart'], { timeout: INSTALL_TIMEOUT_MS });
         tartReady = commandExists('tart');
       } catch (error) {
@@ -237,62 +249,326 @@ async function auditMacosPrerequisites() {
   return { tartReady, imageReady };
 }
 
-function launchdEnvironmentXml() {
-  const entries = MACOS_ENVIRONMENT_KEYS
-    .filter((key) => process.env[key])
-    .map((key) => `    <key>${key}</key><string>${xmlEscape(process.env[key])}</string>`);
-  if (!entries.length) return '';
-  return `  <key>EnvironmentVariables</key>\n  <dict>\n${entries.join('\n')}\n  </dict>\n`;
+function macosDataPath(...parts) {
+  return join(homedir(), 'Library', 'Application Support', 'runnerize', ...parts);
+}
+
+function materializeMacosApp() {
+  const root = macosDataPath();
+  const destination = join(root, 'app');
+  const temporary = join(root, `app.new.${process.pid}`);
+  const old = join(root, `app.old.${process.pid}`);
+  mkdirSync(root, { recursive: true });
+  const leftovers = readdirSync(root).filter((entry) => /^app\.(?:new|old)\./.test(entry));
+  if (!existsSync(destination)) {
+    const recoverable = leftovers.filter((entry) => entry.startsWith('app.old.')).sort().at(-1);
+    if (recoverable) renameSync(join(root, recoverable), destination);
+  }
+  for (const entry of leftovers) {
+    if (existsSync(join(root, entry))) rmSync(join(root, entry), { recursive: true, force: true });
+  }
+  rmSync(temporary, { recursive: true, force: true });
+  mkdirSync(temporary, { recursive: true });
+  for (const entry of ['bin', 'src', 'package.json']) {
+    cpSync(join(packageRoot, entry), join(temporary, entry), { recursive: true });
+  }
+  rmSync(old, { recursive: true, force: true });
+  if (existsSync(destination)) renameSync(destination, old);
+  try {
+    renameSync(temporary, destination);
+  } catch (error) {
+    rmSync(temporary, { recursive: true, force: true });
+    if (existsSync(old)) renameSync(old, destination);
+    throw error;
+  }
+  return { root: destination, bin: join(destination, 'bin', 'runnerize.js'), old };
+}
+
+function validateMacosNode(nodePath) {
+  if (!isAbsolute(nodePath)) throw new Error('RUNNERIZE_MACOS_NODE must be an absolute path.');
+  const result = captureResult(nodePath, ['--version'], { timeout: PROBE_TIMEOUT_MS });
+  const version = result.stdout.trim();
+  if (result.status !== 0 || !validNodeVersion(version) || Number(version.match(/^v(\d+)/)?.[1]) < 20) {
+    throw new Error(`RUNNERIZE_MACOS_NODE must point to Node.js 20 or newer: ${nodePath}`);
+  }
+  return nodePath;
+}
+
+function ensureMacosNode() {
+  const version = process.env.RUNNERIZE_MACOS_NODE_VERSION || DEFAULT_MACOS_NODE_VERSION;
+  if (!/^v\d+\.\d+\.\d+$/.test(version)) throw new Error('RUNNERIZE_MACOS_NODE_VERSION must look like v24.18.0.');
+  const machineArch = arch();
+  if (!['arm64', 'x64'].includes(machineArch)) throw new Error(`Unsupported macOS architecture for Node.js: ${machineArch}`);
+  const installDir = macosDataPath('node', version);
+  const nodePath = join(installDir, 'bin', 'node');
+  const cached = captureResult(nodePath, ['--version'], { timeout: PROBE_TIMEOUT_MS });
+  if (cached.status === 0 && cached.stdout.trim() === version && validNodeVersion(cached.stdout.trim())) return nodePath;
+
+  const defaultHash = machineArch === 'arm64' ? DEFAULT_MACOS_NODE_SHA256_ARM64 : DEFAULT_MACOS_NODE_SHA256_X64;
+  const expectedHash = version === DEFAULT_MACOS_NODE_VERSION
+    ? (process.env.RUNNERIZE_MACOS_NODE_SHA256 || defaultHash)
+    : process.env.RUNNERIZE_MACOS_NODE_SHA256;
+  if (!/^[a-fA-F0-9]{64}$/.test(expectedHash || '')) {
+    throw new Error('Custom RUNNERIZE_MACOS_NODE_VERSION requires RUNNERIZE_MACOS_NODE_SHA256.');
+  }
+  const script = [
+    'set -eu',
+    'version="$1"',
+    'machine="$2"',
+    'destination="$3"',
+    'expected="$4"',
+    'archive="node-${version}-darwin-${machine}.tar.gz"',
+    'base="https://nodejs.org/dist/${version}"',
+    'temporary="$(mktemp -d)"',
+    "trap 'rm -rf \"$temporary\" \"${destination}.new.$$\"' EXIT INT TERM HUP",
+    'curl -fsSL "$base/$archive" -o "$temporary/$archive"',
+    'printf "%s  %s\\n" "$expected" "$temporary/$archive" | shasum -a 256 -c -',
+    'staging="${destination}.new.$$"',
+    'backup="${destination}.bak.$$"',
+    'mkdir -p "$staging"',
+    'tar -xzf "$temporary/$archive" --strip-components=1 -C "$staging"',
+    'mkdir -p "$(dirname "$destination")"',
+    'rm -rf "$backup"',
+    'if [ -e "$destination" ]; then mv "$destination" "$backup"; fi',
+    'if ! mv "$staging" "$destination"; then if [ -e "$backup" ]; then mv "$backup" "$destination"; fi; exit 1; fi',
+    'rm -rf "$backup"',
+  ].join('\n');
+  run('bash', ['-c', script, 'runnerize-node-install', version, machineArch, installDir, expectedHash.toLowerCase()], { timeout: INSTALL_TIMEOUT_MS });
+  const verified = captureResult(nodePath, ['--version'], { timeout: PROBE_TIMEOUT_MS });
+  if (verified.status !== 0 || verified.stdout.trim() !== version || !validNodeVersion(verified.stdout.trim())) {
+    throw new Error(`Installed Node at ${nodePath}, but version verification failed.`);
+  }
+  return nodePath;
+}
+
+function resolveDurableNode() {
+  if (process.env.RUNNERIZE_MACOS_NODE) return validateMacosNode(process.env.RUNNERIZE_MACOS_NODE);
+  const managed = /\/(?:\.nvm|\.fnm|\.volta|\.asdf)\/|\/versions\/node\//.test(process.execPath);
+  return managed ? ensureMacosNode() : process.execPath;
+}
+
+function commandPath(command) {
+  const result = captureResult('sh', ['-c', 'command -v "$1"', 'sh', command], { timeout: PROBE_TIMEOUT_MS });
+  return result.status === 0 && isAbsolute(result.stdout.trim()) ? result.stdout.trim() : null;
+}
+
+function macosServicePath(nodePath) {
+  const nodeDirectory = dirname(nodePath);
+  const directories = nodeDirectory.startsWith('/') ? [nodeDirectory] : [];
+  for (const tool of ['gh', 'tart', 'podman', 'docker']) {
+    const path = commandPath(tool);
+    const directory = path && dirname(path);
+    if (directory?.startsWith('/')) directories.push(directory);
+  }
+  if (arch() === 'arm64') directories.push('/opt/homebrew/bin', '/opt/homebrew/sbin');
+  else directories.push('/usr/local/bin', '/usr/local/sbin');
+  directories.push('/usr/local/bin', '/usr/local/sbin', '/usr/bin', '/bin', '/usr/sbin', '/sbin');
+  return [...new Set(directories)].join(':');
+}
+
+function persistMacosToken(token) {
+  const directory = macosDataPath('credentials');
+  const tokenPath = join(directory, 'gh-token');
+  const temporary = join(directory, `.gh-token.${process.pid}.${randomUUID()}`);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  let descriptor;
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600);
+    fchmodSync(descriptor, 0o600);
+    writeFileSync(descriptor, `${token.trim()}\n`, 'utf8');
+    const fd = descriptor;
+    descriptor = undefined;
+    closeSync(fd);
+    renameSync(temporary, tokenPath);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    rmSync(temporary, { force: true });
+  }
+  return tokenPath;
+}
+
+function macosEnvironmentValue(key) {
+  const value = process.env[key];
+  if (key === 'RUNNERIZE_MACOS_SSH_KEY' && value?.startsWith('~/')) return join(homedir(), value.slice(2));
+  return value;
+}
+
+function launchdEnvironmentXml(pathValue, healthGeneration, healthFile) {
+  const entries = [['PATH', pathValue], ...MACOS_ENVIRONMENT_KEYS
+    .map((key) => [key, macosEnvironmentValue(key)])
+    .filter(([, value]) => value),
+  ['RUNNERIZE_HEALTH_GENERATION', healthGeneration], ['RUNNERIZE_HEALTH_FILE', healthFile]];
+  return `  <key>EnvironmentVariables</key>\n  <dict>\n${entries.map(([key, value]) => `    <key>${key}</key><string>${xmlEscape(value)}</string>`).join('\n')}\n  </dict>\n`;
+}
+
+function guiDomainAvailable(domain) {
+  return captureResult('launchctl', ['print', domain], { timeout: PROBE_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).status === 0;
+}
+
+function launchctlHealthy(domain, label) {
+  const result = captureResult('launchctl', ['print', `${domain}/${label}`], { timeout: PROBE_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+  if (result.status !== 0) return null;
+  const pid = Number.parseInt(result.stdout.match(/\bpid\s*=\s*(\d+)/)?.[1], 10);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  return pid;
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function launchdReady(domain, label, healthFile, generation) {
+  const pollMs = Number(process.env.RUNNERIZE_MACOS_HEALTH_POLL_MS ?? 1000);
+  const stableMs = Number(process.env.RUNNERIZE_MACOS_HEALTH_STABLE_MS ?? 10_000);
+  const deadlineMs = Number(process.env.RUNNERIZE_MACOS_HEALTH_TIMEOUT_MS ?? 22_000);
+  const deadline = Date.now() + deadlineMs;
+  let stablePid;
+  let stableSince;
+  while (Date.now() <= deadline) {
+    let health;
+    try { health = JSON.parse(readFileSync(healthFile, 'utf8')); } catch { health = null; }
+    const pid = launchctlHealthy(domain, label);
+    if (health?.generation === generation && health.pid === pid && pid) {
+      if (stablePid !== pid) {
+        stablePid = pid;
+        stableSince = Date.now();
+      }
+      if (Date.now() - stableSince >= stableMs) return true;
+    } else {
+      stablePid = undefined;
+      stableSince = undefined;
+    }
+    if (Date.now() >= deadline) break;
+    await delay(Math.max(0, pollMs));
+  }
+  return false;
+}
+
+function restoreMacosApp(installation) {
+  rmSync(installation.root, { recursive: true, force: true });
+  if (existsSync(installation.old)) renameSync(installation.old, installation.root);
+}
+
+function rollbackMacosInstall({ installation, agentPath, oldPlist, domain }) {
+  spawnSync('launchctl', ['bootout', domain, agentPath], { stdio: 'ignore' });
+  restoreMacosApp(installation);
+  if (oldPlist === null) rmSync(agentPath, { force: true });
+  else writeFileSync(agentPath, oldPlist, { mode: 0o644 });
+  if (oldPlist !== null) {
+    const result = spawnSync('launchctl', ['bootstrap', domain, agentPath], { stdio: 'ignore' });
+    if (result.status !== 0) console.warn('The previous launchd agent could not be restarted during rollback.');
+  }
 }
 
 async function installLaunchd() {
+  if (process.getuid?.() === 0 || process.env.SUDO_USER) throw new Error('Do not install the macOS service with sudo. Run it as the signed-in user.');
   const audit = await auditMacosPrerequisites();
-  let runnable = false;
-  try {
-    await preflightRun();
-    runnable = true;
-  } catch (error) {
-    if (audit.tartReady && audit.imageReady) {
-      if (!nativeGitHubCredentialAvailable()) throw error;
-      runnable = true;
-      console.warn(`Linux backend unavailable: ${error.message}`);
-    } else {
-      throw error;
-    }
+  let token;
+  try { token = await getToken(); } catch (error) {
+    throw new Error(`GitHub authentication is not available.\n${GITHUB_AUTH_GUIDANCE}`, { cause: error });
   }
-  if (!runnable) throw new Error('No runnerize backend is available on this macOS host.');
-  const agentPath = join(homedir(), 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist');
-  mkdirSync(dirname(agentPath), { recursive: true });
-  writeFileSync(agentPath, `<?xml version="1.0" encoding="UTF-8"?>
+  const runtime = nativeRuntime();
+  if (!runtime && !(audit.tartReady && process.env.RUNNERIZE_MACOS_IMAGE)) {
+    throw new Error('No runnerize backend is available on this macOS host.');
+  }
+  if (!runtime) console.warn('Linux backend unavailable: no working rootless Podman or Docker runtime was found.');
+
+  const nodePath = resolveDurableNode();
+  const pathValue = macosServicePath(nodePath);
+  persistMacosToken(token);
+  const installation = materializeMacosApp();
+  const label = 'io.runnerize.dispatcher';
+  const agentPath = join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+  const logPath = join(homedir(), 'Library', 'Logs', 'runnerize.log');
+  const healthFile = macosDataPath('state', 'health.json');
+  const generation = randomUUID();
+  const temporary = `${agentPath}.new.${process.pid}`;
+  let transactionHandled = false;
+  try {
+    run(nodePath, [installation.bin, '--help'], { timeout: PROBE_TIMEOUT_MS });
+    mkdirSync(dirname(agentPath), { recursive: true });
+    mkdirSync(dirname(logPath), { recursive: true });
+    mkdirSync(dirname(healthFile), { recursive: true });
+    rmSync(healthFile, { force: true });
+    writeFileSync(temporary, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>io.runnerize.dispatcher</string>
+  <key>Label</key><string>${label}</string>
   <key>ProgramArguments</key>
-  <array><string>${xmlEscape(process.execPath)}</string><string>${xmlEscape(binPath)}</string><string>run</string></array>
+  <array><string>${xmlEscape(nodePath)}</string><string>${xmlEscape(installation.bin)}</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-${launchdEnvironmentXml()}  <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>${xmlEscape(join(homedir(), 'Library', 'Logs', 'runnerize.log'))}</string>
-  <key>StandardErrorPath</key><string>${xmlEscape(join(homedir(), 'Library', 'Logs', 'runnerize.log'))}</string>
+${launchdEnvironmentXml(pathValue, generation, healthFile)}  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>${xmlEscape(logPath)}</string>
+  <key>StandardErrorPath</key><string>${xmlEscape(logPath)}</string>
 </dict>
 </plist>
 `, { mode: 0o644 });
+    run('plutil', ['-lint', temporary], { timeout: PROBE_TIMEOUT_MS });
 
-  const domain = `gui/${process.getuid()}`;
-  spawnSync('launchctl', ['bootout', domain, agentPath], { stdio: 'ignore' });
-  run('launchctl', ['bootstrap', domain, agentPath]);
-  console.log(`Installed and started ${agentPath}`);
-  console.log(`View logs: tail -f ${join(homedir(), 'Library', 'Logs', 'runnerize.log')}`);
+    const domain = `gui/${process.getuid()}`;
+    if (!guiDomainAvailable(domain)) {
+      renameSync(temporary, agentPath);
+      rmSync(installation.old, { recursive: true, force: true });
+      console.log(`Installed ${agentPath}; it will start at the next desktop login because ${domain} is unavailable.`);
+      return;
+    }
+
+    const oldPlist = existsSync(agentPath) ? readFileSync(agentPath) : null;
+    renameSync(temporary, agentPath);
+    try {
+      spawnSync('launchctl', ['bootout', domain, agentPath], { stdio: 'ignore' });
+      run('launchctl', ['enable', `${domain}/${label}`]);
+      run('launchctl', ['bootstrap', domain, agentPath]);
+      run('launchctl', ['kickstart', '-k', `${domain}/${label}`]);
+      if (!await launchdReady(domain, label, healthFile, generation)) throw new Error('The launchd agent did not become healthy.');
+    } catch (error) {
+      transactionHandled = true;
+      rollbackMacosInstall({ installation, agentPath, oldPlist, domain });
+      const tail = captureResult('tail', ['-n', '40', logPath], { timeout: PROBE_TIMEOUT_MS });
+      const diagnosis = tail.stdout.trim() || tail.stderr.trim() || 'No log output was available.';
+      throw new Error(`${error.message}\nLast 40 log lines:\n${diagnosis}`, { cause: error });
+    }
+    rmSync(installation.old, { recursive: true, force: true });
+    console.log(`Installed and started ${agentPath}`);
+    console.log(`View logs: tail -f ${logPath}`);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    if (!transactionHandled) restoreMacosApp(installation);
+    throw error;
+  }
 }
 
-function uninstallLaunchd() {
-  const agentPath = join(homedir(), 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist');
-  if (existsSync(agentPath)) {
-    spawnSync('launchctl', ['bootout', `gui/${process.getuid()}`, agentPath], { stdio: 'inherit' });
+function processGone(pid) {
+  if (!pid) return true;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error.code === 'ESRCH';
+  }
+}
+
+async function uninstallLaunchd() {
+  const label = 'io.runnerize.dispatcher';
+  const domain = `gui/${process.getuid()}`;
+  const target = `${domain}/${label}`;
+  const agentPath = join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+  const loaded = () => captureResult('launchctl', ['print', target], { timeout: PROBE_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).status === 0;
+  const pid = launchctlHealthy(domain, label);
+  if (existsSync(agentPath)) spawnSync('launchctl', ['bootout', domain, agentPath], { stdio: 'ignore' });
+  if (loaded()) spawnSync('launchctl', ['bootout', target], { stdio: 'ignore' });
+  for (let attempt = 0; attempt < 5 && (loaded() || !processGone(pid)); attempt += 1) await delay(100);
+  if (loaded() || !processGone(pid)) {
+    console.warn(`The launchd job or dispatcher process is still running. Run \`launchctl bootout ${target}\`, then rerun uninstall.`);
+    rmSync(agentPath, { force: true });
+    return;
   }
   rmSync(agentPath, { force: true });
-  console.log(`Removed ${agentPath}`);
+  rmSync(macosDataPath(), { recursive: true, force: true });
+  rmSync(join(homedir(), 'Library', 'Logs', 'runnerize.log'), { force: true });
+  console.log('Removed the macOS launchd agent, package copy, pinned Node, credential, state, and log.');
 }
 
 export function powershellLiteral(value) {

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { homedir, hostname as osHostname } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -125,6 +125,16 @@ async function paginated(pathForPage, etagPrefix, selectItems = (data) => data, 
   }
 }
 
+function readMacosPersistedToken() {
+  const tokenPath = join(homedir(), 'Library', 'Application Support', 'runnerize', 'credentials', 'gh-token');
+  try {
+    if (!lstatSync(tokenPath).isFile()) return null;
+    return readFileSync(tokenPath, 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getToken({ signal } = {}) {
   if (cachedToken) return cachedToken;
   if (signal?.aborted) throw abortError(signal);
@@ -132,6 +142,13 @@ export async function getToken({ signal } = {}) {
   const envToken = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
   if (envToken) {
     cachedToken = envToken;
+    return cachedToken;
+  }
+
+  if (process.platform === 'darwin' && process.env.RUNNERIZE_HEALTH_FILE) {
+    const token = readMacosPersistedToken();
+    if (!token) throw new Error('No persisted macOS GitHub token is available');
+    cachedToken = token;
     return cachedToken;
   }
 
@@ -147,6 +164,12 @@ export async function getToken({ signal } = {}) {
     cachedToken = token;
     return cachedToken;
   } catch (error) {
+    if (process.platform === 'darwin') {
+      const token = readMacosPersistedToken();
+      if (!token) throw error;
+      cachedToken = token;
+      return cachedToken;
+    }
     if (process.platform !== 'win32') throw error;
     const tokenPath = join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'runnerize', 'windows.token');
     if (!existsSync(tokenPath)) throw error;
