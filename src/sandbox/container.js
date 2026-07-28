@@ -10,7 +10,7 @@ import { ensureImage, ensureRunnerBinary } from '../runner.js';
 // bare short name; docker is lenient, so this stays correct there too).
 const DEFAULT_IMAGE = 'docker.io/catthehacker/ubuntu:full-latest';
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
-const DEFAULT_MAX_LIFETIME_MS = 6 * 60 * 60_000;
+const DEFAULT_MAX_LIFETIME_MS = 7 * 24 * 60 * 60_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const KILL_GRACE_MS = 1_000;
 const FORCE_SETTLE_MS = 7_000;
@@ -216,7 +216,7 @@ cp -a /rsrc/. "$workdir/"
 cd "$workdir"
 rm -rf _work _diag .runner .credentials*
 export RUNNER_ALLOW_RUNASROOT=1
-exec timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-21600}s" ./run.sh --jitconfig "$JITCFG"
+exec timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-604800}s" ./run.sh --jitconfig "$JITCFG"
 `;
 
 export const linux = {

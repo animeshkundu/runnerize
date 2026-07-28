@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { latestRunnerVersion } from '../runner.js';
 
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
-const DEFAULT_MAX_LIFETIME_MS = 6 * 60 * 60_000;
+const DEFAULT_MAX_LIFETIME_MS = 7 * 24 * 60 * 60_000;
 const COMMAND_TIMEOUT_MS = 300_000;
 const READINESS_TIMEOUT_MS = 120_000;
 const READINESS_POLL_MS = 2_000;

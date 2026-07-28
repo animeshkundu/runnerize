@@ -14,7 +14,7 @@ import { createGuardLease } from './guard.js';
 const RUNNER_NAME_PREFIX = runnerNamePrefix();
 const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
 const DEFAULT_DRAIN_TIMEOUT_MS = 15 * 60_000;
-const DEFAULT_RUNNER_MAX_LIFETIME_MS = 6 * 60 * 60_000;
+const DEFAULT_RUNNER_MAX_LIFETIME_MS = 7 * 24 * 60 * 60_000;
 const DRAIN_HOOK_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_MAX_INTERVAL_MS = 120_000;
 const POLL_JITTER = 0.25;

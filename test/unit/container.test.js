@@ -327,7 +327,7 @@ test('INNER_SCRIPT invariant: operates on a throwaway workdir, never the read-on
 test('WSL forwards the max lifetime and the inner script has a defensive default', async () => {
   const source = await readContainerSource();
   assert.match(source, /WSLENV: `\$\{existing\}JITCFG:MAX_LIFETIME_SECONDS`/);
-  assert.match(extractInnerScript(source), /MAX_LIFETIME_SECONDS:-21600/);
+  assert.match(extractInnerScript(source), /MAX_LIFETIME_SECONDS:-604800/);
 });
 
 test('mounted INNER_SCRIPT is readable by a non-owner container user', async () => {
