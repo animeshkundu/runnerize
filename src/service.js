@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ const DEFAULT_WSL_NODE_VERSION = 'v24.18.0';
 const DEFAULT_WSL_NODE_SHA256 = '55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742';
 const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
 const packageRoot = dirname(dirname(binPath));
+const SERVICE_PACKAGE_ENTRIES = ['bin', 'src', 'package.json'];
 const ELEVATION_TIMEOUT_MS = 55_000;
 const PROBE_TIMEOUT_MS = 10_000;
 const INSTALL_TIMEOUT_MS = 120_000;
@@ -110,14 +111,59 @@ function nativeGitHubCredentialAvailable() {
   return result.status === 0 && Boolean(result.stdout?.trim());
 }
 
+function systemdAppPath(...parts) {
+  return join(homedir(), '.local', 'share', `${SERVICE_NAME}-service`, ...parts);
+}
+
+function servicePackageManifest() {
+  const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(manifest.version)) {
+    throw new Error('runnerize package version is invalid.');
+  }
+  const runtimeDependencies = [manifest.dependencies, manifest.optionalDependencies]
+    .flatMap((dependencies) => Object.keys(dependencies ?? {}));
+  if (runtimeDependencies.length) {
+    throw new Error(`runnerize service installation does not support runtime dependencies: ${runtimeDependencies.join(', ')}`);
+  }
+  return manifest;
+}
+
+function copyServicePackage(destination, manifest = servicePackageManifest()) {
+  for (const entry of SERVICE_PACKAGE_ENTRIES) {
+    cpSync(join(packageRoot, entry), join(destination, entry), { recursive: true });
+  }
+  return manifest;
+}
+
+function materializeSystemdApp() {
+  const manifest = servicePackageManifest();
+  const releases = systemdAppPath('releases');
+  mkdirSync(releases, { recursive: true });
+  const destination = mkdtempSync(join(releases, `${manifest.version}.`));
+  try {
+    copyServicePackage(destination);
+  } catch (error) {
+    rmSync(destination, { recursive: true, force: true });
+    throw error;
+  }
+  return { root: destination, bin: join(destination, 'bin', 'runnerize.js') };
+}
+
 async function installSystemd() {
   await preflightRun();
   const unitName = `${SERVICE_NAME}.service`;
   const wasActive = captureResult('systemctl', ['--user', 'is-active', '--quiet', unitName]).status === 0;
+  // npx runs packages from its disposable cache; keep the service executable independent of it.
+  const installation = materializeSystemdApp();
   const unitPath = join(homedir(), '.config', 'systemd', 'user', unitName);
-  const environmentFile = process.env.RUNNERIZE_SYSTEMD_ENV_FILE
-    ? `EnvironmentFile=-${process.env.RUNNERIZE_SYSTEMD_ENV_FILE}\n`
+  const environmentFilePath = process.env.RUNNERIZE_SYSTEMD_ENV_FILE;
+  if (environmentFilePath && /[\r\n]/.test(environmentFilePath)) {
+    throw new Error('RUNNERIZE_SYSTEMD_ENV_FILE cannot contain a newline.');
+  }
+  const environmentFile = environmentFilePath
+    ? `EnvironmentFile=-${quoteSystemd(environmentFilePath)}\n`
     : '';
+  const runOnly = process.env.RUNNERIZE_SERVICE_RUN_ONLY;
   mkdirSync(dirname(unitPath), { recursive: true });
   writeFileSync(unitPath, `[Unit]
 Description=runnerize ephemeral GitHub Actions dispatcher
@@ -126,7 +172,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(binPath)} run${process.env.RUNNERIZE_SERVICE_RUN_ONLY ? ` --only ${process.env.RUNNERIZE_SERVICE_RUN_ONLY}` : ''}
+ExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(installation.bin)} run${runOnly ? ` --only ${quoteSystemd(runOnly)}` : ''}
 ${environmentFile}Restart=always
 RestartSec=5
 KillMode=mixed
@@ -157,6 +203,7 @@ function uninstallSystemd() {
     });
   }
   rmSync(unitPath, { force: true });
+  rmSync(systemdAppPath(), { recursive: true, force: true });
   if (commandExists('systemctl')) run('systemctl', ['--user', 'daemon-reload']);
   console.log(`Removed ${unitPath}`);
 }
@@ -529,6 +576,7 @@ function ensureWslNode({ distro, user, home }) {
 }
 
 function materializeRunnerize({ distro, user, home }) {
+  servicePackageManifest();
   const destination = `${home}/.local/share/runnerize`;
   const windowsRoot = capture('wsl.exe', ['-d', distro, '-u', user, '-e', 'wslpath', '-a', packageRoot]);
   const script = [
@@ -538,7 +586,7 @@ function materializeRunnerize({ distro, user, home }) {
     'temporary="${destination}.new.$$"',
     'rm -rf "$temporary"',
     'mkdir -p "$temporary"',
-    'cp -R "$source/bin" "$source/src" "$source/package.json" "$temporary/"',
+    `cp -R ${SERVICE_PACKAGE_ENTRIES.map((entry) => `"$source/${entry}"`).join(' ')} "$temporary/"`,
     'old="${destination}.old.$$"',
     'rm -rf "$old"',
     'if [ -e "$destination" ]; then mv "$destination" "$old"; fi',
@@ -874,6 +922,7 @@ function wslTriggerSpec(context) {
 }
 
 function materializeWindowsApp() {
+  servicePackageManifest();
   const root = windowsDataPath();
   const destination = join(root, 'app');
   const temporary = join(root, `app.new.${process.pid}`);
@@ -881,9 +930,7 @@ function materializeWindowsApp() {
   mkdirSync(root, { recursive: true });
   rmSync(temporary, { recursive: true, force: true });
   mkdirSync(temporary, { recursive: true });
-  for (const entry of ['bin', 'src', 'package.json']) {
-    cpSync(join(packageRoot, entry), join(temporary, entry), { recursive: true });
-  }
+  copyServicePackage(temporary);
   rmSync(old, { recursive: true, force: true });
   if (existsSync(destination)) renameSync(destination, old);
   try {

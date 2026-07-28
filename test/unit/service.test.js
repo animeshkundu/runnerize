@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -257,7 +257,7 @@ async function withLinuxService({ active = false } = {}, action) {
   const restore = installStubs({ exec, spawn, platformName: 'linux', home });
   try {
     const service = await freshImport('../../src/service.js');
-    await action(service, calls);
+    await action(service, calls, home);
   } finally {
     restore();
     rmSync(home, { recursive: true, force: true });
@@ -266,9 +266,29 @@ async function withLinuxService({ active = false } = {}, action) {
   }
 }
 
-test('systemd reinstall restarts an active dispatcher', async () => {
-  await withLinuxService({ active: true }, async (service, calls) => {
+test('systemd install materializes a cache-independent package release', async () => {
+  await withLinuxService({}, async (service, calls, home) => {
     await service.installService();
+    const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
+    const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+    const release = join(releases, readdirSync(releases)[0]);
+    assert.ok(unit.replaceAll('\\\\', '\\').includes(join(release, 'bin', 'runnerize.js')));
+    assert.ok(existsSync(join(release, 'src', 'service.js')));
+    assert.ok(existsSync(join(release, 'package.json')));
+  });
+});
+
+test('systemd reinstall creates a new immutable release and restarts an active dispatcher', async () => {
+  await withLinuxService({ active: true }, async (service, calls, home) => {
+    await service.installService();
+    const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+    const firstRelease = readdirSync(releases)[0];
+
+    await service.installService();
+
+    const installed = readdirSync(releases);
+    assert.equal(installed.length, 2);
+    assert.ok(installed.includes(firstRelease));
     assert.ok(calls.some((call) => call.file === 'systemctl'
       && call.args.join(' ') === '--user restart runnerize.service'));
     assert.ok(!calls.some((call) => call.file === 'systemctl'
@@ -283,6 +303,18 @@ test('systemd first install starts without restarting', async () => {
       && call.args.join(' ') === '--user start runnerize.service'));
     assert.ok(!calls.some((call) => call.file === 'systemctl'
       && call.args.join(' ') === '--user restart runnerize.service'));
+  });
+});
+
+test('systemd uninstall removes private package releases', async () => {
+  await withLinuxService({}, async (service, _calls, home) => {
+    await service.installService();
+    const installation = join(home, '.local', 'share', 'runnerize-service');
+    assert.ok(existsSync(installation));
+
+    await service.uninstallService();
+
+    assert.equal(existsSync(installation), false);
   });
 });
 
