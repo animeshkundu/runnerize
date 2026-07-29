@@ -30,7 +30,7 @@ Usage:
   runnerize --help
 
 Options:
-  --max <n>              Maximum concurrent runners (default: 4)
+  --max <n>              Maximum concurrent runners (default: 5)
   --interval <ms>        Poll interval in milliseconds (default: 15000)
   --idle-timeout <ms>    Kill an unclaimed runner after this time (default: 120000)
   --only <csv>           Serve only these flavors: linux, windows, macos

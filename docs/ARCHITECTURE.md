@@ -33,13 +33,14 @@ mints **ephemeral, just-in-time** runners on demand and lets nothing persist.
    │    flavors ← sandbox.detectFlavors()                                     │
    │    for each flavor:                                                      │
    │      demand   = Σ github.countQueuedMatchingJobs(repo, flavor.labels)    │
-   │      toMint   = clamp(demand − unassigned, 0, semaphore.free())          │
-   │      repeat toMint times, picking a repo with unmet demand:              │
+   │      if demand > unassigned and capacity is free:                        │
+   │        pick one repo with unmet demand                                   │
    │        if !github.isStillPrivate(repo): skip     ── FAIL-CLOSED          │
    │        semaphore.acquire(); mark unassigned                              │
    │        jit ← github.generateJitConfig(repo, labels)                      │
    │        flavor.launch(jit).finally(release + unmark)                      │
-   │    sleep(pollDelay)                                                      │
+   │        stop after this one claim                                         │
+   │    sleep(geometric load delay, or 20 × base after a claim)               │
    │                                                                          │
    │  on abort: stop minting; await Promise.allSettled(in-flight launches)    │
    └───────────┬───────────────────────────────────────────┬────────────────┘
@@ -83,6 +84,28 @@ self-correcting: the extra runner idles and the watchdog reaps it. `unassignedBy
 
 **Where:** demand math in `runDispatcher` (`src/dispatcher.js`);
 `countQueuedMatchingJobs` (`src/github.js`).
+
+### Decentralized fair dispatch
+
+**Decision:** each dispatcher claims at most one job per poll, then waits 20 base
+intervals. Otherwise its cadence is the base interval at zero active runner lifecycles,
+then 4×, 8×, 16×, and 32× at one through four. At five it does not poll until a
+lifecycle exits. Every delay retains phase jitter. Repository-count scaling remains an
+additional multiplier on ordinary load-based intervals before jitter; the post-claim
+interval stays constant at 20 times the base as required.
+
+**Why:** independent idle hosts should observe queued work before already-busy hosts,
+without introducing shared state or a coordinator. A runner counts as active from slot
+acquisition through lifecycle exit, including the unassigned startup window, because
+that local capacity is already committed. Lifecycle completion notifies the sleeping
+loop, so the cap reverses immediately rather than leaving the dispatcher quiet.
+
+**Consequence:** with the default 15s base, a successful claim causes a jittered 300s
+quiet period. Three idle hosts therefore claim roughly three jobs per five minutes
+under sustained demand, before startup and API latency.
+
+**Where:** `pollDelay`, `waitForNextPoll`, and the one-claim mint decision in
+`runDispatcher` (`src/dispatcher.js`).
 
 ### JIT runners for statelessness
 

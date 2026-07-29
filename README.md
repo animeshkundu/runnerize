@@ -76,9 +76,10 @@ build-only wrapper. No host container socket is exposed and the job container is
 
 | | |
 |---|---|
-| `--max <n>` | max concurrent runners (default 4) |
-| `--interval <ms>` | poll interval (default 15000; adapts with repo count) |
+| `--max <n>` | max concurrent runners (default and hard active-job cap 5) |
+| `--interval <ms>` | base poll interval (default 15000; backs off geometrically with active jobs) |
 | `--idle-timeout <ms>` | kill an unclaimed runner after this (default 120000) |
+| `RUNNERIZE_POLL_MAX_INTERVAL_MS` | poll-backoff cap (default `32 × --interval`) |
 | `RUNNERIZE_LINUX_IMAGE` | fat image (default `catthehacker/ubuntu:full-latest`) |
 | `RUNNERIZE_CONTAINER_BUILDS` | set to `0` to disable probed, isolated `docker`/`podman`/`buildah build` (`container-build` label); on by default |
 | `RUNNERIZE_RUNNER_DIR` | use a preinstalled runner dir instead of downloading |

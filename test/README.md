@@ -56,8 +56,9 @@ the container launch state machine) executes for real.
   on error / public repo but **rethrowing** a caller abort; `generateJitConfig` shape +
   incomplete-response rejection; `listRunners` label normalization; `deleteRunner` 404
   tolerance and non-404 throw.
-- **`dispatcher.test.js`** — option validation; `toMint = min(demand - unassigned, free)`
-  capped by the semaphore; count-based / never job-pinned (no job id in any JIT request);
+- **`dispatcher.test.js`** — option validation; the geometric 0–4 active-job poll table,
+  stop-at-5 and completion recovery, jittered 20× post-claim quiet period, and one claim
+  per poll capped by the semaphore; count-based / never job-pinned (no job id in any JIT request);
   double-mint damping via inflight `unassigned`; the two-counter model decrementing
   `unassigned` **exactly once** (onStarted OR settle, not both); the semaphore released on
   every path so later demand is still served; deregister-on-launch-failure calling

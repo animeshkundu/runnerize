@@ -51,7 +51,7 @@ runnerize status            # list runners currently registered across your repo
 runnerize remove            # clean up any offline ephemeral runnerize-* runners
 ```
 
-Flags: `--max <n>` (concurrent runners, default 4), `--interval <ms>` (poll, default
+Flags: `--max <n>` (concurrent runners, default 5), `--interval <ms>` (base poll, default
 15000), `--idle-timeout <ms>` (kill an unclaimed runner, default 120000), `--only
 <linux,windows,macos>` (serve selected flavors), and `--no-keep-awake` (allow the
 host to sleep while the dispatcher runs). `status` always reports every available

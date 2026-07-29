@@ -13,10 +13,10 @@ your **private** repos, so private-repo CI runs on your own machine instead of
 GitHub-hosted minutes, with no standing runners left registered.
 
 One always-on **dispatcher** polls your owned-private repos. When it sees queued
-jobs whose labels a sandbox flavor can serve, it mints a **just-in-time (JIT)**
-runner per unit of demand and launches each inside a **throwaway rootless
-container**. The runner takes exactly one job, auto-deregisters, and the container
-is destroyed. Nothing persists; the job never sees your host credentials or caches.
+jobs whose labels a sandbox flavor can serve, it mints at most one **just-in-time
+(JIT)** runner per poll and launches it inside a **throwaway rootless container**.
+The runner takes exactly one job, auto-deregisters, and the container is destroyed.
+Nothing persists; the job never sees your host credentials or caches.
 
 Status: **v0.1**, live-validated on Windows 11 + WSL2 (rootless Podman). The
 `macos` (`tart`) and native `windows` (Windows Sandbox) flavors are detected-and-
@@ -172,7 +172,8 @@ Highlights an agent trips over most:
   labels. A bare `[self-hosted]` job matches the **linux (default)** flavor only
   (`isDefault`), so it isn't double-counted across flavors.
 - The `FLAVOR` interface and `runDispatcher({ maxConcurrent, pollIntervalMs,
-  idleTimeoutMs, reconcileMs, signal })` shape above.
+  idleTimeoutMs, reconcileMs, signal })` shape above. `maxConcurrent` defaults to 5;
+  the dispatcher also hard-caps locally active runner lifecycles at 5.
 
 If you genuinely need to change a contract, update `CONTRACTS.md`, this file, the
 tests, and every implementer in the same change — and say so explicitly in the PR.

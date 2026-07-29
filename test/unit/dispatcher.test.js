@@ -96,74 +96,233 @@ test('runDispatcher validates its numeric options', async () => {
   await assert.rejects(() => runDispatcher({ reconcileMs: 0, signal }), TypeError);
 });
 
-test('poll delay is jittered within bounds and varies across calls', () => {
-  const values = [0, 0.5, 1].map((random) => pollDelay({
-    floorMilliseconds: 100,
-    capMilliseconds: 800,
-    repoCount: 1,
-    freeCapacity: 2,
-    maxCapacity: 4,
+test('default poll maximum derives from the configured base interval', { concurrency: false }, async () => {
+  const previous = process.env.RUNNERIZE_POLL_MAX_INTERVAL_MS;
+  delete process.env.RUNNERIZE_POLL_MAX_INTERVAL_MS;
+  const controller = new AbortController();
+  controller.abort();
+
+  try {
+    await assert.doesNotReject(() => runDispatcher({
+      pollIntervalMs: 5_000,
+      signal: controller.signal,
+      keepAwake: false,
+    }));
+  } finally {
+    if (previous === undefined) delete process.env.RUNNERIZE_POLL_MAX_INTERVAL_MS;
+    else process.env.RUNNERIZE_POLL_MAX_INTERVAL_MS = previous;
+  }
+});
+
+test('poll delay follows the geometric active-job interval table', () => {
+  const cases = [
+    { activeJobs: 0, expected: 100 },
+    { activeJobs: 1, expected: 400 },
+    { activeJobs: 2, expected: 800 },
+    { activeJobs: 3, expected: 1600 },
+    { activeJobs: 4, expected: 3200 },
+  ];
+
+  for (const { activeJobs, expected } of cases) {
+    assert.equal(pollDelay({
+      baseMilliseconds: 100,
+      capMilliseconds: 3200,
+      activeJobs,
+      random: () => 0.5,
+    }), expected, `${activeJobs} active jobs`);
+  }
+});
+
+test('poll delay stops at five active jobs', () => {
+  assert.equal(pollDelay({
+    baseMilliseconds: 100,
+    capMilliseconds: 3200,
+    activeJobs: 5,
+    random: () => 0.5,
+  }), null);
+});
+
+test('poll delay jitters regular and post-claim intervals within the configured cap', () => {
+  const idle = [0, 0.5, 1].map((random) => pollDelay({
+    baseMilliseconds: 100,
+    capMilliseconds: 3200,
+    activeJobs: 0,
+    random: () => random,
+  }));
+  const regular = [0, 0.5, 1].map((random) => pollDelay({
+    baseMilliseconds: 100,
+    capMilliseconds: 3200,
+    activeJobs: 2,
+    random: () => random,
+  }));
+  const claimed = [0, 0.5, 1].map((random) => pollDelay({
+    baseMilliseconds: 100,
+    capMilliseconds: 3200,
+    activeJobs: 1,
+    claimed: true,
     random: () => random,
   }));
 
-  assert.deepEqual(values, [337.5, 450, 562.5]);
-  assert.ok(values.every((value) => value >= 75 && value <= 1000));
+  assert.deepEqual(idle, [75, 100, 125]);
+  assert.deepEqual(regular, [600, 800, 1000]);
+  assert.deepEqual(claimed, [1500, 2000, 2500]);
+  assert.equal(pollDelay({
+    baseMilliseconds: 100,
+    capMilliseconds: 500,
+    activeJobs: 4,
+    random: () => 1,
+  }), 500);
 });
 
-test('poll delay increases with capacity-normalized load and respects floor and cap', () => {
-  const delay = (freeCapacity, random = 0.5) => pollDelay({
-    floorMilliseconds: 100,
-    capMilliseconds: 800,
-    repoCount: 1,
-    freeCapacity,
-    maxCapacity: 4,
-    random: () => random,
-  });
-
-  assert.equal(delay(4), 100, 'idle hosts poll at the rate-safe floor');
-  assert.ok(delay(3) < delay(2));
-  assert.ok(delay(2) < delay(1));
-  assert.ok(delay(1) < delay(0));
-  assert.equal(delay(0), 800, 'full hosts poll at the cap');
-  assert.equal(delay(4, 0), 100, 'negative jitter never takes idle polling below the floor');
-  assert.equal(delay(0, 1), 800, 'positive jitter never takes full polling above the cap');
-});
-
-test('repo-count scaling remains additive without crossing the configured cap', () => {
-  const options = {
-    floorMilliseconds: 100,
-    capMilliseconds: 800,
-    freeCapacity: 4,
-    maxCapacity: 4,
-    random: () => 0.5,
-  };
-
-  assert.equal(pollDelay({ ...options, repoCount: 20 }), 100);
-  assert.equal(pollDelay({ ...options, repoCount: 21 }), 200);
-  assert.equal(pollDelay({ ...options, repoCount: 200 }), 800);
-});
-
-test('mints toMint = min(demand - unassigned, free): capped by the semaphore', async () => {
+test('claims at most one job per poll even when demand and capacity are higher', async () => {
   const flavor = new FakeFlavor();
-  flavor.behavior = holdingBehavior({ markStarted: false }); // hold all launches open
+  flavor.behavior = holdingBehavior({ markStarted: false });
+  let repoPolls = 0;
   await runSession({
     flavor,
-    options: { maxConcurrent: 2 },
+    options: { maxConcurrent: 5, pollIntervalMs: 1000, random: () => 0.5 },
     github: {
       user: { login: 'me', type: 'User' },
       repos: [{ full_name: 'me/cap', private: true }],
-      // 5 queued linux jobs => demand 5, but only 2 slots free.
       runs: { 'me/cap': [{ id: 1, status: 'queued' }] },
       jobs: { 1: Array.from({ length: 5 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+      onRequest: (method, pathname) => {
+        if (method === 'GET' && pathname === '/user/repos') repoPolls += 1;
+        return undefined;
+      },
     },
   }, async ({ start, flavor }) => {
     start();
-    // Fixed point: exactly 2 held launches (the semaphore cap), regardless of extra polls.
-    const reached = await waitFor(() => flavor.launches.length === 2);
-    assert.ok(reached, `expected 2 launches, saw ${flavor.launches.length}`);
-    // Let several more poll cycles run; held launches keep the fixed point stable.
-    await tick(120);
-    assert.equal(flavor.launches.length, 2, 'never over-mints past the free slots while launches are held');
+    assert.ok(await waitFor(() => flavor.launches.length === 1));
+    assert.equal(repoPolls, 1, 'the first poll cycle claims exactly one job');
+    assert.equal(flavor.launches.length, 1, 'free capacity does not cause a mint loop');
+  });
+});
+
+test('hard cap stops polling at five active jobs even when configured concurrency is higher', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  await runSession({
+    flavor,
+    options: { maxConcurrent: 6, pollIntervalMs: 1, pollMaxIntervalMs: 32, random: () => 0.5 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/hard-cap', private: true }],
+      runs: { 'me/hard-cap': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: Array.from({ length: 8 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+    },
+  }, async ({ start, flavor, stub }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 5, { timeoutMs: 2000 }));
+    const pollsAtCap = stub.countCalls('GET', '/user/repos');
+    await tick(100);
+    assert.equal(flavor.launches.length, 5, 'the machine never exceeds five active jobs');
+    assert.equal(stub.countCalls('GET', '/user/repos'), pollsAtCap, 'polling stops completely at the cap');
+  });
+});
+
+test('post-claim quiet period is twenty base intervals and remains jittered', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  const pollTimes = [];
+  await runSession({
+    flavor,
+    options: { maxConcurrent: 5, pollIntervalMs: 10, pollMaxIntervalMs: 320, random: () => 0 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/quiet', private: true }],
+      runs: { 'me/quiet': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: Array.from({ length: 2 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+      onRequest: (method, pathname) => {
+        if (method === 'GET' && pathname === '/user/repos') pollTimes.push(Date.now());
+        return undefined;
+      },
+    },
+  }, async ({ start, flavor }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 1));
+    await tick(100);
+    assert.equal(flavor.launches.length, 1, 'no second claim before the jittered 15x quiet period');
+    assert.ok(await waitFor(() => flavor.launches.length === 2, { timeoutMs: 200 }));
+    assert.ok(pollTimes[1] - pollTimes[0] >= 140, `quiet period was ${pollTimes[1] - pollTimes[0]}ms`);
+    assert.ok(pollTimes[1] - pollTimes[0] < 260, `quiet period was ${pollTimes[1] - pollTimes[0]}ms`);
+  });
+});
+
+test('repo-count scaling remains additive and preserves jitter at the cap', () => {
+  const capped = [0, 0.5, 1].map((random) => pollDelay({
+    baseMilliseconds: 100,
+    capMilliseconds: 800,
+    activeJobs: 2,
+    repoCount: 21,
+    random: () => random,
+  }));
+  const uncapped = [0, 0.5, 1].map((random) => pollDelay({
+    baseMilliseconds: 100,
+    capMilliseconds: 3200,
+    activeJobs: 1,
+    repoCount: 21,
+    random: () => random,
+  }));
+
+  assert.deepEqual(capped, [600, 800, 800]);
+  assert.deepEqual(uncapped, [600, 800, 1000]);
+});
+
+test('repo-count scaling does not alter the post-claim quiet period', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  const repos = Array.from({ length: 21 }, (_, index) => ({
+    full_name: `me/quiet-repo-${index}`,
+    private: true,
+  }));
+  const pollTimes = [];
+  await runSession({
+    flavor,
+    options: { pollIntervalMs: 10, pollMaxIntervalMs: 320, random: () => 0.5 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos,
+      runs: { 'me/quiet-repo-0': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: Array.from({ length: 2 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+      onRequest: (method, pathname) => {
+        if (method === 'GET' && pathname === '/user/repos') pollTimes.push(Date.now());
+        return undefined;
+      },
+    },
+  }, async ({ start, flavor }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 2, { timeoutMs: 300 }));
+    const elapsed = pollTimes[1] - pollTimes[0];
+    assert.ok(elapsed >= 180 && elapsed < 300, `post-claim delay was ${elapsed}ms`);
+  });
+});
+
+test('polling resumes when a job completes at the hard cap', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = holdingBehavior({ markStarted: true });
+  await runSession({
+    flavor,
+    options: { maxConcurrent: 6, pollIntervalMs: 1, pollMaxIntervalMs: 32, random: () => 0.5 },
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/recovery', private: true }],
+      runs: { 'me/recovery': [{ id: 1, status: 'queued' }] },
+      jobs: { 1: Array.from({ length: 8 }, () => ({ status: 'queued', labels: ['self-hosted', 'linux', 'x64'] })) },
+    },
+  }, async ({ start, flavor, stub }) => {
+    start();
+    assert.ok(await waitFor(() => flavor.launches.length === 5, { timeoutMs: 2000 }));
+    const pollsAtCap = stub.countCalls('GET', '/user/repos');
+
+    flavor.launches[0].succeed({ startedJob: true });
+
+    assert.ok(await waitFor(
+      () => stub.countCalls('GET', '/user/repos') > pollsAtCap,
+      { timeoutMs: 200 },
+    ), 'slot completion wakes the capped dispatcher');
+    assert.ok(await waitFor(() => flavor.launches.length === 6, { timeoutMs: 200 }),
+      'the resumed poll can claim one replacement job');
   });
 });
 

@@ -89,13 +89,14 @@ demand math.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max <n>` | 4 | max concurrent runners (the semaphore capacity) |
-| `--interval <ms>` | 15000 | base poll interval; scales up with repo count, capped at 60s |
+| `--max <n>` | 5 | max concurrent runners (the semaphore capacity; active jobs are hard-capped at 5) |
+| `--interval <ms>` | 15000 | base poll interval; backs off geometrically with active jobs and scales with repo count |
 | `--idle-timeout <ms>` | 120000 | kill an unclaimed runner after this |
 | `--dry-run` | off | count demand, mint nothing |
 
 | Env var | Default | Meaning |
 |---|---|---|
+| `RUNNERIZE_POLL_MAX_INTERVAL_MS` | `32 × --interval` | cap for load and post-claim poll backoff; must be at least the base interval |
 | `RUNNERIZE_LINUX_IMAGE` | `catthehacker/ubuntu:full-latest` | the fat image jobs run in |
 | `RUNNERIZE_RUNNER_DIR` | (download) | use a preinstalled `actions/runner` dir instead of downloading + SHA-256-verifying one; accepts an absolute Windows or WSL path |
 | `RUNNERIZE_WSL_DISTRO` | (probe all) | pin which WSL distro runs the containers |
