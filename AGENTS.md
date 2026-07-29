@@ -122,8 +122,9 @@ wrong — stop and reconsider, don't work around it.
 5. **Stateless / ephemeral.** Each job runs in a fresh sandbox from a fat image, takes
    exactly one job, then the runner auto-deregisters and the container is `--rm`-
    destroyed. `INNER_SCRIPT` copies the read-only runner into a throwaway writable
-   dir and wipes `_work _diag .runner .credentials*` first. No cross-job state, no
-   persisted credentials, no long-lived registration.
+   dir and wipes `_work _diag .runner .credentials*` first. Optional Buildah images
+   and layers stay inside that same outer container and disappear with it. No
+   cross-job state, no persisted credentials, no long-lived registration.
 
 6. **JIT via env, not argv.** JIT runners are minted with
    `generate-jitconfig` and launched with `run.sh --jitconfig <cfg>` where the config

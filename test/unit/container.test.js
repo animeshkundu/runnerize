@@ -46,14 +46,18 @@ async function withLinuxLaunch(fn) {
   const runnerDir = await makeRunnerDir();
   const prevDir = process.env.RUNNERIZE_RUNNER_DIR;
   const prevImage = process.env.RUNNERIZE_LINUX_IMAGE;
+  const prevContainerBuilds = process.env.RUNNERIZE_CONTAINER_BUILDS;
   process.env.RUNNERIZE_RUNNER_DIR = runnerDir;
   process.env.RUNNERIZE_LINUX_IMAGE = 'example/image:latest';
+  // Container builds are on by default; tests that want them opt in explicitly.
+  process.env.RUNNERIZE_CONTAINER_BUILDS = '0';
   try {
     const { linux } = await freshImport('../../src/sandbox/container.js');
     return await fn(linux);
   } finally {
     if (prevDir === undefined) delete process.env.RUNNERIZE_RUNNER_DIR; else process.env.RUNNERIZE_RUNNER_DIR = prevDir;
     if (prevImage === undefined) delete process.env.RUNNERIZE_LINUX_IMAGE; else process.env.RUNNERIZE_LINUX_IMAGE = prevImage;
+    if (prevContainerBuilds === undefined) delete process.env.RUNNERIZE_CONTAINER_BUILDS; else process.env.RUNNERIZE_CONTAINER_BUILDS = prevContainerBuilds;
     await rm(runnerDir, { recursive: true, force: true });
     restoreProc();
   }
@@ -115,7 +119,114 @@ test('linux passes through usable KVM and advertises the capability', async () =
   });
 });
 
-test('linux keeps labels and spawn args unchanged when KVM is unusable', async () => {
+test('linux advertises functional opt-in container builds and configures the job container', async () => {
+  await withLinuxLaunch(async (linux) => {
+    process.env.RUNNERIZE_CONTAINER_BUILDS = '1';
+    const stub = new SpawnStub((child) => {
+      const args = child.args ?? [];
+      if (args.includes('--name')) {
+        child.startJob();
+        child.close(0);
+        return;
+      }
+      if (args.includes('exec 3<>/dev/kvm')) {
+        child.close(1);
+        return;
+      }
+      child.emitStdout('ok\n');
+      child.close(0);
+    }).install();
+    try {
+      assert.equal(await linux.available(), true);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL, 'container-build']);
+      const probe = stub.children.find((child) => (child.args ?? []).some((arg) => String(arg).includes('runnerize-capability-probe')));
+      assert.ok(probe, 'runs a real image-build probe before advertising the label');
+      assert.ok(probe.args.includes('--user'));
+      assert.ok(probe.args.includes('0'));
+      assert.ok(probe.args.includes('RUNNERIZE_CONTAINER_BUILD_PROFILE=1'));
+      const probeScript = probe.args.find((arg) => String(arg).includes('runnerize-capability-probe'));
+      assert.match(probeScript, /\/proc\/self\/uid_map/, 'rejects an outer container whose root maps to host root');
+      assert.match(probeScript, /for command in docker podman buildah/, 'probes every documented build shim');
+      assert.match(probeScript, /runuser -u runner .* "\$command" build/, 'probes the user-facing commands as the runner user');
+      assert.match(probeScript, /sudo -n \/usr\/bin\/id -u/, 'proves broad passwordless sudo is unavailable');
+      assert.match(probeScript, /docker build --volume \/:\/host/, 'proves dangerous build options are rejected');
+      assert.match(probeScript, /sudo -n \/opt\/runnerize\/libexec\/buildah-build "\$option"/,
+        'proves direct helper calls cannot bypass the option policy');
+      assert.match(probeScript, /--runtime=\/bin\/sh.*--userns=host/s,
+        'probes runtime and namespace overrides at the privilege boundary');
+      assert.match(probeScript, /BUILDAH_ISOLATION=chroot/);
+      assert.match(probeScript, /build --cap-drop all/, 'removes capabilities from hostile RUN instructions');
+      assert.match(probeScript, /CapBnd:\[\[:space:\]\]\*0000000000000000/,
+        'functionally proves RUN instructions have an empty capability set');
+      assert.match(probeScript, /STORAGE_DRIVER=vfs/);
+      assert.ok(!probe.args.includes('--privileged'));
+      assert.ok(!probe.args.includes('--device'));
+      assert.ok(!probe.args.some((arg) => /docker\.sock|podman\.sock/.test(arg)));
+
+      const probesBeforeLaunch = stub.children.filter((child) =>
+        (child.args ?? []).some((arg) => String(arg).includes('runnerize-capability-probe'))).length;
+      await linux.launch('cfg', { idleTimeoutMs: 5000 });
+      const probesAfterLaunch = stub.children.filter((child) =>
+        (child.args ?? []).some((arg) => String(arg).includes('runnerize-capability-probe'))).length;
+      assert.equal(probesAfterLaunch, probesBeforeLaunch, 'reuses the successful probe for this runtime and image');
+      const container = stub.find('--name');
+      assert.ok(container.args.includes('--user'));
+      assert.ok(container.args.includes('0'));
+      assert.ok(container.args.includes('RUNNERIZE_CONTAINER_BUILD_PROFILE=1'));
+      assert.ok(!container.args.includes('--privileged'));
+      assert.ok(!container.args.includes('--device'));
+      assert.ok(!container.args.some((arg) => /docker\.sock|podman\.sock/.test(arg)));
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux treats an explicit falsey RUNNERIZE_CONTAINER_BUILDS as off, not as truthy', async () => {
+  for (const value of ['0', 'false', 'no', 'off', 'OFF', ' 0 ']) {
+    await withLinuxLaunch(async (linux) => {
+      process.env.RUNNERIZE_CONTAINER_BUILDS = value;
+      const stub = new SpawnStub((child) => {
+        const args = child.args ?? [];
+        if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) child.close(1);
+        else { child.emitStdout('ok\n'); child.close(0); }
+      }).install();
+      try {
+        await linux.available();
+        assert.ok(
+          !linux.labels.includes('container-build'),
+          `RUNNERIZE_CONTAINER_BUILDS=${JSON.stringify(value)} must disable container builds`,
+        );
+      } finally {
+        stub.restore();
+      }
+    });
+  }
+});
+
+test('linux does not advertise container builds when the functional probe fails', async () => {
+  await withLinuxLaunch(async (linux) => {
+    process.env.RUNNERIZE_CONTAINER_BUILDS = '1';
+    const stub = new SpawnStub((child) => {
+      const args = child.args ?? [];
+      if (args.includes('exec 3<>/dev/kvm') || args.some((arg) => String(arg).includes('runnerize-capability-probe'))) {
+        child.close(1);
+        return;
+      }
+      child.emitStdout('ok\n');
+      child.close(0);
+    }).install();
+    try {
+      assert.equal(await linux.available(), true);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL]);
+      assert.equal(linux.containerBuild, false);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux keeps labels and spawn args unchanged when optional capabilities are unusable', async () => {
   await withLinuxLaunch(async (linux) => {
     const stub = containerStub((child) => {
       child.startJob();
@@ -270,8 +381,10 @@ test('linux.available: true when a container runtime is present, false when none
 
     const absent = new SpawnStub((child) => { child.fail(new Error('ENOENT')); }).install();
     try {
+      linux.containerBuild = true;
       assert.equal(await linux.available(), false);
-      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL], 'stale KVM capability is removed');
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL], 'stale capability labels are removed');
+      assert.equal(linux.containerBuild, false);
     } finally {
       absent.restore();
     }
@@ -322,7 +435,57 @@ test('INNER_SCRIPT invariant: operates on a throwaway workdir, never the read-on
   assert.match(inner, /workdir="\$\(mktemp -d\)"/, 'a fresh workdir per run');
   assert.match(inner, /trap 'rm -rf "\$workdir"' EXIT/, 'workdir is cleaned on exit');
   assert.doesNotMatch(inner, /rm -rf[^\n]*\/rsrc/, 'never deletes the mounted runner source');
-  assert.match(inner, /run\.sh --jitconfig "\$JITCFG"/, 'launches run.sh with the jit config from env');
+  assert.match(inner, /run\.sh" --jitconfig "\$JITCFG"|run\.sh --jitconfig "\$JITCFG"/,
+    'launches run.sh with the jit config from env');
+});
+
+test('INNER_SCRIPT gives a non-root runner only the isolated image-build helper', async () => {
+  const source = await readContainerSource();
+  assert.match(source, /sed -i -E .*NOPASSWD\/d.*runner ALL=\(root\) NOPASSWD: \/opt\/runnerize\/libexec\/buildah-build/s,
+    'existing broad passwordless sudo is removed before allowing only the fixed Buildah helper');
+  assert.doesNotMatch(source, /runner ALL=\(ALL\) NOPASSWD: ALL/, 'does not grant broad passwordless sudo');
+  assert.match(source, /driver="vfs"/, 'uses the VFS storage driver inside the outer user namespace');
+  assert.match(source, /ignore_chown_errors="true"/, 'supports image ownership within the outer user namespace');
+  assert.match(source, /awk .*\/proc\/self\/uid_map/, 'requires mapped outer-container root');
+  assert.match(source, /if \[\[ "\$#" -eq 0 \|\| "\$1" != build \]\]/,
+    'docker, podman, and buildah wrappers expose only image builds');
+  assert.match(source, /--runtime-flag.*--volume.*--runtime-flag=\*.*--volume=\*/s,
+    'the root Buildah helper rejects namespace, runtime, and bind-mount overrides itself');
+  assert.match(source, /exec sudo -n \/opt\/runnerize\/libexec\/buildah-build "\$@"/,
+    'the user-facing wrapper delegates validation to the privilege-boundary helper');
+  assert.match(source, /SUDO_USER:-.*runner.*unsupported build option/s,
+    'direct helper calls remain subject to the same fail-closed option parser');
+  assert.match(source, /stage_wrapper=.*mktemp.*staged_context="\$stage_wrapper\/context".*source_context=.*mktemp/s,
+    'the final context stays beneath a root-only wrapper during staging');
+  assert.match(source, /source_context=.*mktemp.*runuser -u runner -- tar --create/s,
+    'the helper snapshots a local context as the runner user before the root build');
+  assert.match(source, /cp -a --no-dereference -- "\\\$\{source_context:\?\}\/\." "\\\$\{staged_context:\?\}\/"/,
+    'root copies into a final directory the runner never owned or traversed');
+  assert.match(source, /build contexts may not contain special files/,
+    'device, socket, pipe, and block files are rejected before the root build');
+  assert.match(source, /build context symlinks must resolve inside the context/,
+    'symlinks cannot escape the staged context');
+  assert.match(source, /\| runuser -u runner -- tar --extract/,
+    'untrusted archives are extracted without root privileges');
+  assert.match(source, /source_context=\ntrap 'rm -rf -- "\$stage_wrapper".*' EXIT/s,
+    'cleanup is armed immediately after the first allocation');
+  assert.doesNotMatch(source, /exec \/usr\/bin\/buildah build/,
+    'the helper returns through its EXIT trap after Buildah finishes');
+  assert.match(source, /\$\{source_context:\?\}\/\./,
+    'empty staging paths fail closed before copying');
+  assert.match(source, /build --cap-drop all/,
+    'hostile RUN instructions receive no Linux capabilities');
+  assert.match(source, /chown -R root:root "\$staged_context"/,
+    'the staged context is root-owned before validation and the root build');
+  assert.doesNotMatch(source, /chmod -R a-w "\$staged_context"/,
+    'context modes are preserved for COPY and ADD');
+  assert.match(source, /realpath -e -- "\$staged_context\/\$file"/,
+    'Containerfiles must resolve inside the staged context');
+  assert.doesNotMatch(source, /grep -RIEq .*\/proc\|\/sys\|\/dev/s,
+    'security does not depend on heuristic Dockerfile scanning');
+  assert.match(source, /ln -sf container-build \/opt\/runnerize\/bin\/docker/);
+  assert.match(source, /ln -sf container-build \/opt\/runnerize\/bin\/podman/);
+  assert.match(source, /exec runuser -u runner -- env/, 'the Actions runner remains non-root');
 });
 
 test('WSL forwards the max lifetime and the inner script has a defensive default', async () => {

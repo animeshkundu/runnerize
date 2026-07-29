@@ -128,6 +128,33 @@ as an argv token — so it never appears in the host process table or a log.
 `invocation()`/WSL staging in `src/sandbox/container.js`; `ensureImage`/
 `ensureRunnerBinary` in `src/runner.js`.
 
+### Daemonless image builds behind a functional capability probe
+
+**Decision:** expose opt-in `docker build`, `podman build`, and `buildah build` compatibility,
+advertise `container-build` only after all three build shims succeed as the non-root runner user,
+and keep nested storage inside the ephemeral job container.
+
+**Why:** mounting the host Docker/Podman socket would give autonomous jobs control of the
+host runtime and other containers. Privileged Docker-in-Docker has a similarly unacceptable
+blast radius. Rootless Podman-in-Podman could not create a second subordinate user namespace
+on the supported rootless Podman/WSL path. Buildah with chroot isolation and VFS storage can
+build images without a daemon, socket, `--privileged`, or host-persistent storage.
+
+**Consequence:** the Actions runner remains the image's non-root `runner` user. A build-only
+wrapper may invoke one immutable root-owned Buildah helper through a narrow sudo rule; existing
+broad passwordless sudo in the default image is removed. The root helper applies a fail-closed
+option allowlist even when invoked directly, snapshots a local build context without root
+privileges, and rejects special files or symlinks that escape the root-owned result. Namespace,
+runtime, device, security, and bind-mount overrides are rejected, and every `RUN` instruction
+has an empty Linux capability set before Buildah executes it. The outer container starts as UID
+0 only to install that profile, and the capability probe rejects a host runtime whose container
+root maps to host root. VFS is slower and uses more temporary disk than overlay; all build
+layers disappear when the outer `--rm` container exits. The shims implement only the `build`
+subcommand, not general Docker or Podman daemon commands.
+
+**Where:** `hasUsableContainerBuild`, `BUILD_SETUP_SCRIPT`, `buildContainerArgs`, and the build
+branch in `INNER_SCRIPT` (`src/sandbox/container.js`).
+
 ### Fail-closed privacy
 
 **Decision:** only `private`, User-owned, non-fork, non-archived repos are eligible,
