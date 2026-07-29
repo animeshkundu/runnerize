@@ -201,6 +201,42 @@ it to run before/without an interactive login: `loginctl enable-linger "$USER"`.
 Logs: `journalctl --user -u runnerize -f`. This is also the cleanest path *inside
 WSL* (systemd runs there) once Node is installed in the WSL distro.
 
+### Isolated container image builds
+
+Set `RUNNERIZE_CONTAINER_BUILDS=1` in the dispatcher's environment to opt in. For a
+systemd service, add it to the file referenced by `RUNNERIZE_SYSTEMD_ENV_FILE` before
+installing or restarting the service. A capable host advertises the additional label only
+after the configured Linux image completes a real `docker build` with a `RUN` instruction
+as the non-root runner user:
+
+```yaml
+runs-on: [self-hosted, linux, x64, container-build]
+```
+
+Jobs can use `docker build`, `podman build`, or `buildah build`. These build-only shims invoke
+Buildah with chroot isolation and VFS storage under `/tmp`; other Docker, Podman, and Buildah
+subcommands return exit 125. Build flags that override namespaces, runtimes, capabilities,
+devices, security settings, or bind mounts are also rejected. The Actions runner stays non-root
+and receives passwordless sudo only for one immutable root-owned Buildah helper. The outer
+container starts as UID 0 to install that profile, but the capability probe rejects a runtime
+whose container root maps
+to host root. No `--privileged`, `/dev/fuse`, or host Docker/Podman socket is used.
+
+The default image already contains the required tools, so opt-in does not add image bytes.
+Custom images must include `bash`, `awk`, `buildah`, a statically linked `busybox`, `runuser`,
+`sed`, `sudo`/`visudo`, and the `runner` user. The functional probe adds a real scratch image
+build at first detection and when the runtime, WSL distro, or configured image changes. VFS
+copies layers instead of sharing overlay layers, so builds use more temporary disk and can be
+slower. All nested images and layers live in the ephemeral job container and are deleted with
+it; no cross-job cache accumulates and no host cleanup is required.
+
+Socket mounting was rejected because it grants jobs control of the host runtime and makes
+sandbox escape straightforward. Privileged Docker-in-Docker has a similarly broad blast
+radius and adds a daemon. Rootless Podman-in-Podman was rejected because nested subordinate
+user namespaces are not functional on the supported rootless Podman/WSL setup. Buildah is
+the smallest mechanism that completed a real image build while retaining the host-runtime
+boundary.
+
 ### KVM-accelerated Android tests
 
 runnerize enables KVM automatically when the linux execution environment has a

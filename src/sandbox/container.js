@@ -16,8 +16,66 @@ const CLEANUP_TIMEOUT_MS = 5_000;
 const KILL_GRACE_MS = 1_000;
 const FORCE_SETTLE_MS = 7_000;
 const DIAGNOSTICS_MAX_BYTES = 64 * 1024;
+const CAPABILITY_PROBE_TIMEOUT_MS = 60_000;
 const KVM_PROBE_TIMEOUT_MS = 5_000;
 const BASE_LINUX_LABELS = ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL];
+const BUILD_CAPABILITY_LABEL = 'container-build';
+const BUILD_BIN_DIR = '/opt/runnerize/bin';
+const BUILD_SETUP_SCRIPT = `
+set -euo pipefail
+[[ "$(id -u)" == 0 && -d /home/runner ]]
+[[ -x /usr/bin/buildah ]]
+command -v awk >/dev/null
+command -v busybox >/dev/null
+command -v runuser >/dev/null
+command -v sed >/dev/null
+command -v sudo >/dev/null
+command -v visudo >/dev/null
+awk '($1 == 0 && $2 != 0) { mapped=1 } END { exit mapped ? 0 : 1 }' /proc/self/uid_map
+install -d -m 0755 /opt/runnerize/bin /opt/runnerize/libexec
+install -d -m 0700 /tmp/runnerize-build/home /tmp/runnerize-build/run /tmp/runnerize-build/runroot /tmp/runnerize-build/storage
+printf '{}' > /tmp/runnerize-build/auth.json
+printf '[storage]\\ndriver="vfs"\\ngraphroot="/tmp/runnerize-build/storage"\\nrunroot="/tmp/runnerize-build/runroot"\\n[storage.options.vfs]\\nignore_chown_errors="true"\\n' > /tmp/runnerize-build/storage.conf
+cat > /opt/runnerize/libexec/buildah-build <<'RUNNERIZE_BUILD_HELPER'
+#!/bin/sh
+export BUILDAH_ISOLATION=chroot
+export CONTAINERS_STORAGE_CONF=/tmp/runnerize-build/storage.conf
+export HOME=/tmp/runnerize-build/home
+export REGISTRY_AUTH_FILE=/tmp/runnerize-build/auth.json
+export STORAGE_DRIVER=vfs
+export XDG_RUNTIME_DIR=/tmp/runnerize-build/run
+exec /usr/bin/buildah build "$@"
+RUNNERIZE_BUILD_HELPER
+cat > /opt/runnerize/bin/container-build <<'RUNNERIZE_BUILD_WRAPPER'
+#!/bin/sh
+if [ "$#" -eq 0 ] || [ "$1" != build ]; then
+  echo "runnerize: only the build subcommand is available" >&2
+  exit 125
+fi
+shift
+for arg in "$@"; do
+  case "$arg" in
+    --cap-add|--cap-add=*|--cap-drop|--cap-drop=*|--cdi-config-dir|--cdi-config-dir=*|--cgroupns|--cgroupns=*|--device|--device=*|--group-add|--group-add=*|--hooks-dir|--hooks-dir=*|--ipc|--ipc=*|--isolation|--isolation=*|--network|--network=*|--pid|--pid=*|--runtime|--runtime=*|--runtime-flag|--runtime-flag=*|--security-opt|--security-opt=*|--userns|--userns=*|--userns-gid-map|--userns-gid-map=*|--userns-gid-map-group|--userns-gid-map-group=*|--userns-uid-map|--userns-uid-map=*|--userns-uid-map-user|--userns-uid-map-user=*|--uts|--uts=*|--volume|--volume=*|-v|-v*)
+      echo "runnerize: unsupported build option: $arg" >&2
+      exit 125
+      ;;
+  esac
+done
+exec sudo -n /opt/runnerize/libexec/buildah-build "$@"
+RUNNERIZE_BUILD_WRAPPER
+chmod 0755 /opt/runnerize/libexec/buildah-build /opt/runnerize/bin/container-build
+ln -sf container-build /opt/runnerize/bin/buildah
+ln -sf container-build /opt/runnerize/bin/docker
+ln -sf container-build /opt/runnerize/bin/podman
+for sudoers_file in /etc/sudoers /etc/sudoers.d/*; do
+  [[ "$sudoers_file" == /etc/sudoers.d/runnerize-container-build ]] && continue
+  [[ -f "$sudoers_file" ]] || continue
+  sed -i -E '/^[[:space:]]*%?(runner|sudo|wheel)[[:space:]].*NOPASSWD/d' "$sudoers_file"
+done
+printf 'runner ALL=(root) NOPASSWD: /opt/runnerize/libexec/buildah-build\\n' > /etc/sudoers.d/runnerize-container-build
+chmod 0440 /etc/sudoers.d/runnerize-container-build
+visudo -cf /etc/sudoers >/dev/null
+`;
 
 function appendBounded(current, chunk) {
   const combined = Buffer.concat([current, Buffer.from(chunk)]);
@@ -107,6 +165,45 @@ async function hasUsableKvm(target) {
     await collect(command, args, { timeoutMs: KVM_PROBE_TIMEOUT_MS });
     return true;
   } catch {
+    return false;
+  }
+}
+
+function buildContainerArgs(image) {
+  return ['--user', '0', '-e', 'RUNNERIZE_CONTAINER_BUILD_PROFILE=1', image];
+}
+
+async function hasUsableContainerBuild(target, image) {
+  if (!target || !process.env.RUNNERIZE_CONTAINER_BUILDS) {
+    linux.containerBuildProbeKey = null;
+    return false;
+  }
+  const probeKey = `${target.runtime}\0${target.distro || ''}\0${image}`;
+  if (linux.containerBuildProbeKey === probeKey) return true;
+  const args = ['run', '--rm', ...buildContainerArgs(image), 'bash', '-lc', `
+set -euo pipefail
+${BUILD_SETUP_SCRIPT}
+context="$(runuser -u runner -- mktemp -d)"
+cp "$(command -v busybox)" "$context/busybox"
+printf 'FROM scratch\\nCOPY busybox /busybox\\nRUN ["/busybox", "true"]\\n' > "$context/Containerfile"
+runuser -u runner -- env "PATH=${BUILD_BIN_DIR}:$PATH" docker build -t localhost/runnerize-capability-probe "$context" >/dev/null
+if runuser -u runner -- sudo -n /usr/bin/id -u >/dev/null 2>&1; then
+  exit 1
+fi
+set +e
+runuser -u runner -- env "PATH=${BUILD_BIN_DIR}:$PATH" docker build --volume /:/host "$context" >/dev/null 2>&1
+blocked_status=$?
+set -e
+[[ "$blocked_status" == 125 ]]
+rm -rf "$context"
+`];
+  const call = invocation(target, args, process.env);
+  try {
+    await collect(call.command, call.args, { env: call.env, timeoutMs: CAPABILITY_PROBE_TIMEOUT_MS });
+    linux.containerBuildProbeKey = probeKey;
+    return true;
+  } catch {
+    linux.containerBuildProbeKey = null;
     return false;
   }
 }
@@ -211,6 +308,20 @@ function isJobStartLine(line) {
 
 const INNER_SCRIPT = `#!/usr/bin/env bash
 set -euo pipefail
+if [[ "\${RUNNERIZE_CONTAINER_BUILD_PROFILE:-}" ]]; then
+${BUILD_SETUP_SCRIPT}
+  workdir="$(runuser -u runner -- mktemp -d)"
+  trap 'rm -rf "$workdir"' EXIT
+  cp -a /rsrc/. "$workdir/"
+  chown -R runner:runner "$workdir"
+  rm -rf "$workdir"/_work "$workdir"/_diag "$workdir"/.runner "$workdir"/.credentials*
+  exec runuser -u runner -- env \
+    JITCFG="$JITCFG" \
+    MAX_LIFETIME_SECONDS="\${MAX_LIFETIME_SECONDS:-604800}" \
+    PATH="${BUILD_BIN_DIR}:$PATH" \
+    timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-604800}s" \
+    "$workdir/run.sh" --jitconfig "$JITCFG"
+fi
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 cp -a /rsrc/. "$workdir/"
@@ -224,11 +335,19 @@ export const linux = {
   key: 'linux',
   labels: [...BASE_LINUX_LABELS],
   kvm: false,
+  containerBuild: false,
+  containerBuildProbeKey: null,
 
   async available() {
     const target = await backend();
+    const image = process.env.RUNNERIZE_LINUX_IMAGE || DEFAULT_LINUX_IMAGE;
     linux.kvm = await hasUsableKvm(target);
-    linux.labels = linux.kvm ? [...BASE_LINUX_LABELS, 'kvm'] : [...BASE_LINUX_LABELS];
+    linux.containerBuild = await hasUsableContainerBuild(target, image);
+    linux.labels = [
+      ...BASE_LINUX_LABELS,
+      ...(linux.kvm ? ['kvm'] : []),
+      ...(linux.containerBuild ? [BUILD_CAPABILITY_LABEL] : []),
+    ];
     return Boolean(target);
   },
 
@@ -262,6 +381,7 @@ export const linux = {
     if (!target) throw new Error('podman or docker is required for the linux flavor');
     const kvm = linux.kvm && await hasUsableKvm(target);
     const image = process.env.RUNNERIZE_LINUX_IMAGE || DEFAULT_LINUX_IMAGE;
+    const containerBuild = linux.containerBuild && await hasUsableContainerBuild(target, image);
     if (target.distro) {
       const inspect = invocation(target, ['image', 'inspect', image], process.env);
       try {
@@ -295,7 +415,8 @@ export const linux = {
       '-v', `${mountedRunner}:/rsrc:ro`,
       '-v', `${mountedScript}:/inner.sh:ro`,
       ...(kvm ? ['--device', '/dev/kvm'] : []),
-      image, 'bash', '/inner.sh',
+      ...(containerBuild ? buildContainerArgs(image) : [image]),
+      'bash', '/inner.sh',
     ];
     const env = {
       ...process.env,
