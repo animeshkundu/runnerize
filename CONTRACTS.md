@@ -56,7 +56,7 @@ Default: **GitHub App installation token** (short-lived 1h, scoped repos, `actio
 
 - **Worker A → `src/github.js`**: token provider; HTTP client (built-in `fetch` + `AbortController` timeout, ETag cache, backoff, off-argv); `getUser()`, `listOwnedPrivateRepos()`, `isStillPrivate(fullName)`, `countQueuedMatchingJobs(fullName, flavorLabels)`, `generateJitConfig(fullName, labels)`, `listRunners(fullName)`, `deleteRunner(fullName, id)`.
 - **Worker B → `src/platform.js`, `src/runner.js`, `src/sandbox/container.js`, `src/sandbox/index.js`**: OS/arch/WSL detection + stable machine-id; runner download + **SHA-256 verify** (against release metadata) + cache + `xattr -c` on mac; ensure fat image present; the **FLAVOR interface** + the validated rootless-Podman `linux` flavor with the **idle watchdog**. Stub `windows` (Windows Sandbox, `available()` checks the feature) + `macos` (`tart`) flavors.
-- **Worker C → `src/dispatcher.js`, `bin/runnerize.js`, `src/service.js`**: the count-based loop + semaphore + reconcile + SIGTERM drain; CLI (`run` [foreground], `status`, `remove`, `service install`); service install (systemd unit `KillMode=mixed` so a daemon restart does NOT kill in-flight `run.sh` children; launchd LaunchAgent; Windows Service).
+- **Worker C → `src/dispatcher.js`, `bin/runnerize.js`, `src/service.js`**: the count-based loop + semaphore + reconcile + SIGTERM drain; CLI (`run` [foreground], `status`, `remove`, `service install|uninstall|status|update`); service install (private materialized release; systemd unit `KillMode=mixed` so a normal daemon restart does NOT kill in-flight `run.sh` children; launchd LaunchAgent; independent Windows and WSL services).
 - **Lead → `package.json`, `CONTRACTS.md`, integration + spike-repo testing.**
 
 ## Frozen signatures (ESM)
@@ -70,12 +70,13 @@ export async function listOwnedPrivateRepos();                     // [{ full_na
 export async function isStillPrivate(fullName);                    // boolean (fail-closed: false on error)
 export async function countQueuedMatchingJobs(fullName, flavorLabels); // integer; scans {queued,in_progress} runs → queued jobs, labels ⊆ flavorLabels
 export async function generateJitConfig(fullName, labels);         // encoded_jit_config string
-export async function listRunners(fullName);                       // [{ id, name, status, labels:[string] }]
+export async function listRunners(fullName);                       // [{ id, name, status, busy:boolean, labels:[string] }]
 export async function deleteRunner(fullName, id);                  // void
 
 // src/sandbox/index.js  — FLAVOR interface
 // flavor = { key:'linux'|'windows'|'macos', labels:string[], async available():boolean,
 //            async launch(encodedJitConfig, { idleTimeoutMs }):Promise<{ startedJob:boolean }> }
+// labels always include the exact running package version as `runnerize-X.Y.Z`.
 export async function detectFlavors();                             // FLAVOR[] the host can serve now
 
 // src/dispatcher.js

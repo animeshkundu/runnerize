@@ -444,14 +444,14 @@ test('listRunners normalizes id/name/status/labels (string and object labels)', 
     user: { login: 'alice', type: 'User' },
     runners: {
       'alice/repo': [
-        { id: 1, name: 'runnerize-a', status: 'online', labels: ['self-hosted', { name: 'linux' }, 'x64'] },
+        { id: 1, name: 'runnerize-a', status: 'online', busy: true, labels: ['self-hosted', { name: 'linux' }, 'x64'] },
         { id: 2, name: 'other', status: 'offline', labels: undefined },
       ],
     },
   }, async (gh) => {
     const runners = await gh.listRunners('alice/repo');
     assert.deepEqual(runners[0], {
-      id: 1, name: 'runnerize-a', status: 'online', labels: ['self-hosted', 'linux', 'x64'],
+      id: 1, name: 'runnerize-a', status: 'online', busy: true, labels: ['self-hosted', 'linux', 'x64'],
     });
     assert.deepEqual(runners[1].labels, [], 'missing labels normalize to []');
   });

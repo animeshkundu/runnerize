@@ -10,6 +10,7 @@ import { overrideProcess } from '../helpers/platform-override.js';
 import { SpawnStub } from '../helpers/process-stub.js';
 import { freshImport } from '../helpers/fresh-module.js';
 import { withKeepAlive } from '../helpers/dispatcher-harness.js';
+import { RUNNERIZE_VERSION_LABEL } from '../../src/version.js';
 
 const CONTAINER_SRC = fileURLToPath(new URL('../../src/sandbox/container.js', import.meta.url));
 
@@ -101,7 +102,7 @@ test('linux passes through usable KVM and advertises the capability', async () =
     }).install();
     try {
       assert.equal(await linux.available(), true);
-      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', 'kvm']);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL, 'kvm']);
       await linux.launch('cfg', { idleTimeoutMs: 5000 });
       const container = stub.find('--name');
       assert.deepEqual(
@@ -122,7 +123,7 @@ test('linux keeps labels and spawn args unchanged when KVM is unusable', async (
     }).install();
     try {
       assert.equal(await linux.available(), true);
-      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64']);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL]);
       await linux.launch('cfg', { idleTimeoutMs: 5000 });
       const container = stub.find('--name');
       const name = container.args[container.args.indexOf('--name') + 1];
@@ -270,7 +271,7 @@ test('linux.available: true when a container runtime is present, false when none
     const absent = new SpawnStub((child) => { child.fail(new Error('ENOENT')); }).install();
     try {
       assert.equal(await linux.available(), false);
-      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64'], 'stale KVM capability is removed');
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL], 'stale KVM capability is removed');
     } finally {
       absent.restore();
     }

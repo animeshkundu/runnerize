@@ -157,13 +157,34 @@ async function commandAvailable(command) {
   }
 }
 
-export async function ensureImage(image) {
+export async function ensureImage(image, { refresh = false } = {}) {
   if (!image || typeof image !== 'string') throw new TypeError('image must be a non-empty string');
   const runtime = await commandAvailable('podman') ? 'podman' : await commandAvailable('docker') ? 'docker' : null;
   if (!runtime) throw new Error('podman or docker is required for the linux flavor');
+  if (refresh) {
+    await run(runtime, ['pull', image]);
+    return;
+  }
   try {
     await run(runtime, ['image', 'inspect', image]);
   } catch {
     await run(runtime, ['pull', image]);
+  }
+}
+
+export async function localImageDetails(image) {
+  if (!image || typeof image !== 'string') throw new TypeError('image must be a non-empty string');
+  const runtime = await commandAvailable('podman') ? 'podman' : await commandAvailable('docker') ? 'docker' : null;
+  if (!runtime) return { reference: image, runtime: null, digest: null, created: null };
+  try {
+    const { stdout } = await run(runtime, ['image', 'inspect', image]);
+    const details = JSON.parse(stdout)?.[0] ?? {};
+    const digest = details.Digest
+      ?? details.RepoDigests?.find((value) => value.includes('@sha256:'))?.split('@')[1]
+      ?? details.Id
+      ?? null;
+    return { reference: image, runtime, digest, created: details.Created ?? null };
+  } catch {
+    return { reference: image, runtime, digest: null, created: null };
   }
 }

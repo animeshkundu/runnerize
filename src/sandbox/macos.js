@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { latestRunnerVersion } from '../runner.js';
+import { RUNNERIZE_VERSION_LABEL } from '../version.js';
 
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_LIFETIME_MS = 7 * 24 * 60 * 60_000;
@@ -208,7 +209,7 @@ async function observeRunner(child, idleTimeoutMs, maxLifetimeMs, onStarted) {
 
 export const macos = {
   key: 'macos',
-  labels: ['self-hosted', 'macos', 'arm64'],
+  labels: ['self-hosted', 'macos', 'arm64', RUNNERIZE_VERSION_LABEL],
   maxConcurrent: 2,
 
   async available() {
