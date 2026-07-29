@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { freshImport } from '../helpers/fresh-module.js';
+import { RUNNERIZE_VERSION } from '../../src/version.js';
 
 const require = createRequire(import.meta.url);
 const childProcess = require('node:child_process');
@@ -33,6 +34,8 @@ function successfulHarness(options = {}) {
   const calls = [];
   let cachedNodeChecks = 0;
   const registeredActions = new Map();
+  const registeredArguments = new Map();
+  for (const taskName of options.installedTasks ?? []) registeredActions.set(taskName, true);
   const exec = (file, args, execOptions = {}) => {
     calls.push({ kind: 'exec', file, args, options: execOptions });
     if (file.toLowerCase().endsWith('powershell.exe')) {
@@ -51,9 +54,26 @@ function successfulHarness(options = {}) {
       }
       const confirmation = command.includes('[Console]::Out.Write($task.Principal.UserId)');
       const specMatch = command.includes('$a = $task.Actions | Select-Object -First 1');
+      if (options.startTaskFails && command.includes("Start-ScheduledTask -TaskName 'runnerize-windows'")) {
+        const error = new Error('could not start task');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = error.message;
+        throw error;
+      }
       if (specMatch) {
         const taskNameMatch = command.match(/-TaskName '([^']*)'/);
         const taskName = taskNameMatch?.[1];
+        if (options.recordRegisteredArguments) {
+          const expectedArgument = command.match(/\$a\.Arguments -eq '([^']*)'/)?.[1]?.replaceAll("''", "'");
+          if (expectedArgument !== registeredArguments.get(taskName)) {
+            const error = new Error('no match');
+            error.status = 1;
+            error.stdout = '';
+            error.stderr = '';
+            throw error;
+          }
+        }
         // A genuinely-failed registration (as opposed to a powershell.exe crash-after-success)
         // must not be resurrected by the post-failure confirmation check: the task was never
         // actually registered, so this must report a mismatch/absence for that specific task.
@@ -87,6 +107,14 @@ function successfulHarness(options = {}) {
         error.status = 1;
         error.stdout = '';
         error.stderr = '';
+        throw error;
+      }
+      if (options.startTaskFailsOnce && command.includes("Start-ScheduledTask -TaskName 'runnerize-windows'")) {
+        options.startTaskFailsOnce = false;
+        const error = new Error('could not start task');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = error.message;
         throw error;
       }
       if ((options.windowsTaskFails || options.registrationCrashesAfterSuccess) && command.includes("$taskName = 'runnerize-windows'") && command.includes('Register-ScheduledTask')) {
@@ -138,8 +166,21 @@ function successfulHarness(options = {}) {
         if (elevatedTaskNameMatch && !options.taskMissing) registeredActions.set(elevatedTaskNameMatch[1], true);
       }
       const registerMatch = !elevatedLaunch && command.includes('Register-ScheduledTask') && command.match(/\$taskName = '([^']*)'/);
-      if (registerMatch) registeredActions.set(registerMatch[1], true);
+      if (registerMatch) {
+        registeredActions.set(registerMatch[1], true);
+        if (options.recordRegisteredArguments) {
+          const argument = command.match(/New-ScheduledTaskAction .* -Argument '((?:[^']|'')*)'/)?.[1]?.replaceAll("''", "'");
+          registeredArguments.set(registerMatch[1], argument);
+        }
+      }
       return '';
+    }
+    if (file === 'podman') {
+      if (args[0] === '--version') return 'podman 5\n';
+      if (args[0] === 'image' && args[1] === 'inspect') {
+        return '[{"RepoDigests":["example/image@sha256:abc123"],"Created":"2026-07-01T12:34:56Z"}]\n';
+      }
+      if (args[0] === 'pull') return 'pulled\n';
     }
     if (file !== 'wsl.exe') return '';
     if (args[0] === '--status') return options.status ?? 'Default Distribution: Ubuntu\r\n';
@@ -149,6 +190,13 @@ function successfulHarness(options = {}) {
     if (command[0] === 'ps') return options.noSystemd ? 'init' : 'systemd';
     if (command[0] === 'sh' && command.includes('printf %s "$HOME"')) return '/home/ani';
     if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('/etc/os-release')) return options.osRelease ?? 'ubuntu debian';
+    if (command[0] === 'cat' && command[1]?.endsWith('/.config/systemd/user/runnerize.service')) {
+      if (!options.wslInstalledRoot) throw new Error('unit missing');
+      return `ExecStart="/usr/bin/node" "${options.wslInstalledRoot}/bin/runnerize.js" run --only linux\n`;
+    }
+    if (command[0] === 'cat' && command[1] === `${options.wslInstalledRoot}/package.json`) {
+      return JSON.stringify({ version: options.wslInstalledVersion ?? RUNNERIZE_VERSION });
+    }
     if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('command -v node')) {
       if (options.nodeAbsent) throw new Error('node missing');
       return options.nodeOutput ?? '/usr/bin/node\nv24.18.0\n';
@@ -156,6 +204,9 @@ function successfulHarness(options = {}) {
     if (command[0] === 'bash' && command[1] === '-lc' && command[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman') {
       if (options.podmanInstallFails) throw new Error('sudo: a password is required');
       return '';
+    }
+    if (command[0] === 'bash' && command[1] === '-c' && command[3] === 'runnerize-copy') {
+      return `${command[5]}/${command[6]}.123.456`;
     }
     if (command[0] === 'podman') {
       if (options.noRuntime && !(options.podmanInstallSucceeds && command[1] === '--version')) throw new Error('podman missing');
@@ -185,7 +236,7 @@ function successfulHarness(options = {}) {
     }
     return { status: 0, stdout: '', stderr: '' };
   };
-  return { calls, exec, spawn };
+  return { calls, exec, spawn, options, registeredArguments, registeredActions };
 }
 
 async function withWindowsService(options, action) {
@@ -233,11 +284,68 @@ function commandOf(call) {
   return call.args.slice(call.args.indexOf('-e') + 1);
 }
 
-async function withLinuxService({ active = false } = {}, action) {
+async function withMacosService({ force = false, linuxRuntime = false } = {}, action) {
+  const calls = [];
+  const home = mkdtempSync(join(tmpdir(), 'runnerize-macos-service-'));
+  const originalArch = Object.getOwnPropertyDescriptor(process, 'arch');
+  const originalGetuid = process.getuid;
+  const oldToken = process.env.GH_TOKEN;
+  const oldImage = process.env.RUNNERIZE_MACOS_IMAGE;
+  Object.defineProperty(process, 'arch', { value: 'arm64', configurable: true });
+  process.getuid = () => 501;
+  process.env.GH_TOKEN = 'test-token';
+  process.env.RUNNERIZE_MACOS_IMAGE = 'registry.example/macos:1';
+  const exec = (file, args, options = {}) => {
+    calls.push({ kind: 'exec', file, args, options });
+    if (file === 'podman') {
+      if (linuxRuntime && args[0] === '--version') return 'podman 5\n';
+      if (linuxRuntime && args[0] === 'pull') return 'pulled\n';
+      if (linuxRuntime && args[0] === 'image' && args[1] === 'inspect') return JSON.stringify([{}]);
+      const error = new Error('runtime unavailable');
+      error.status = 1;
+      throw error;
+    }
+    if (file === 'docker') {
+      const error = new Error('runtime unavailable');
+      error.status = 1;
+      throw error;
+    }
+    if (file === 'tart' && args[0] === 'list') {
+      return force ? JSON.stringify([{ name: 'runnerize-active' }, { name: 'other-vm' }]) : JSON.stringify([]);
+    }
+    if (file === 'gh' && args[0] === 'auth') return 'test-token';
+    return '';
+  };
+  const spawn = (file, args, options = {}) => {
+    calls.push({ kind: 'spawn', file, args, options });
+    if (file === 'sh' || file === 'tart') return { status: 0, stdout: '', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const restore = installStubs({ exec, spawn, platformName: 'darwin', home });
+  try {
+    const service = await freshImport('../../src/service.js');
+    await action(service, calls, home);
+  } finally {
+    restore();
+    Object.defineProperty(process, 'arch', originalArch);
+    if (originalGetuid === undefined) delete process.getuid;
+    else process.getuid = originalGetuid;
+    rmSync(home, { recursive: true, force: true });
+    if (oldToken === undefined) delete process.env.GH_TOKEN;
+    else process.env.GH_TOKEN = oldToken;
+    if (oldImage === undefined) delete process.env.RUNNERIZE_MACOS_IMAGE;
+    else process.env.RUNNERIZE_MACOS_IMAGE = oldImage;
+  }
+}
+
+async function withLinuxService({ active = false, imageDetails, imagePullFails = false, image } = {}, action) {
   const calls = [];
   const home = mkdtempSync(join(tmpdir(), 'runnerize-linux-service-'));
   const oldToken = process.env.GH_TOKEN;
+  const oldImage = process.env.RUNNERIZE_LINUX_IMAGE;
   process.env.GH_TOKEN = 'test-token';
+  if (image) process.env.RUNNERIZE_LINUX_IMAGE = image;
+  else delete process.env.RUNNERIZE_LINUX_IMAGE;
   const exec = (file, args, options = {}) => {
     calls.push({ kind: 'exec', file, args, options });
     if (file === 'systemctl' && args.includes('is-active')) {
@@ -245,6 +353,11 @@ async function withLinuxService({ active = false } = {}, action) {
       const error = new Error('inactive');
       error.status = 3;
       throw error;
+    }
+    if (file === 'podman' && args[0] === '--version') return 'podman 5\n';
+    if (file === 'podman' && args[0] === 'pull' && imagePullFails) throw new Error('pull failed');
+    if (file === 'podman' && args[0] === 'image' && args[1] === 'inspect') {
+      return JSON.stringify([imageDetails ?? {}]);
     }
     return '';
   };
@@ -263,8 +376,316 @@ async function withLinuxService({ active = false } = {}, action) {
     rmSync(home, { recursive: true, force: true });
     if (oldToken === undefined) delete process.env.GH_TOKEN;
     else process.env.GH_TOKEN = oldToken;
+    if (oldImage === undefined) delete process.env.RUNNERIZE_LINUX_IMAGE;
+    else process.env.RUNNERIZE_LINUX_IMAGE = oldImage;
   }
 }
+
+test('service status distinguishes a stale installed release and reports image identity', async () => {
+  await withLinuxService({
+    active: true,
+    imageDetails: {
+      RepoDigests: ['docker.io/catthehacker/ubuntu@sha256:abc123'],
+      Created: '2026-07-01T12:34:56Z',
+    },
+  }, async (service, _calls, home) => {
+    await service.installService();
+    const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+    const releaseRoot = join(releases, readdirSync(releases)[0]);
+    const manifestPath = join(releaseRoot, 'package.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    manifest.version = '0.6.0';
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message = '') => logs.push(String(message));
+    try {
+      await service.serviceStatus({
+        fetchImpl: async () => new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+          headers: { 'content-type': 'application/json' },
+        }),
+      });
+    } finally {
+      console.log = originalLog;
+    }
+
+    assert.ok(logs.includes(`Command package: runnerize ${RUNNERIZE_VERSION}`));
+    assert.ok(logs.includes(`Latest on npm: ${RUNNERIZE_VERSION}`));
+    assert.ok(logs.some((line) => /linux: installed=0\.6\.0 running=yes status=STALE/.test(line)));
+    assert.ok(logs.some((line) => /Linux image: reference=docker\.io\/catthehacker\/ubuntu:full-latest runtime=podman digest=sha256:abc123 created=2026-07-01T12:34:56Z/.test(line)));
+  });
+});
+
+test('service status and update use the Linux image configured in the service environment file', async () => {
+  await withLinuxService({ image: 'registry.example/linux:service' }, async (service, calls, home) => {
+    const environmentPath = join(home, 'runnerize.env');
+    writeFileSync(environmentPath, 'RUNNERIZE_LINUX_IMAGE=registry.example/linux:service\n');
+    process.env.RUNNERIZE_SYSTEMD_ENV_FILE = environmentPath;
+    await service.installService();
+    delete process.env.RUNNERIZE_SYSTEMD_ENV_FILE;
+    delete process.env.RUNNERIZE_LINUX_IMAGE;
+
+    const status = await service.serviceStatus({
+      fetchImpl: async () => new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    });
+    assert.equal(status.images[0].reference, 'registry.example/linux:service');
+
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes('registry.npmjs.org')) {
+        return new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user')) {
+        return new Response(JSON.stringify({ login: 'me', type: 'User' }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user/repos?affiliation=owner&per_page=100&page=1')) {
+        return new Response(JSON.stringify([]), { headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    try {
+      await service.updateService({ installVersion: async () => {} });
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+    assert.ok(calls.some((call) => call.file === 'podman'
+      && call.args.join(' ') === 'pull registry.example/linux:service'));
+  });
+});
+
+test('service status degrades npm latest to unknown while offline', async () => {
+  await withLinuxService({}, async (service) => {
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message = '') => logs.push(String(message));
+    try {
+      await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(logs.includes('Latest on npm: unknown (offline or unavailable)'));
+  });
+});
+
+test('npm latest rejects invalid semantic versions', async () => {
+  await withLinuxService({}, async (service) => {
+    const response = (version) => new Response(JSON.stringify({ version }), {
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(await service.latestPublishedVersion({ fetchImpl: async () => response('01.2.3') }), null);
+    assert.equal(await service.latestPublishedVersion({ fetchImpl: async () => response('1.2.3-01') }), null);
+    assert.equal(await service.latestPublishedVersion({ fetchImpl: async () => response('1.2.3-beta.1') }), '1.2.3-beta.1');
+  });
+});
+
+test('service status treats a stable release as newer than its prerelease', async () => {
+  await withLinuxService({}, async (service, _calls, home) => {
+    await service.installService();
+    const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+    const manifestPath = join(releases, readdirSync(releases)[0], 'package.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    manifest.version = '1.0.0-beta.1';
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message = '') => logs.push(String(message));
+    try {
+      await service.serviceStatus({
+        fetchImpl: async () => new Response(JSON.stringify({ version: '1.0.0' }), {
+          headers: { 'content-type': 'application/json' },
+        }),
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(logs.some((line) => /installed=1\.0\.0-beta\.1 running=no status=STALE/.test(line)));
+  });
+});
+
+test('service update refuses while a runnerize job is busy', async () => {
+  await withLinuxService({}, async (service, _calls, home) => {
+    await service.installService();
+    const oldFetch = globalThis.fetch;
+    const prefix = (await import('../../src/github.js')).runnerNamePrefix();
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes('registry.npmjs.org')) {
+        return new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user')) {
+        return new Response(JSON.stringify({ login: 'me', type: 'User' }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user/repos?affiliation=owner&per_page=100&page=1')) {
+        return new Response(JSON.stringify([{
+          full_name: 'me/repo', private: true, fork: false, archived: false,
+          owner: { login: 'me', type: 'User' },
+        }]), { headers: { 'content-type': 'application/json' } });
+      }
+      if (url.includes('/actions/runners')) {
+        return new Response(JSON.stringify({
+          runners: [{ id: 1, name: `${prefix}1`, status: 'online', busy: true, labels: [] }],
+        }), { headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    let installed = false;
+    try {
+      await assert.rejects(
+        () => service.updateService({ installVersion: async () => { installed = true; } }),
+        /Refusing to update while 1 runnerize job\(s\) are active.*--force/,
+      );
+      assert.equal(installed, false);
+      assert.ok(existsSync(join(home, '.config', 'systemd', 'user', 'runnerize.service')));
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
+test('service update refreshes the image and installs npm latest when idle', async () => {
+  await withLinuxService({}, async (service, calls) => {
+    await service.installService();
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes('registry.npmjs.org')) {
+        return new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user')) {
+        return new Response(JSON.stringify({ login: 'me', type: 'User' }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user/repos?affiliation=owner&per_page=100&page=1')) {
+        return new Response(JSON.stringify([]), { headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    let installed;
+    try {
+      const result = await service.updateService({
+        installVersion: async (version, options) => { installed = { version, options }; },
+      });
+      assert.deepEqual(installed, { version: RUNNERIZE_VERSION, options: { force: false } });
+      assert.equal(result.imageRefreshed, true);
+      assert.ok(calls.some((call) => call.kind === 'exec'
+        && call.file === 'podman' && call.args.join(' ') === 'pull docker.io/catthehacker/ubuntu:full-latest'));
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
+test('service update does not install when image refresh fails', async () => {
+  await withLinuxService({ imagePullFails: true }, async (service) => {
+    await service.installService();
+    let installed = false;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes('registry.npmjs.org')) {
+        return new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user')) {
+        return new Response(JSON.stringify({ login: 'me', type: 'User' }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user/repos?affiliation=owner&per_page=100&page=1')) {
+        return new Response(JSON.stringify([]), { headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    try {
+      await assert.rejects(
+        service.updateService({ installVersion: async () => { installed = true; } }),
+        /Could not refresh the configured Linux image/,
+      );
+      assert.equal(installed, false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
+test('launchd install materializes a private release and status reads its version', async () => {
+  await withMacosService({}, async (service, calls, home) => {
+    await service.installService();
+    const agentPath = join(home, 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist');
+    const plist = readFileSync(agentPath, 'utf8');
+    const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+    const release = join(releases, readdirSync(releases)[0]);
+    assert.ok(plist.includes(join(release, 'bin', 'runnerize.js')));
+    assert.ok(calls.some((call) => call.file === 'launchctl' && call.args[0] === 'bootstrap'));
+
+    const status = await service.serviceStatus({
+      fetchImpl: async () => new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    });
+    assert.equal(status.services[0].backend, 'macos');
+    assert.equal(status.services[0].version, RUNNERIZE_VERSION);
+  });
+});
+
+test('macOS service update refreshes the Linux image configured in launchd', async () => {
+  await withMacosService({ linuxRuntime: true }, async (service, calls) => {
+    process.env.RUNNERIZE_LINUX_IMAGE = 'registry.example/linux:macos';
+    await service.installService();
+    delete process.env.RUNNERIZE_LINUX_IMAGE;
+
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes('registry.npmjs.org')) {
+        return new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user')) {
+        return new Response(JSON.stringify({ login: 'me', type: 'User' }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/user/repos?affiliation=owner&per_page=100&page=1')) {
+        return new Response(JSON.stringify([]), { headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    try {
+      await service.updateService({ installVersion: async () => {} });
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+    assert.ok(calls.some((call) => call.file === 'podman'
+      && call.args.join(' ') === 'pull registry.example/linux:macos'));
+  });
+});
+
+test('forced launchd install stops runnerize tart VMs before restarting', async () => {
+  await withMacosService({ force: true }, async (service, calls) => {
+    await service.installService({ force: true });
+    assert.ok(calls.some((call) => call.file === 'tart' && call.args.join(' ') === 'stop runnerize-active'));
+    assert.ok(calls.some((call) => call.file === 'tart' && call.args.join(' ') === 'delete runnerize-active'));
+    assert.ok(!calls.some((call) => call.file === 'tart' && call.args.includes('other-vm') && ['stop', 'delete'].includes(call.args[0])));
+  });
+});
 
 test('systemd install materializes a cache-independent package release', async () => {
   await withLinuxService({}, async (service, calls, home) => {
@@ -318,6 +739,30 @@ test('systemd uninstall removes private package releases', async () => {
   });
 });
 
+test('Windows status reports independent WSL and native installed versions', async () => {
+  await withWindowsService({
+    wslInstalledRoot: '/home/ani/.local/share/runnerize-service/releases/0.6.0.1',
+    wslInstalledVersion: '0.6.0',
+    windowsTaskRunning: true,
+  }, async (service, _harness, appData) => {
+    const nativeRoot = join(appData, 'runnerize', 'releases', '0.7.0.1');
+    mkdirSync(nativeRoot, { recursive: true });
+    writeFileSync(join(nativeRoot, 'package.json'), JSON.stringify({ version: '0.7.0' }));
+    mkdirSync(join(appData, 'runnerize'), { recursive: true });
+    writeFileSync(join(appData, 'runnerize', 'current-release'), nativeRoot);
+
+    const status = await service.serviceStatus({
+      fetchImpl: async () => new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    });
+    assert.deepEqual(status.services.map(({ backend, version, running }) => ({ backend, version, running })), [
+      { backend: 'linux (WSL Ubuntu)', version: '0.6.0', running: true },
+      { backend: 'windows', version: '0.7.0', running: true },
+    ]);
+  });
+});
+
 test('Windows install skips docker-desktop, reuses PATH Node, and delegates service install', async () => {
   await withWindowsService({ cachedNode: false }, async (service, harness, appData) => {
     await service.installService();
@@ -327,7 +772,7 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
       const command = commandOf(call);
       return command[0] === 'bash' && command[1] === '-lc'
         && command.includes('/usr/bin/node')
-        && command.includes('/home/ani/.local/share/runnerize/bin/runnerize.js')
+        && command.some((value) => String(value).startsWith('/home/ani/.local/share/runnerize-service/releases/'))
         && command.includes('install');
     }));
     assert.ok(harness.calls.some((call) => commandOf(call).includes('enable-linger')));
@@ -356,7 +801,9 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     assert.match(launcher, /SetThreadExecutionState\(\[Convert\]::ToUInt32\('80000001', 16\)\)/);
     assert.match(launcher, /run --only windows/);
     assert.match(launcher, /runnerize-windows\.log/);
-    assert.ok(existsSync(join(appData, 'runnerize', 'app', 'bin', 'runnerize.js')));
+    const installedRoot = readFileSync(join(appData, 'runnerize', 'current-release'), 'utf8');
+    assert.ok(installedRoot.startsWith(join(appData, 'runnerize', 'releases')));
+    assert.ok(existsSync(join(installedRoot, 'bin', 'runnerize.js')));
   });
 });
 
@@ -372,6 +819,48 @@ test('Windows first install does not restart an inactive dispatcher task', async
   await withWindowsService({}, async (service, harness) => {
     await service.installService();
     assert.ok(!harness.calls.some((call) => call.args.at(-1)?.includes("Stop-ScheduledTask -TaskName 'runnerize-windows'")));
+  });
+});
+
+test('Windows update restarts the native task after installing its replacement', async () => {
+  await withWindowsService({ windowsTaskRunning: true }, async (service, harness) => {
+    await service.installService();
+    harness.calls.length = 0;
+    await service.installService({ update: true });
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    const stop = taskCommands.findIndex((command) => command.includes("Stop-ScheduledTask -TaskName 'runnerize-windows'"));
+    const register = taskCommands.findIndex((command) => command.includes("$taskName = 'runnerize-windows'") && command.includes('Register-ScheduledTask'));
+    const start = taskCommands.findIndex((command) => command.includes("Start-ScheduledTask -TaskName 'runnerize-windows'"));
+    assert.ok(stop >= 0 && register > stop && start > register);
+  });
+});
+
+test('Windows update fails if an installed native backend cannot restart', async () => {
+  await withWindowsService({ windowsTaskRunning: true }, async (service, harness) => {
+    await service.installService();
+    harness.options.startTaskFails = true;
+    await assert.rejects(service.installService({ update: true }), /Could not update every installed runnerize backend: windows/);
+  });
+});
+
+test('Windows update restores an inactive native task registration when startup fails', async () => {
+  await withWindowsService({ recordRegisteredArguments: true }, async (service, harness, appData) => {
+    await service.installService();
+    const previousRoot = readFileSync(join(appData, 'runnerize', 'current-release'), 'utf8');
+    harness.options.startTaskFailsOnce = true;
+
+    await assert.rejects(service.installService({ update: true }), /Could not update every installed runnerize backend: windows/);
+
+    assert.equal(readFileSync(join(appData, 'runnerize', 'current-release'), 'utf8'), previousRoot);
+    assert.equal(harness.registeredActions.get('runnerize-windows'), true);
+    const registrations = harness.calls.filter((call) => call.file.toLowerCase().endsWith('powershell.exe')
+      && call.args.at(-1).includes("$taskName = 'runnerize-windows'")
+      && call.args.at(-1).includes('Register-ScheduledTask'));
+    assert.ok(registrations.length >= 3, 'initial, replacement, and rollback task registrations run');
+    const restoredBin = join(previousRoot, 'bin', 'runnerize.js');
+    assert.ok(readFileSync(join(appData, 'runnerize', 'runnerize-windows.ps1'), 'utf8').includes(restoredBin));
   });
 });
 
@@ -759,13 +1248,13 @@ test('Windows uninstall removes the WSL service, task, package, and cache', asyn
     await service.uninstallService();
     assert.ok(harness.calls.some((call) => {
       const command = commandOf(call);
-      return command.includes('service') && command.includes('uninstall')
+      return command.includes('systemctl') && command.includes('disable') && command.includes('--now')
         && command[2]?.includes('XDG_RUNTIME_DIR');
     }));
     assert.ok(harness.calls.some((call) => commandOf(call).includes('disable-linger')));
     assert.ok(harness.calls.some((call) => {
       const command = commandOf(call);
-      return command[0] === 'rm' && command.includes('/home/ani/.local/share/runnerize');
+      return command[0] === 'rm' && command.includes('/home/ani/.local/share/runnerize-service');
     }));
     assert.ok(harness.calls.some((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('Unregister-ScheduledTask')));
   });

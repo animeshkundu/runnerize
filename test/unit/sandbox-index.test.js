@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { detectFlavors, linux, windows, macos } from '../../src/sandbox/index.js';
+import { RUNNERIZE_VERSION_LABEL } from '../../src/version.js';
 
 // detectFlavors returns the exported flavor singletons whose `available()` resolves
 // truthy, and swallows a throwing `available()` as "not available". We drive it by
@@ -26,6 +27,7 @@ test('stub flavors expose the frozen FLAVOR shape', () => {
     assert.equal(typeof flavor.available, 'function');
     assert.equal(typeof flavor.launch, 'function');
     assert.ok(flavor.labels.includes('self-hosted'), 'every flavor advertises self-hosted');
+    assert.ok(flavor.labels.includes(RUNNERIZE_VERSION_LABEL), 'every flavor advertises the running runnerize version');
   }
   assert.equal(linux.key, 'linux');
   assert.equal(windows.key, 'windows');
@@ -40,7 +42,7 @@ test('native VM flavors expose their host concurrency caps', async () => {
 test('detectFlavors returns only available flavors with snapshotted labels', async () => {
   await withAvailability({
     linux: async function available() {
-      this.labels = ['self-hosted', 'linux', 'x64', 'kvm'];
+      this.labels = ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL, 'kvm'];
       return true;
     },
     windows: async () => true,
@@ -49,9 +51,9 @@ test('detectFlavors returns only available flavors with snapshotted labels', asy
     const flavors = await detectFlavors();
     assert.deepEqual(flavors.map((f) => f.key), ['linux', 'windows']);
     assert.notEqual(flavors[0], linux, 'returns a per-poll snapshot, not mutable singleton state');
-    assert.deepEqual(flavors[0].labels, ['self-hosted', 'linux', 'x64', 'kvm']);
-    linux.labels = ['self-hosted', 'linux', 'x64'];
-    assert.deepEqual(flavors[0].labels, ['self-hosted', 'linux', 'x64', 'kvm']);
+    assert.deepEqual(flavors[0].labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL, 'kvm']);
+    linux.labels = ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL];
+    assert.deepEqual(flavors[0].labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL, 'kvm']);
   });
 });
 

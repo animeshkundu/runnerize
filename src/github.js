@@ -390,6 +390,7 @@ export async function listRunners(fullName, { signal } = {}) {
     id: runner.id,
     name: runner.name,
     status: runner.status,
+    busy: runner.busy === true,
     labels: Array.isArray(runner.labels)
       ? runner.labels.map((label) => typeof label === 'string' ? label : label.name)
       : [],

@@ -43,18 +43,24 @@ node bin/runnerize.js status       # show flavors, owned-private repos, live run
 node bin/runnerize.js run --dry-run  # enumerate demand, mint nothing
 node bin/runnerize.js remove       # one reconcile/cleanup pass
 node bin/runnerize.js service install   # install as a boot service
+node bin/runnerize.js service status    # show command/service versions, running state, and Linux image identity
+node bin/runnerize.js service update    # update from npm while idle; add --force to interrupt active jobs
 
 # once published:
 npx github:animeshkundu/runnerize#<tag> run
 ```
 
-Point a repo's workflow at the runner (always name the OS/arch labels — a bare `[self-hosted]` is ambiguous across flavors):
+Point a repo's workflow at the runner (always name the OS/arch labels — a bare `[self-hosted]` is ambiguous across flavors). Every runner also advertises the exact package label, such as `runnerize-0.7.1`, so a workflow can require a specific dispatcher release:
 
 ```yaml
 jobs:
   build:
     runs-on: [self-hosted, linux, x64]
 ```
+
+Only the exact version is labeled. There is no `runnerize-0.7` label because GitHub labels are exact selectors, not minimum-version constraints.
+
+`service update` resolves npm's current `latest`, refreshes the configured Linux image, installs a private immutable service release, and restarts the dispatcher. It refuses to proceed while a runnerize-owned GitHub runner is busy unless `--force` is supplied. For reproducible environments, prefer a deliberately updated immutable image tag or digest over a floating `latest` tag. Image digests are reported by `service status` rather than added as high-cardinality scheduling labels.
 
 For Android instrumented tests, a linux host with usable `/dev/kvm` automatically
 advertises `[self-hosted, linux, x64, kvm]` and passes only that device through to the

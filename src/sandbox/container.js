@@ -4,11 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ensureImage, ensureRunnerBinary } from '../runner.js';
+import { RUNNERIZE_VERSION_LABEL } from '../version.js';
 
 // Fully qualified so rootless podman resolves it without needing an
 // unqualified-search-registries entry in registries.conf (podman errors 125 on a
 // bare short name; docker is lenient, so this stays correct there too).
-const DEFAULT_IMAGE = 'docker.io/catthehacker/ubuntu:full-latest';
+export const DEFAULT_LINUX_IMAGE = 'docker.io/catthehacker/ubuntu:full-latest';
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_LIFETIME_MS = 7 * 24 * 60 * 60_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
@@ -16,7 +17,7 @@ const KILL_GRACE_MS = 1_000;
 const FORCE_SETTLE_MS = 7_000;
 const DIAGNOSTICS_MAX_BYTES = 64 * 1024;
 const KVM_PROBE_TIMEOUT_MS = 5_000;
-const BASE_LINUX_LABELS = ['self-hosted', 'linux', 'x64'];
+const BASE_LINUX_LABELS = ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL];
 
 function appendBounded(current, chunk) {
   const combined = Buffer.concat([current, Buffer.from(chunk)]);
@@ -260,7 +261,7 @@ export const linux = {
     const target = await backend();
     if (!target) throw new Error('podman or docker is required for the linux flavor');
     const kvm = linux.kvm && await hasUsableKvm(target);
-    const image = process.env.RUNNERIZE_LINUX_IMAGE || DEFAULT_IMAGE;
+    const image = process.env.RUNNERIZE_LINUX_IMAGE || DEFAULT_LINUX_IMAGE;
     if (target.distro) {
       const inspect = invocation(target, ['image', 'inspect', image], process.env);
       try {

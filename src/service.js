@@ -1,10 +1,12 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getToken } from './github.js';
+import { getToken, listOwnedPrivateRepos, listRunners, sanitizeHostname } from './github.js';
 import { installGuard, uninstallGuard } from './guard.js';
+import { DEFAULT_LINUX_IMAGE } from './sandbox/container.js';
+import { RUNNERIZE_VERSION } from './version.js';
 
 const SERVICE_NAME = 'runnerize';
 const DEFAULT_WSL_NODE_VERSION = 'v24.18.0';
@@ -15,12 +17,14 @@ const SERVICE_PACKAGE_ENTRIES = ['bin', 'src', 'package.json'];
 const ELEVATION_TIMEOUT_MS = 55_000;
 const PROBE_TIMEOUT_MS = 10_000;
 const INSTALL_TIMEOUT_MS = 120_000;
+const NPM_LOOKUP_TIMEOUT_MS = 10_000;
 const WSL_INSTALL_GUIDANCE = 'In an elevated PowerShell: wsl --install -d Ubuntu\nThen restart Windows if prompted and rerun this command.';
 const GITHUB_AUTH_GUIDANCE = 'Run: gh auth login\nOr set GH_TOKEN/GITHUB_TOKEN. The credential needs Administration, Actions, and Metadata access across all owned private repositories.';
 const DEFAULT_MACOS_IMAGE = 'ghcr.io/cirruslabs/macos-sequoia-base:latest';
 const HOMEBREW_INSTALL_COMMAND = '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"';
 const TART_INSTALL_COMMAND = 'brew install cirruslabs/cli/tart';
 const MACOS_ENVIRONMENT_KEYS = [
+  'RUNNERIZE_LINUX_IMAGE',
   'RUNNERIZE_MACOS_IMAGE',
   'RUNNERIZE_MACOS_SSH_USER',
   'RUNNERIZE_MACOS_SSH_KEY',
@@ -117,7 +121,7 @@ function systemdAppPath(...parts) {
 
 function servicePackageManifest() {
   const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
-  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(manifest.version)) {
+  if (!SEMVER_PATTERN.test(manifest.version)) {
     throw new Error('runnerize package version is invalid.');
   }
   const runtimeDependencies = [manifest.dependencies, manifest.optionalDependencies]
@@ -135,6 +139,449 @@ function copyServicePackage(destination, manifest = servicePackageManifest()) {
   return manifest;
 }
 
+function readInstalledVersion(root) {
+  if (!root) return null;
+  try {
+    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+    return typeof manifest.version === 'string' ? manifest.version : null;
+  } catch {
+    return null;
+  }
+}
+
+function systemdUnitPath() {
+  return join(homedir(), '.config', 'systemd', 'user', `${SERVICE_NAME}.service`);
+}
+
+function executableRoot(spec, pathApi = { dirname }) {
+  const normalized = spec?.replaceAll('\\\\', '\\');
+  const match = normalized?.match(/(?:^|\s)"?([^"\s]*[\\/]bin[\\/]runnerize\.js)"?(?:\s|$)/);
+  if (!match) return null;
+  return pathApi.dirname(pathApi.dirname(match[1]));
+}
+
+function systemdServiceState() {
+  let unit = '';
+  try {
+    unit = readFileSync(systemdUnitPath(), 'utf8');
+  } catch {
+    // Missing units are reported as not installed below.
+  }
+  const installedRoot = executableRoot(unit.split(/\r?\n/).find((line) => line.startsWith('ExecStart=')));
+  const hasSystemctl = commandExists('systemctl');
+  const effectiveEnvironment = hasSystemctl
+    ? captureResult('systemctl', [
+      '--user', 'show', `${SERVICE_NAME}.service`, '--property=Environment', '--value',
+    ])
+    : { status: 1, stdout: '' };
+  return {
+    backend: platform() === 'darwin' ? 'launchd' : 'linux',
+    installed: Boolean(installedRoot),
+    version: readInstalledVersion(installedRoot),
+    running: hasSystemctl
+      && captureResult('systemctl', ['--user', 'is-active', '--quiet', `${SERVICE_NAME}.service`]).status === 0,
+    root: installedRoot,
+    environment: systemdServiceEnvironment(
+      unit,
+      (fileName) => readFileSync(fileName, 'utf8'),
+      effectiveEnvironment.status === 0 ? effectiveEnvironment.stdout : '',
+    ),
+  };
+}
+
+function launchdServiceState() {
+  const agentPath = join(homedir(), 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist');
+  let installedRoot = null;
+  try {
+    const plist = readFileSync(agentPath, 'utf8');
+    const binMatch = plist.match(/<string>([^<]*[\\/]bin[\\/]runnerize\.js)<\/string>/);
+    if (binMatch) installedRoot = dirname(dirname(binMatch[1]));
+  } catch {
+    // Missing or unreadable launchd agents are reported as not installed.
+  }
+  const environment = new Map();
+  try {
+    const plist = readFileSync(agentPath, 'utf8');
+    for (const match of plist.matchAll(/<key>(RUNNERIZE_[^<]+)<\/key><string>([^<]*)<\/string>/g)) {
+      environment.set(match[1], match[2]
+        .replaceAll('&quot;', '"')
+        .replaceAll('&apos;', "'")
+        .replaceAll('&gt;', '>')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&amp;', '&'));
+    }
+  } catch {
+    // Missing or unreadable launchd agents have no configured environment.
+  }
+  return {
+    backend: 'macos',
+    installed: Boolean(installedRoot),
+    version: readInstalledVersion(installedRoot),
+    running: captureResult('launchctl', ['print', `gui/${process.getuid()}/io.runnerize.dispatcher`]).status === 0,
+    root: installedRoot,
+    environment,
+  };
+}
+
+function windowsServiceState() {
+  let installedRoot = null;
+  try {
+    installedRoot = readFileSync(windowsDataPath('current-release'), 'utf8').trim();
+  } catch {
+    // Backward compatibility with the original mutable materialization layout.
+    const legacyRoot = windowsDataPath('app');
+    if (existsSync(join(legacyRoot, 'package.json'))) installedRoot = legacyRoot;
+  }
+  const installed = Boolean(installedRoot && existsSync(join(installedRoot, 'package.json')));
+  return {
+    backend: 'windows',
+    installed,
+    version: installed ? readInstalledVersion(installedRoot) : null,
+    running: scheduledTaskIsRunning('runnerize-windows'),
+    root: installed ? installedRoot : null,
+  };
+}
+
+function wslServiceState(context) {
+  const unitPath = `${context.home}/.config/systemd/user/${SERVICE_NAME}.service`;
+  let unit = '';
+  let root = null;
+  let version = null;
+  try {
+    unit = wslCapture(context.distro, context.user, ['cat', unitPath], { timeout: PROBE_TIMEOUT_MS });
+    const execStart = unit.split('\n').find((line) => line.startsWith('ExecStart='));
+    root = executableRoot(execStart, posix);
+    version = root
+      ? JSON.parse(wslCapture(context.distro, context.user, ['cat', `${root}/package.json`], { timeout: PROBE_TIMEOUT_MS })).version
+      : null;
+  } catch {
+    // A missing or unreadable unit is reported as not installed below.
+  }
+  const running = Boolean(root) && captureResult('wsl.exe', wslArgs(
+    context.distro,
+    context.user,
+    systemdWslArgs(['systemctl', '--user', 'is-active', '--quiet', `${SERVICE_NAME}.service`]),
+  ), { timeout: PROBE_TIMEOUT_MS }).status === 0;
+  let effectiveEnvironment = '';
+  try {
+    effectiveEnvironment = wslCapture(context.distro, context.user, systemdWslArgs([
+      'systemctl', '--user', 'show', `${SERVICE_NAME}.service`, '--property=Environment', '--value',
+    ]), { timeout: PROBE_TIMEOUT_MS });
+  } catch {
+    // Inactive or missing units may not expose an effective environment.
+  }
+  const environment = systemdServiceEnvironment(
+    unit,
+    (fileName) => wslCapture(context.distro, context.user, ['cat', fileName], { timeout: PROBE_TIMEOUT_MS }),
+    effectiveEnvironment,
+  );
+  return { backend: `linux (WSL ${context.distro})`, installed: Boolean(root), version, running, root, environment };
+}
+
+const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+export async function latestPublishedVersion({ fetchImpl = globalThis.fetch } = {}) {
+  try {
+    const response = await fetchImpl('https://registry.npmjs.org/runnerize/latest', {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(NPM_LOOKUP_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return typeof data.version === 'string' && SEMVER_PATTERN.test(data.version) ? data.version : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseEnvironmentAssignments(text) {
+  const values = new Map();
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const assignment = line.startsWith('export ') ? line.slice(7).trim() : line;
+    const separator = assignment.indexOf('=');
+    if (separator < 1) continue;
+    const key = assignment.slice(0, separator).trim();
+    let value = assignment.slice(separator + 1).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.slice(1, -1);
+    }
+    values.set(key, value);
+  }
+  return values;
+}
+
+function systemdEnvironmentFile(unit) {
+  const directive = String(unit).split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith('EnvironmentFile='));
+  if (!directive) return null;
+  let fileName = directive.slice('EnvironmentFile='.length).trim().replace(/^-/, '');
+  if (fileName.startsWith('"') && fileName.endsWith('"')) fileName = fileName.slice(1, -1);
+  return fileName || null;
+}
+
+function systemdServiceEnvironment(unit, readText, effectiveEnvironment = '') {
+  const values = new Map();
+  const environmentFile = systemdEnvironmentFile(unit);
+  if (environmentFile) {
+    try {
+      for (const [key, value] of parseEnvironmentAssignments(readText(environmentFile))) {
+        if (key === 'RUNNERIZE_LINUX_IMAGE') values.set(key, value);
+      }
+    } catch {
+      // Optional or unreadable environment files do not hide the installed service.
+    }
+  }
+  for (const directive of String(unit).split(/\r?\n/).map((line) => line.trim())) {
+    if (!directive.startsWith('Environment=')) continue;
+    for (const [key, value] of parseEnvironmentAssignments(directive.slice('Environment='.length))) {
+      if (key === 'RUNNERIZE_LINUX_IMAGE') values.set(key, value);
+    }
+  }
+  const effectiveImage = String(effectiveEnvironment)
+    .match(/(?:^|\s)"?RUNNERIZE_LINUX_IMAGE=([^"\s]+)"?/)?.[1];
+  if (effectiveImage) values.set('RUNNERIZE_LINUX_IMAGE', effectiveImage);
+  return values;
+}
+
+function configuredLinuxImage(state) {
+  return state?.environment?.get('RUNNERIZE_LINUX_IMAGE')
+    || process.env.RUNNERIZE_LINUX_IMAGE
+    || DEFAULT_LINUX_IMAGE;
+}
+
+function nativeContainerRuntime() {
+  for (const runtime of ['podman', 'docker']) {
+    if (captureResult(runtime, ['--version'], { timeout: PROBE_TIMEOUT_MS }).status === 0) return runtime;
+  }
+  return null;
+}
+
+function imageDetails(raw) {
+  try {
+    const details = JSON.parse(raw)?.[0] ?? {};
+    const digest = details.Digest
+      ?? details.RepoDigests?.find((value) => value.includes('@sha256:'))?.split('@')[1]
+      ?? details.Id
+      ?? null;
+    return { digest, created: details.Created ?? null };
+  } catch {
+    return { digest: null, created: null };
+  }
+}
+
+function nativeImageState(state) {
+  const reference = configuredLinuxImage(state);
+  const runtime = nativeContainerRuntime();
+  if (!runtime) return { reference, runtime: null, digest: null, created: null };
+  const result = captureResult(runtime, ['image', 'inspect', reference], { timeout: PROBE_TIMEOUT_MS });
+  const details = result.status === 0 ? imageDetails(result.stdout) : { digest: null, created: null };
+  return { reference, runtime, ...details };
+}
+
+function wslImageState(context, state) {
+  const reference = configuredLinuxImage(state);
+  for (const runtime of ['podman', 'docker']) {
+    try {
+      const raw = wslCapture(context.distro, context.user, [runtime, 'image', 'inspect', reference], { timeout: PROBE_TIMEOUT_MS });
+      return { reference, runtime: `${runtime} (WSL ${context.distro})`, ...imageDetails(raw) };
+    } catch {
+      // Try the other supported runtime.
+    }
+  }
+  return { reference, runtime: null, digest: null, created: null };
+}
+
+async function imageStates(states) {
+  const serviceStateList = states ?? await serviceStates();
+  if (platform() === 'win32') {
+    try {
+      const context = resolveWslContext();
+      const state = serviceStateList.find(({ backend }) => backend.startsWith('linux (WSL'));
+      return [wslImageState(context, state)];
+    } catch {
+      return [{ reference: configuredLinuxImage(), runtime: null, digest: null, created: null }];
+    }
+  }
+  return [await nativeImageState(serviceStateList[0])];
+}
+
+function refreshWslImage(context, state) {
+  const reference = configuredLinuxImage(state);
+  const runtime = ensureWslRuntime(context, { install: false });
+  wslRun(context.distro, context.user, [runtime, 'pull', reference], { timeout: 10 * 60_000 });
+}
+
+async function refreshLinuxImages(state) {
+  if (platform() === 'win32') {
+    try {
+      refreshWslImage(resolveWslContext(), state);
+      return true;
+    } catch (error) {
+      console.warn(`Linux image refresh unavailable: ${error.message}`);
+      return false;
+    }
+  }
+  try {
+    const runtime = nativeContainerRuntime();
+    if (!runtime) throw new Error('podman or docker is required for the linux flavor');
+    run(runtime, ['pull', configuredLinuxImage(state)], { timeout: 10 * 60_000 });
+    return true;
+  } catch (error) {
+    console.warn(`Linux image refresh unavailable: ${error.message}`);
+    return false;
+  }
+}
+
+async function serviceStates() {
+  if (platform() === 'win32') {
+    const states = [];
+    try {
+      states.push(wslServiceState(resolveWslContext()));
+    } catch {
+      states.push({ backend: 'linux (WSL)', installed: false, version: null, running: false, root: null });
+    }
+    states.push(windowsServiceState());
+    return states;
+  }
+  return [platform() === 'darwin' ? launchdServiceState() : systemdServiceState()];
+}
+
+function parseVersion(version) {
+  const match = SEMVER_PATTERN.exec(String(version));
+  if (!match) return null;
+  return {
+    core: [Number(match[1]), Number(match[2]), Number(match[3])],
+    prerelease: match[4]?.split('.') ?? [],
+  };
+}
+
+function compareVersions(left, right) {
+  const a = parseVersion(left);
+  const b = parseVersion(right);
+  if (!a || !b) return String(left).localeCompare(String(right));
+  for (let index = 0; index < 3; index += 1) {
+    if (a.core[index] !== b.core[index]) return a.core[index] < b.core[index] ? -1 : 1;
+  }
+  if (!a.prerelease.length || !b.prerelease.length) {
+    if (a.prerelease.length === b.prerelease.length) return 0;
+    return a.prerelease.length ? -1 : 1;
+  }
+  const identifiers = Math.max(a.prerelease.length, b.prerelease.length);
+  for (let index = 0; index < identifiers; index += 1) {
+    if (a.prerelease[index] === undefined) return -1;
+    if (b.prerelease[index] === undefined) return 1;
+    if (a.prerelease[index] === b.prerelease[index]) continue;
+    const aNumeric = /^\d+$/.test(a.prerelease[index]);
+    const bNumeric = /^\d+$/.test(b.prerelease[index]);
+    if (aNumeric && bNumeric) return Number(a.prerelease[index]) < Number(b.prerelease[index]) ? -1 : 1;
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+    return a.prerelease[index] < b.prerelease[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+function versionRelation(installedVersion, latestVersion) {
+  if (!installedVersion) return 'NOT INSTALLED';
+  if (!latestVersion) return 'LATEST UNKNOWN';
+  const comparison = compareVersions(installedVersion, latestVersion);
+  if (comparison === 0) return 'CURRENT';
+  return comparison < 0 ? 'STALE' : 'AHEAD';
+}
+
+export async function serviceStatus({ fetchImpl } = {}) {
+  const statesPromise = serviceStates();
+  const [states, latestVersion] = await Promise.all([
+    statesPromise,
+    latestPublishedVersion({ fetchImpl }),
+  ]);
+  const images = await imageStates(states);
+  console.log(`Command package: runnerize ${RUNNERIZE_VERSION}`);
+  console.log(`Latest on npm: ${latestVersion ?? 'unknown (offline or unavailable)'}`);
+  for (const state of states) {
+    const relation = versionRelation(state.version, latestVersion);
+    console.log(`${state.backend}: installed=${state.version ?? 'no'} running=${state.running ? 'yes' : 'no'} status=${relation}`);
+  }
+  for (const image of images) {
+    console.log(`Linux image: reference=${image.reference} runtime=${image.runtime ?? 'unavailable'} digest=${image.digest ?? 'not present'} created=${image.created ?? 'unknown'}`);
+  }
+  return { commandVersion: RUNNERIZE_VERSION, latestVersion, services: states, images };
+}
+
+async function serviceRunnerPrefixes() {
+  const prefixes = new Set([`${sanitizeHostname()}-`]);
+  if (platform() === 'win32') {
+    try {
+      const context = resolveWslContext();
+      const hostname = wslCapture(context.distro, context.user, ['hostname'], { timeout: PROBE_TIMEOUT_MS });
+      prefixes.add(`${sanitizeHostname(hostname)}-`);
+    } catch {
+      // A missing WSL backend has no WSL jobs to protect.
+    }
+  }
+  return prefixes;
+}
+
+async function activeRunnerNames() {
+  const prefixes = await serviceRunnerPrefixes();
+  const repos = await listOwnedPrivateRepos();
+  const active = [];
+  for (const repo of repos) {
+    const runners = await listRunners(repo.full_name);
+    for (const runner of runners) {
+      if (runner.busy && [...prefixes].some((prefix) => runner.name.startsWith(prefix))) {
+        active.push(`${repo.full_name}:${runner.name}`);
+      }
+    }
+  }
+  return active;
+}
+
+function installPublishedVersion(version, { force = false } = {}) {
+  const npm = platform() === 'win32' ? 'npm.cmd' : 'npm';
+  run(npm, [
+    'exec', '--yes', `--package=runnerize@${version}`, '--',
+    'runnerize', 'service', 'install', '--update', ...(force ? ['--force'] : []),
+  ], { timeout: 10 * 60_000, env: { ...process.env, RUNNERIZE_SERVICE_UPDATE: '1' } });
+}
+
+export async function updateService({ force = false, fetchImpl, installVersion = installPublishedVersion } = {}) {
+  const latestVersion = await latestPublishedVersion({ fetchImpl });
+  if (!latestVersion) throw new Error('Could not resolve the latest runnerize version from npm. Check the network connection and try again.');
+
+  const states = await serviceStates();
+  const installedStates = states.filter((state) => state.installed);
+  if (!installedStates.length) {
+    throw new Error('No runnerize service is installed on this host. Run `runnerize service install` first.');
+  }
+
+  if (!force) {
+    const active = await activeRunnerNames();
+    if (active.length) {
+      throw new Error(`Refusing to update while ${active.length} runnerize job(s) are active: ${active.join(', ')}. Retry after they finish, or use --force to interrupt them.`);
+    }
+  }
+
+  const linuxState = installedStates.find(({ backend }) => backend === 'linux' || backend.startsWith('linux (WSL'));
+  const imageState = linuxState ?? (platform() === 'darwin' ? installedStates[0] : undefined);
+  const shouldRefreshLinuxImage = Boolean(linuxState) || platform() === 'darwin' && Boolean(nativeContainerRuntime());
+  let imageRefreshed = false;
+  if (shouldRefreshLinuxImage) {
+    console.log(`Refreshing ${configuredLinuxImage(imageState)} before updating the service...`);
+    imageRefreshed = await refreshLinuxImages(imageState);
+    if (!imageRefreshed) {
+      throw new Error('Could not refresh the configured Linux image. The service was not updated.');
+    }
+  }
+  console.log(`Updating installed runnerize service backend(s) to ${latestVersion}${force ? ' (forced)' : ''}...`);
+  await installVersion(latestVersion, { force });
+  return { latestVersion, forced: force, imageRefreshed };
+}
+
 function materializeSystemdApp() {
   const manifest = servicePackageManifest();
   const releases = systemdAppPath('releases');
@@ -149,7 +596,7 @@ function materializeSystemdApp() {
   return { root: destination, bin: join(destination, 'bin', 'runnerize.js') };
 }
 
-async function installSystemd() {
+async function installSystemd({ force = false } = {}) {
   await preflightRun();
   const unitName = `${SERVICE_NAME}.service`;
   const wasActive = captureResult('systemctl', ['--user', 'is-active', '--quiet', unitName]).status === 0;
@@ -186,6 +633,9 @@ WantedBy=default.target
   run('systemctl', ['--user', 'enable', unitName]);
   if (wasActive) {
     console.log('Restarting the running dispatcher to load the new version…');
+    if (force) {
+      run('systemctl', ['--user', 'kill', '--kill-whom=all', '--signal=SIGKILL', unitName]);
+    }
     run('systemctl', ['--user', 'restart', unitName]);
   } else {
     run('systemctl', ['--user', 'start', unitName]);
@@ -292,7 +742,39 @@ function launchdEnvironmentXml() {
   return `  <key>EnvironmentVariables</key>\n  <dict>\n${entries.join('\n')}\n  </dict>\n`;
 }
 
-async function installLaunchd() {
+function forceStopMacosJobs() {
+  const runtime = nativeContainerRuntime();
+  if (runtime) {
+    const listed = captureResult(runtime, [
+      'ps', '-a', '--filter', 'name=^runnerize-', '--format', '{{.Names}}',
+    ], { timeout: PROBE_TIMEOUT_MS });
+    if (listed.status === 0) {
+      for (const name of listed.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+        run(runtime, ['rm', '-f', name], { timeout: PROBE_TIMEOUT_MS });
+      }
+    }
+  }
+
+  if (!commandExists('tart')) return;
+  const listed = captureResult('tart', ['list', '--format', 'json'], { timeout: PROBE_TIMEOUT_MS });
+  if (listed.status !== 0) throw new Error('Could not list runnerize tart VMs.');
+  let entries;
+  try {
+    const parsed = JSON.parse(listed.stdout);
+    entries = Array.isArray(parsed) ? parsed : parsed.vms ?? parsed.VMs ?? [];
+  } catch {
+    throw new Error('Could not parse the tart VM list.');
+  }
+  const names = entries.map((entry) => typeof entry === 'string' ? entry : entry.name ?? entry.Name)
+    .filter((name) => typeof name === 'string' && name.startsWith('runnerize-'));
+  for (const name of names) {
+    captureResult('tart', ['stop', name], { timeout: PROBE_TIMEOUT_MS });
+    const removed = captureResult('tart', ['delete', name], { timeout: PROBE_TIMEOUT_MS });
+    if (removed.status !== 0) throw new Error(`Could not delete tart VM ${name}.`);
+  }
+}
+
+async function installLaunchd({ force = false } = {}) {
   const audit = await auditMacosPrerequisites();
   let runnable = false;
   try {
@@ -309,6 +791,7 @@ async function installLaunchd() {
   }
   if (!runnable) throw new Error('No runnerize backend is available on this macOS host.');
   const agentPath = join(homedir(), 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist');
+  const installation = materializeSystemdApp();
   mkdirSync(dirname(agentPath), { recursive: true });
   writeFileSync(agentPath, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -316,7 +799,7 @@ async function installLaunchd() {
 <dict>
   <key>Label</key><string>io.runnerize.dispatcher</string>
   <key>ProgramArguments</key>
-  <array><string>${xmlEscape(process.execPath)}</string><string>${xmlEscape(binPath)}</string><string>run</string></array>
+  <array><string>${xmlEscape(process.execPath)}</string><string>${xmlEscape(installation.bin)}</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 ${launchdEnvironmentXml()}  <key>ProcessType</key><string>Background</string>
@@ -327,6 +810,7 @@ ${launchdEnvironmentXml()}  <key>ProcessType</key><string>Background</string>
 `, { mode: 0o644 });
 
   const domain = `gui/${process.getuid()}`;
+  if (force) forceStopMacosJobs();
   spawnSync('launchctl', ['bootout', domain, agentPath], { stdio: 'ignore' });
   run('launchctl', ['bootstrap', domain, agentPath]);
   console.log(`Installed and started ${agentPath}`);
@@ -339,6 +823,7 @@ function uninstallLaunchd() {
     spawnSync('launchctl', ['bootout', `gui/${process.getuid()}`, agentPath], { stdio: 'inherit' });
   }
   rmSync(agentPath, { force: true });
+  rmSync(systemdAppPath(), { recursive: true, force: true });
   console.log(`Removed ${agentPath}`);
 }
 
@@ -576,25 +1061,25 @@ function ensureWslNode({ distro, user, home }) {
 }
 
 function materializeRunnerize({ distro, user, home }) {
-  servicePackageManifest();
-  const destination = `${home}/.local/share/runnerize`;
+  const manifest = servicePackageManifest();
+  const releases = `${home}/.local/share/runnerize-service/releases`;
   const windowsRoot = capture('wsl.exe', ['-d', distro, '-u', user, '-e', 'wslpath', '-a', packageRoot]);
   const script = [
     'set -eu',
     'source="$1"',
-    'destination="$2"',
-    'temporary="${destination}.new.$$"',
-    'rm -rf "$temporary"',
-    'mkdir -p "$temporary"',
-    `cp -R ${SERVICE_PACKAGE_ENTRIES.map((entry) => `"$source/${entry}"`).join(' ')} "$temporary/"`,
-    'old="${destination}.old.$$"',
-    'rm -rf "$old"',
-    'if [ -e "$destination" ]; then mv "$destination" "$old"; fi',
-    'if ! mv "$temporary" "$destination"; then if [ -e "$old" ]; then mv "$old" "$destination"; fi; exit 1; fi',
-    'rm -rf "$old"',
+    'releases="$2"',
+    'version="$3"',
+    'mkdir -p "$releases"',
+    'destination="$releases/${version}.$(date +%s).$$"',
+    'mkdir "$destination"',
+    'trap \'rm -rf "$destination"\' EXIT',
+    `cp -R ${SERVICE_PACKAGE_ENTRIES.map((entry) => `"$source/${entry}"`).join(' ')} "$destination/"`,
+    'trap - EXIT',
+    'printf %s "$destination"',
   ].join('\n');
-  wslRun(distro, user, ['bash', '-c', script, 'runnerize-copy', cleanWslOutput(windowsRoot), destination]);
-  return { root: destination, bin: `${destination}/bin/runnerize.js` };
+  const root = wslCapture(distro, user, ['bash', '-c', script, 'runnerize-copy', cleanWslOutput(windowsRoot), releases, manifest.version]);
+  if (!root.startsWith(`${releases}/`)) throw new Error('Could not materialize the runnerize WSL service release.');
+  return { root, bin: `${root}/bin/runnerize.js` };
 }
 
 function windowsStartupPath(fileName = 'runnerize.vbs') {
@@ -817,8 +1302,20 @@ function scheduledTaskIsRunning(taskName) {
   ]).status === 0;
 }
 
-function deferScheduledTaskRestart(taskName) {
-  console.warn(`${taskName} is running; Windows Task Scheduler cannot signal a graceful drain. The new version will load after the dispatcher next exits or the host restarts.`);
+function stopScheduledTask(taskName) {
+  const script = `Stop-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction Stop`;
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ]);
+  if (result.status !== 0) throw new Error(`Could not stop ${taskName}.`);
+}
+
+function startScheduledTask(taskName) {
+  const script = `Start-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction Stop`;
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ]);
+  if (result.status !== 0) throw new Error(`Could not start ${taskName}.`);
 }
 
 function scheduledTaskPrincipal(taskName) {
@@ -922,24 +1419,21 @@ function wslTriggerSpec(context) {
 }
 
 function materializeWindowsApp() {
-  servicePackageManifest();
+  const manifest = servicePackageManifest();
   const root = windowsDataPath();
-  const destination = join(root, 'app');
-  const temporary = join(root, `app.new.${process.pid}`);
-  const old = join(root, `app.old.${process.pid}`);
-  mkdirSync(root, { recursive: true });
+  const releases = windowsDataPath('releases');
+  const temporary = join(releases, `${manifest.version}.new.${process.pid}`);
+  const destination = join(releases, `${manifest.version}.${Date.now()}.${process.pid}`);
+  mkdirSync(releases, { recursive: true });
   rmSync(temporary, { recursive: true, force: true });
   mkdirSync(temporary, { recursive: true });
-  copyServicePackage(temporary);
-  rmSync(old, { recursive: true, force: true });
-  if (existsSync(destination)) renameSync(destination, old);
   try {
+    copyServicePackage(temporary);
     renameSync(temporary, destination);
   } catch (error) {
-    if (existsSync(old)) renameSync(old, destination);
+    rmSync(temporary, { recursive: true, force: true });
     throw error;
   }
-  rmSync(old, { recursive: true, force: true });
   return { root: destination, bin: join(destination, 'bin', 'runnerize.js') };
 }
 
@@ -959,9 +1453,8 @@ function persistWindowsTokenIfNeeded() {
   return true;
 }
 
-function writeWindowsLauncher({ keepAwake = true } = {}) {
+function writeWindowsLauncher(appBin, { keepAwake = true } = {}) {
   const launcherPath = windowsDataPath('runnerize-windows.ps1');
-  const appBin = windowsDataPath('app', 'bin', 'runnerize.js');
   const logPath = windowsDataPath('runnerize-windows.log');
   mkdirSync(dirname(launcherPath), { recursive: true });
   // ES_SYSTEM_REQUIRED | ES_CONTINUOUS (0x80000001) and ES_CONTINUOUS (0x80000000) both have
@@ -1003,15 +1496,18 @@ function wslKeepAwakeSpec(context) {
   };
 }
 
-async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard = false, installGuardOperation = installGuard } = {}) {
+async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard = false, force = false, update = false, installGuardOperation = installGuard } = {}) {
   const audit = await auditWindowsPrerequisites({ noElevate, elevationTimeoutMs });
   if (audit.rebootRequired) return;
 
+  const previousStates = update ? await serviceStates() : [];
+  const requiredBackends = new Set(previousStates.filter((state) => state.installed).map((state) => state.backend.startsWith('linux (WSL') ? 'linux' : state.backend));
   const statuses = [];
   let context;
   let linuxInstalled = false;
   let windowsInstalled = false;
   let linuxError;
+  let windowsError;
   try {
     context = resolveWslContext();
     console.log(`WSL distro: ${context.distro} (user ${context.user})`);
@@ -1027,7 +1523,14 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
     const installation = materializeRunnerize(context);
     const serviceEnvironment = ['env', 'RUNNERIZE_SERVICE_RUN_ONLY=linux'];
     if (preflight.token) serviceEnvironment.push(`RUNNERIZE_SYSTEMD_ENV_FILE=${context.home}/.config/runnerize/.env`);
-    const installCommand = [...serviceEnvironment, node.path, installation.bin, 'service', 'install'];
+    const installCommand = [
+      ...serviceEnvironment,
+      node.path,
+      installation.bin,
+      'service',
+      'install',
+      ...(force ? ['--force'] : []),
+    ];
     wslRun(context.distro, context.user, systemdWslArgs(installCommand));
     const trigger = await installLogonTrigger(wslTriggerSpec(context), { noElevate, elevationTimeoutMs });
     console.log(`Linux logon trigger: ${trigger.kind} (${trigger.detail})`);
@@ -1043,18 +1546,36 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
     try {
       await getToken();
       const windowsTaskName = 'runnerize-windows';
+      const previousWindowsRoot = windowsServiceState().root;
       const wasRunning = scheduledTaskIsRunning(windowsTaskName);
-      const installation = materializeWindowsApp();
-      persistWindowsTokenIfNeeded();
-      const launcher = writeWindowsLauncher();
-      const trigger = await installLogonTrigger(windowsTriggerSpec(launcher), { noElevate, elevationTimeoutMs });
-      if (wasRunning) deferScheduledTaskRestart(windowsTaskName);
-      console.log(`Windows logon trigger: ${trigger.kind} (${trigger.detail})`);
+      if (wasRunning && (update || force)) stopScheduledTask(windowsTaskName);
+      let installation;
+      try {
+        installation = materializeWindowsApp();
+        persistWindowsTokenIfNeeded();
+        const launcher = writeWindowsLauncher(installation.bin);
+        const trigger = await installLogonTrigger(windowsTriggerSpec(launcher), { noElevate, elevationTimeoutMs });
+        if (update || force) startScheduledTask(windowsTaskName);
+        writeFileSync(windowsDataPath('current-release'), installation.root, 'utf8');
+        console.log(`Windows logon trigger: ${trigger.kind} (${trigger.detail})`);
+      } catch (error) {
+        if ((update || force) && previousWindowsRoot) {
+          try {
+            const launcher = writeWindowsLauncher(join(previousWindowsRoot, 'bin', 'runnerize.js'));
+            await installLogonTrigger(windowsTriggerSpec(launcher), { noElevate, elevationTimeoutMs });
+            if (wasRunning) startScheduledTask(windowsTaskName);
+          } catch (rollbackError) {
+            throw new AggregateError([error, rollbackError], `Windows update failed and the previous dispatcher could not be restored: ${error.message}`);
+          }
+        }
+        throw error;
+      }
       console.log(`Windows dispatcher log: ${windowsDataPath('runnerize-windows.log')}`);
       console.log(`runnerize package: ${installation.root}`);
       windowsInstalled = true;
       statuses.push('windows=installed');
     } catch (error) {
+      windowsError = error;
       console.warn(`Windows backend unavailable: ${error.message}`);
       statuses.push('windows=unavailable');
     }
@@ -1069,8 +1590,17 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
   }
 
   console.log(`Backend summary: ${statuses.join(', ')}`);
+  if (update) {
+    const failed = [...requiredBackends].filter((backend) => backend === 'linux' ? !linuxInstalled : !windowsInstalled);
+    if (failed.length) {
+      throw new AggregateError(
+        [linuxError, windowsError].filter(Boolean),
+        `Could not update every installed runnerize backend: ${failed.join(', ')}.`,
+      );
+    }
+  }
   if (!statuses.some((status) => status.endsWith('=installed'))) {
-    throw linuxError ?? new Error('No runnerize backend is available on this Windows host.');
+    throw linuxError ?? windowsError ?? new Error('No runnerize backend is available on this Windows host.');
   }
   if (!noGuard) {
     const manualSteps = [{
@@ -1104,18 +1634,16 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
   }
 
   if (context) {
-    const installation = `${context.home}/.local/share/runnerize`;
-    let nodePath;
-    try {
-      const version = process.env.RUNNERIZE_WSL_NODE_VERSION || DEFAULT_WSL_NODE_VERSION;
-      const cached = `${context.home}/.cache/runnerize/node/${version}/bin/node`;
-      nodePath = wslCapture(context.distro, context.user, ['sh', '-c', 'if [ -x "$1" ]; then printf %s "$1"; else command -v node || true; fi', 'sh', cached]);
-    } catch {
-      nodePath = null;
-    }
-    if (nodePath) bestEffort('wsl.exe', wslArgs(context.distro, context.user, systemdWslArgs([nodePath, `${installation}/bin/runnerize.js`, 'service', 'uninstall'])));
+    const installationRoot = `${context.home}/.local/share/runnerize-service`;
+    bestEffort('wsl.exe', wslArgs(context.distro, context.user, systemdWslArgs([
+      'systemctl', '--user', 'disable', '--now', `${SERVICE_NAME}.service`,
+    ])));
+    bestEffort('wsl.exe', wslArgs(context.distro, context.user, ['rm', '-f', `${context.home}/.config/systemd/user/${SERVICE_NAME}.service`]));
+    bestEffort('wsl.exe', wslArgs(context.distro, context.user, systemdWslArgs([
+      'systemctl', '--user', 'daemon-reload',
+    ])));
     bestEffort('wsl.exe', wslArgs(context.distro, context.user, ['loginctl', 'disable-linger', context.user]));
-    bestEffort('wsl.exe', wslArgs(context.distro, context.user, ['rm', '-rf', installation, `${context.home}/.cache/runnerize/node`, `${context.home}/.config/runnerize`]));
+    bestEffort('wsl.exe', wslArgs(context.distro, context.user, ['rm', '-rf', installationRoot, `${context.home}/.cache/runnerize/node`, `${context.home}/.config/runnerize`]));
   }
 
   for (const taskName of [SERVICE_NAME, 'runnerize-windows', 'runnerize-wsl-keepawake']) {
@@ -1145,7 +1673,7 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
   for (const fileName of ['runnerize.vbs', 'runnerize-windows.vbs', 'runnerize-wsl-keepawake.vbs']) {
     rmSync(windowsStartupPath(fileName), { force: true });
   }
-  for (const artifact of ['app', 'runnerize-windows.ps1', 'runnerize-wsl-keepawake.ps1', 'windows.token', 'runnerize-windows.log']) {
+  for (const artifact of ['app', 'releases', 'current-release', 'runnerize-windows.ps1', 'runnerize-wsl-keepawake.ps1', 'windows.token', 'runnerize-windows.log']) {
     rmSync(windowsDataPath(artifact), { recursive: true, force: true });
   }
   if (!noGuard && !noElevate) {
@@ -1163,17 +1691,19 @@ function elevationDisabled(options) {
 }
 
 export async function installService(options = {}) {
-  if (platform() === 'darwin') return installLaunchd();
+  if (platform() === 'darwin') return installLaunchd({ force: options.force });
   if (platform() === 'win32') return installWindows({
     noElevate: elevationDisabled(options),
     elevationTimeoutMs: options.elevationTimeoutMs,
     noGuard: options.noGuard,
+    force: options.force,
+    update: options.update,
     installGuardOperation: options.installGuardOperation,
   });
   if (!commandExists('systemctl')) {
     throw new Error('systemd is required to install runnerize as a Linux/WSL service.');
   }
-  return installSystemd();
+  return installSystemd({ force: options.force });
 }
 
 export async function uninstallService(options = {}) {

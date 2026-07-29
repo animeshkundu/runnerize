@@ -55,6 +55,47 @@ test('ensureImage inspects first and does not pull when the image is present', a
   }
 });
 
+test('ensureImage refresh pulls even when the image is present', async () => {
+  const runner = await freshImport('../../src/runner.js');
+  const stub = new SpawnStub((child) => {
+    const args = child.args ?? [];
+    if (args.includes('--version')) { child.emitStdout('podman 5\n'); child.close(0); return; }
+    if (args.includes('pull')) { child.emitStdout('pulled\n'); child.close(0); return; }
+    child.close(0);
+  }).install();
+  try {
+    await runner.ensureImage('example/image:latest', { refresh: true });
+    assert.ok(stub.find('pull'), 'explicit refresh pulls the configured image');
+    assert.ok(!stub.find('inspect'), 'refresh does not trust an existing floating tag');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('localImageDetails reports the local digest and creation date', async () => {
+  const runner = await freshImport('../../src/runner.js');
+  const stub = new SpawnStub((child) => {
+    const args = child.args ?? [];
+    if (args.includes('--version')) { child.emitStdout('podman 5\n'); child.close(0); return; }
+    if (args.includes('inspect')) {
+      child.emitStdout('[{"RepoDigests":["example/image@sha256:abc123"],"Created":"2026-07-01T12:34:56Z"}]\n');
+      child.close(0);
+      return;
+    }
+    child.close(0);
+  }).install();
+  try {
+    assert.deepEqual(await runner.localImageDetails('example/image:latest'), {
+      reference: 'example/image:latest',
+      runtime: 'podman',
+      digest: 'sha256:abc123',
+      created: '2026-07-01T12:34:56Z',
+    });
+  } finally {
+    stub.restore();
+  }
+});
+
 test('ensureImage pulls when inspect fails (image absent)', async () => {
   const runner = await freshImport('../../src/runner.js');
   const stub = new SpawnStub((child) => {

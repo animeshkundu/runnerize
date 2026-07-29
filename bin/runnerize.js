@@ -10,7 +10,9 @@ import {
 } from '../src/github.js';
 import { runDispatcher } from '../src/dispatcher.js';
 import { detectFlavors, FLAVOR_KEYS } from '../src/sandbox/index.js';
-import { installService, preflightRun, uninstallService } from '../src/service.js';
+import {
+  installService, preflightRun, serviceStatus, uninstallService, updateService,
+} from '../src/service.js';
 import {
   createGuardLease, guardOff, guardStatus, installGuard, runGuardRecover, runGuardWatch, uninstallGuard,
 } from '../src/guard.js';
@@ -22,6 +24,8 @@ Usage:
   runnerize status
   runnerize remove
   runnerize service install|uninstall [--no-elevate] [--no-guard]
+  runnerize service status
+  runnerize service update [--force]
   runnerize guard install [--shutdown-guard] | uninstall [--shutdown-guard] | status | on | off <session-id>
   runnerize --help
 
@@ -34,6 +38,7 @@ Options:
   --dry-run              Count and display demand without minting runners
   --no-elevate           Never prompt for administrator access during service setup
   --no-guard             Skip host-stability guard setup during service install or uninstall
+  --force                Interrupt active jobs during a service update
   --shutdown-guard       Install or remove the opt-in Hyper-V host shutdown guard
   -h, --help             Show this help
 `;
@@ -217,14 +222,32 @@ async function main() {
       return;
     case 'service': {
       const [action, ...flags] = args;
+      if (action === 'status') {
+        if (flags.length) throw new Error(`Unexpected argument: ${flags[0]}`);
+        await serviceStatus();
+        return;
+      }
+      if (action === 'update') {
+        if (flags.some((flag) => flag !== '--force') || new Set(flags).size !== flags.length) {
+          throw new Error('Usage: runnerize service update [--force]');
+        }
+        await updateService({ force: flags.includes('--force') });
+        return;
+      }
+      const internalUpdate = flags.includes('--update');
       if (!['install', 'uninstall'].includes(action)
-        || flags.some((flag) => !['--no-elevate', '--no-guard'].includes(flag))
+        || flags.some((flag) => !['--no-elevate', '--no-guard', '--force', '--update'].includes(flag))
+        || flags.includes('--force') && action !== 'install'
+        || internalUpdate && action !== 'install'
+        || internalUpdate && process.env.RUNNERIZE_SERVICE_UPDATE !== '1'
         || new Set(flags).size !== flags.length) {
         throw new Error('Usage: runnerize service install|uninstall [--no-elevate] [--no-guard]');
       }
       const options = {
         noElevate: flags.includes('--no-elevate'),
         noGuard: flags.includes('--no-guard'),
+        force: flags.includes('--force'),
+        update: internalUpdate,
       };
       if (action === 'install') await installService(options);
       else await uninstallService(options);
