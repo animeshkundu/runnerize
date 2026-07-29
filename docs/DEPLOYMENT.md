@@ -206,8 +206,8 @@ WSL* (systemd runs there) once Node is installed in the WSL distro.
 Set `RUNNERIZE_CONTAINER_BUILDS=1` in the dispatcher's environment to opt in. For a
 systemd service, add it to the file referenced by `RUNNERIZE_SYSTEMD_ENV_FILE` before
 installing or restarting the service. A capable host advertises the additional label only
-after the configured Linux image completes a real `docker build` with a `RUN` instruction
-as the non-root runner user:
+after the configured Linux image completes real `docker build`, `podman build`, and
+`buildah build` commands with a `RUN` instruction as the non-root runner user:
 
 ```yaml
 runs-on: [self-hosted, linux, x64, container-build]
@@ -215,17 +215,20 @@ runs-on: [self-hosted, linux, x64, container-build]
 
 Jobs can use `docker build`, `podman build`, or `buildah build`. These build-only shims invoke
 Buildah with chroot isolation and VFS storage under `/tmp`; other Docker, Podman, and Buildah
-subcommands return exit 125. Build flags that override namespaces, runtimes, capabilities,
-devices, security settings, or bind mounts are also rejected. The Actions runner stays non-root
-and receives passwordless sudo only for one immutable root-owned Buildah helper. The outer
-container starts as UID 0 to install that profile, but the capability probe rejects a runtime
-whose container root maps
-to host root. No `--privileged`, `/dev/fuse`, or host Docker/Podman socket is used.
+subcommands return exit 125. The root helper applies a fail-closed option allowlist even when
+invoked directly. Only local-directory contexts are accepted; they are snapshotted without root
+privileges, special files are rejected, and symlinks must resolve inside the root-owned result.
+Flags that override namespaces, runtimes, capabilities, devices, security settings, or bind
+mounts are rejected, and every `RUN` instruction receives an empty Linux capability set. The
+Actions runner stays non-root and receives passwordless sudo only for one immutable root-owned
+Buildah helper. The outer container starts as UID 0 to install that profile, but the capability
+probe rejects a runtime whose container root maps to host root. No `--privileged`, `/dev/fuse`, or host Docker/Podman socket is used.
 
 The default image already contains the required tools, so opt-in does not add image bytes.
-Custom images must include `bash`, `awk`, `buildah`, a statically linked `busybox`, `runuser`,
-`sed`, `sudo`/`visudo`, and the `runner` user. The functional probe adds a real scratch image
-build at first detection and when the runtime, WSL distro, or configured image changes. VFS
+Custom images must include `bash`, `awk`, `buildah`, a statically linked `busybox`, `find`,
+`grep`, `realpath`, `runuser`, `sed`, `sudo`/`visudo`, `tar`, and the `runner` user. The
+functional probe adds a real scratch image build at first detection and when the runtime, WSL
+distro, or configured image changes. VFS
 copies layers instead of sharing overlay layers, so builds use more temporary disk and can be
 slower. All nested images and layers live in the ephemeral job container and are deleted with
 it; no cross-job cache accumulates and no host cleanup is required.

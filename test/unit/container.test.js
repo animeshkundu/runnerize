@@ -145,10 +145,18 @@ test('linux advertises functional opt-in container builds and configures the job
       assert.ok(probe.args.includes('RUNNERIZE_CONTAINER_BUILD_PROFILE=1'));
       const probeScript = probe.args.find((arg) => String(arg).includes('runnerize-capability-probe'));
       assert.match(probeScript, /\/proc\/self\/uid_map/, 'rejects an outer container whose root maps to host root');
-      assert.match(probeScript, /runuser -u runner .* docker build/, 'probes the user-facing command as the runner user');
+      assert.match(probeScript, /for command in docker podman buildah/, 'probes every documented build shim');
+      assert.match(probeScript, /runuser -u runner .* "\$command" build/, 'probes the user-facing commands as the runner user');
       assert.match(probeScript, /sudo -n \/usr\/bin\/id -u/, 'proves broad passwordless sudo is unavailable');
       assert.match(probeScript, /docker build --volume \/:\/host/, 'proves dangerous build options are rejected');
+      assert.match(probeScript, /sudo -n \/opt\/runnerize\/libexec\/buildah-build "\$option"/,
+        'proves direct helper calls cannot bypass the option policy');
+      assert.match(probeScript, /--runtime=\/bin\/sh.*--userns=host/s,
+        'probes runtime and namespace overrides at the privilege boundary');
       assert.match(probeScript, /BUILDAH_ISOLATION=chroot/);
+      assert.match(probeScript, /build --cap-drop all/, 'removes capabilities from hostile RUN instructions');
+      assert.match(probeScript, /CapBnd:\[\[:space:\]\]\*0000000000000000/,
+        'functionally proves RUN instructions have an empty capability set');
       assert.match(probeScript, /STORAGE_DRIVER=vfs/);
       assert.ok(!probe.args.includes('--privileged'));
       assert.ok(!probe.args.includes('--device'));
@@ -416,10 +424,42 @@ test('INNER_SCRIPT gives a non-root runner only the isolated image-build helper'
   assert.match(source, /driver="vfs"/, 'uses the VFS storage driver inside the outer user namespace');
   assert.match(source, /ignore_chown_errors="true"/, 'supports image ownership within the outer user namespace');
   assert.match(source, /awk .*\/proc\/self\/uid_map/, 'requires mapped outer-container root');
-  assert.match(source, /if \[ "\$#" -eq 0 \] \|\| \[ "\$1" != build \]/,
+  assert.match(source, /if \[\[ "\$#" -eq 0 \|\| "\$1" != build \]\]/,
     'docker, podman, and buildah wrappers expose only image builds');
-  assert.match(source, /--runtime-flag\|--runtime-flag=\*.*--volume\|--volume=\*/,
-    'the privileged Buildah helper rejects namespace, runtime, and bind-mount overrides');
+  assert.match(source, /--runtime-flag.*--volume.*--runtime-flag=\*.*--volume=\*/s,
+    'the root Buildah helper rejects namespace, runtime, and bind-mount overrides itself');
+  assert.match(source, /exec sudo -n \/opt\/runnerize\/libexec\/buildah-build "\$@"/,
+    'the user-facing wrapper delegates validation to the privilege-boundary helper');
+  assert.match(source, /SUDO_USER:-.*runner.*unsupported build option/s,
+    'direct helper calls remain subject to the same fail-closed option parser');
+  assert.match(source, /stage_wrapper=.*mktemp.*staged_context="\$stage_wrapper\/context".*source_context=.*mktemp/s,
+    'the final context stays beneath a root-only wrapper during staging');
+  assert.match(source, /source_context=.*mktemp.*runuser -u runner -- tar --create/s,
+    'the helper snapshots a local context as the runner user before the root build');
+  assert.match(source, /cp -a --no-dereference -- "\\\$\{source_context:\?\}\/\." "\\\$\{staged_context:\?\}\/"/,
+    'root copies into a final directory the runner never owned or traversed');
+  assert.match(source, /build contexts may not contain special files/,
+    'device, socket, pipe, and block files are rejected before the root build');
+  assert.match(source, /build context symlinks must resolve inside the context/,
+    'symlinks cannot escape the staged context');
+  assert.match(source, /\| runuser -u runner -- tar --extract/,
+    'untrusted archives are extracted without root privileges');
+  assert.match(source, /source_context=\ntrap 'rm -rf -- "\$stage_wrapper".*' EXIT/s,
+    'cleanup is armed immediately after the first allocation');
+  assert.doesNotMatch(source, /exec \/usr\/bin\/buildah build/,
+    'the helper returns through its EXIT trap after Buildah finishes');
+  assert.match(source, /\$\{source_context:\?\}\/\./,
+    'empty staging paths fail closed before copying');
+  assert.match(source, /build --cap-drop all/,
+    'hostile RUN instructions receive no Linux capabilities');
+  assert.match(source, /chown -R root:root "\$staged_context"/,
+    'the staged context is root-owned before validation and the root build');
+  assert.doesNotMatch(source, /chmod -R a-w "\$staged_context"/,
+    'context modes are preserved for COPY and ADD');
+  assert.match(source, /realpath -e -- "\$staged_context\/\$file"/,
+    'Containerfiles must resolve inside the staged context');
+  assert.doesNotMatch(source, /grep -RIEq .*\/proc\|\/sys\|\/dev/s,
+    'security does not depend on heuristic Dockerfile scanning');
   assert.match(source, /ln -sf container-build \/opt\/runnerize\/bin\/docker/);
   assert.match(source, /ln -sf container-build \/opt\/runnerize\/bin\/podman/);
   assert.match(source, /exec runuser -u runner -- env/, 'the Actions runner remains non-root');
