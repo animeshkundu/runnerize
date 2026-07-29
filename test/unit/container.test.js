@@ -138,7 +138,7 @@ test('linux advertises functional opt-in container builds and configures the job
     }).install();
     try {
       assert.equal(await linux.available(), true);
-      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', 'container-build']);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL, 'container-build']);
       const probe = stub.children.find((child) => (child.args ?? []).some((arg) => String(arg).includes('runnerize-capability-probe')));
       assert.ok(probe, 'runs a real image-build probe before advertising the label');
       assert.ok(probe.args.includes('--user'));
@@ -218,7 +218,7 @@ test('linux does not advertise container builds when the functional probe fails'
     }).install();
     try {
       assert.equal(await linux.available(), true);
-      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64']);
+      assert.deepEqual(linux.labels, ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL]);
       assert.equal(linux.containerBuild, false);
     } finally {
       stub.restore();
