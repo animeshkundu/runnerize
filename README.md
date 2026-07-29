@@ -66,8 +66,8 @@ For Android instrumented tests, a linux host with usable `/dev/kvm` automaticall
 advertises `[self-hosted, linux, x64, kvm]` and passes only that device through to the
 container. See [KVM-accelerated Android tests](docs/DEPLOYMENT.md#kvm-accelerated-android-tests).
 
-Container image builds are an explicit host opt-in. Set `RUNNERIZE_CONTAINER_BUILDS=1` on the
-dispatcher and target `[self-hosted, linux, x64, container-build]`. runnerize advertises the
+Container image builds are on by default. Target `[self-hosted, linux, x64, container-build]`;
+set `RUNNERIZE_CONTAINER_BUILDS=0` on the dispatcher to switch them off. runnerize advertises the
 extra label only after the configured job image completes a real `docker build` as the non-root
 runner user. `docker build`, `podman build`, and `buildah build` use daemonless Buildah behind a
 build-only wrapper. No host container socket is exposed and the job container is not privileged.
@@ -80,7 +80,7 @@ build-only wrapper. No host container socket is exposed and the job container is
 | `--interval <ms>` | poll interval (default 15000; adapts with repo count) |
 | `--idle-timeout <ms>` | kill an unclaimed runner after this (default 120000) |
 | `RUNNERIZE_LINUX_IMAGE` | fat image (default `catthehacker/ubuntu:full-latest`) |
-| `RUNNERIZE_CONTAINER_BUILDS` | opt in to probed, isolated `docker`/`podman`/`buildah build` (`container-build` label) |
+| `RUNNERIZE_CONTAINER_BUILDS` | set to `0` to disable probed, isolated `docker`/`podman`/`buildah build` (`container-build` label); on by default |
 | `RUNNERIZE_RUNNER_DIR` | use a preinstalled runner dir instead of downloading |
 | `RUNNERIZE_WSL_DISTRO` | pin the WSL distro (Windows host) |
 

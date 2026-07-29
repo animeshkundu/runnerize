@@ -285,8 +285,16 @@ function buildContainerArgs(image) {
   return ['--user', '0', '-e', 'RUNNERIZE_CONTAINER_BUILD_PROFILE=1', image];
 }
 
+// Enabled unless explicitly switched off. Reading the raw variable for truthiness would treat
+// RUNNERIZE_CONTAINER_BUILDS=0 as "on", which is the opposite of what anyone setting it means.
+function containerBuildsRequested() {
+  const raw = process.env.RUNNERIZE_CONTAINER_BUILDS;
+  if (raw === undefined || raw.trim() === '') return true;
+  return !['0', 'false', 'no', 'off'].includes(raw.trim().toLowerCase());
+}
+
 async function hasUsableContainerBuild(target, image) {
-  if (!target || !process.env.RUNNERIZE_CONTAINER_BUILDS) {
+  if (!target || !containerBuildsRequested()) {
     linux.containerBuildProbeKey = null;
     return false;
   }

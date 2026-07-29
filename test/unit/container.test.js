@@ -49,7 +49,8 @@ async function withLinuxLaunch(fn) {
   const prevContainerBuilds = process.env.RUNNERIZE_CONTAINER_BUILDS;
   process.env.RUNNERIZE_RUNNER_DIR = runnerDir;
   process.env.RUNNERIZE_LINUX_IMAGE = 'example/image:latest';
-  delete process.env.RUNNERIZE_CONTAINER_BUILDS;
+  // Container builds are on by default; tests that want them opt in explicitly.
+  process.env.RUNNERIZE_CONTAINER_BUILDS = '0';
   try {
     const { linux } = await freshImport('../../src/sandbox/container.js');
     return await fn(linux);
@@ -179,6 +180,28 @@ test('linux advertises functional opt-in container builds and configures the job
       stub.restore();
     }
   });
+});
+
+test('linux treats an explicit falsey RUNNERIZE_CONTAINER_BUILDS as off, not as truthy', async () => {
+  for (const value of ['0', 'false', 'no', 'off', 'OFF', ' 0 ']) {
+    await withLinuxLaunch(async (linux) => {
+      process.env.RUNNERIZE_CONTAINER_BUILDS = value;
+      const stub = new SpawnStub((child) => {
+        const args = child.args ?? [];
+        if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) child.close(1);
+        else { child.emitStdout('ok\n'); child.close(0); }
+      }).install();
+      try {
+        await linux.available();
+        assert.ok(
+          !linux.labels.includes('container-build'),
+          `RUNNERIZE_CONTAINER_BUILDS=${JSON.stringify(value)} must disable container builds`,
+        );
+      } finally {
+        stub.restore();
+      }
+    });
+  }
 });
 
 test('linux does not advertise container builds when the functional probe fails', async () => {

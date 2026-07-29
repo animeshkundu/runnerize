@@ -203,9 +203,10 @@ WSL* (systemd runs there) once Node is installed in the WSL distro.
 
 ### Isolated container image builds
 
-Set `RUNNERIZE_CONTAINER_BUILDS=1` in the dispatcher's environment to opt in. For a
-systemd service, add it to the file referenced by `RUNNERIZE_SYSTEMD_ENV_FILE` before
-installing or restarting the service. A capable host advertises the additional label only
+Enabled by default. Set `RUNNERIZE_CONTAINER_BUILDS=0` in the dispatcher's environment to
+switch it off; for a systemd service, add that to the file referenced by
+`RUNNERIZE_SYSTEMD_ENV_FILE` before installing or restarting the service. A capable host
+advertises the additional label only
 after the configured Linux image completes real `docker build`, `podman build`, and
 `buildah build` commands with a `RUN` instruction as the non-root runner user:
 
