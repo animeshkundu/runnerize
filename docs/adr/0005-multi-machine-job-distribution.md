@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-07-17).
+Accepted (2026-07-28).
 
 ## Context
 
@@ -22,7 +22,7 @@ Failure modes:
 - **`listRunners` is eventually consistent and ambiguous.** `online && !busy` is not reserved capacity; a fresh JIT runner is `offline` until it connects (indistinguishable from dead/hung). Counting `offline` as supply risks 24h starvation from a crashed registration; not counting it risks over-provision during multi-minute boots. Any use of it must **fail open** (on error, prefer to mint — never starve).
 - **Fungibility → theft is only fixable by labels/groups.**
 - **Load must be capacity-normalized** (free slots as a fraction of real capacity; a linux slot ≠ a macOS slot).
-- **Local correctness:** consume the capacity cap **atomically at mint-decision** (before async JIT generation); start the idle watchdog only **after** the runner is genuinely online+idle; make "full ⇒ don't poll" a **completion-triggered wakeup + periodic fallback** so a lost completion event can't permanently disable polling.
+- **Local correctness:** consume the capacity cap **atomically at mint-decision** (before async JIT generation); start the idle watchdog only **after** the runner is genuinely online+idle; make "full ⇒ don't poll" completion-triggered so polling resumes as soon as a lifecycle releases its slot.
 
 ## Decision
 
@@ -30,11 +30,12 @@ A tiered, independent, additive design. Ship Layer 0 now; validate-then-adopt La
 
 ### Layer 0 — load-adaptive polling backoff + phase jitter (this ADR ships)
 A purely local load-shaping heuristic (no shared state, churn-trivial):
-- **Phase jitter** on every poll (randomize *when* each machine polls) to break cross-machine lock-step. (There is no randomness in the scheduler today.)
-- **Load-adaptive interval:** the poll interval **increases with load** — the fewer free slots, the longer the wait — so idle machines observe queued jobs first and work drifts to the least-loaded host. Bounded by a **rate-safe floor** (the idle interval; explicitly *not* "fastest possible", which aggravates the herd at scale and blows the rate budget) and a cap.
-- **Capacity-normalized load:** scale on free-slots-as-fraction-of-real-capacity.
-- **Atomic capacity cap** at mint-decision; watchdog started only after online+idle; a full host polls at the long fallback with a **completion-triggered immediate wakeup** + periodic fallback.
-- **Honest framing:** this is a heuristic, not a protocol. It changes which machine *tends* to act; it does not prevent duplicate mints (GitHub still resolves the winner). Big win for the common small, heterogeneous, container-heavy fleet; residual herd persists among *equally-idle* machines and at large N.
+- **Phase jitter** on every poll (randomize *when* each machine polls) to break cross-machine lock-step.
+- **Load-adaptive interval:** with base `x`, poll at `x` for zero active runner lifecycles, then `4x`, `8x`, `16x`, and `32x` for one through four. At five, stop polling until a lifecycle exits. A lifecycle is active from capacity acquisition through runner exit, including the unassigned startup window.
+- **One claim per poll:** even with excess demand and free capacity, mint at most one runner in a cycle. After a successful claim, wait `20x` before polling again.
+- **Repository-count scaling:** preserve the existing `ceil(repoCount / 20)` multiplier on ordinary load-based intervals as an additional rate-safety delay, bounded by the operator-configurable poll cap. The post-claim quiet period remains the required constant `20x`.
+- **Atomic capacity cap** at mint-decision; lifecycle completion wakes a capped or sleeping dispatcher so polling resumes as load falls.
+- **Honest framing:** this is a heuristic, not a protocol. It changes which machine *tends* to act; it does not prevent duplicate mints. At the default 15s base, a three-host idle fleet claims roughly three jobs per five minutes under a sustained burst.
 
 ### Layer 1 — reservation-before-boot (validate → adopt)
 The real decentralized anti-duplication primitive. Split minting into **register, then boot**:

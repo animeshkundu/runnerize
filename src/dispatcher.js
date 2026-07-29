@@ -16,7 +16,9 @@ const LAUNCH_FAILURE_BACKOFF_MS = 30_000;
 const DEFAULT_DRAIN_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_RUNNER_MAX_LIFETIME_MS = 7 * 24 * 60 * 60_000;
 const DRAIN_HOOK_TIMEOUT_MS = 30_000;
-const DEFAULT_POLL_MAX_INTERVAL_MS = 120_000;
+const MAX_ACTIVE_JOBS = 5;
+const DEFAULT_POLL_MAX_INTERVAL_MULTIPLIER = 32;
+const POST_CLAIM_INTERVAL_MULTIPLIER = 20;
 const POLL_JITTER = 0.25;
 
 function environmentDuration(name, fallback) {
@@ -107,6 +109,23 @@ function interruptibleDelay(milliseconds, notifier, signal) {
   });
 }
 
+function waitForNotification(notifier, signal) {
+  if (signal?.aborted) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let unsubscribe = () => {};
+
+    function done() {
+      unsubscribe();
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+
+    unsubscribe = notifier.subscribe(done);
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
+
 function abortableDelay(milliseconds, signal) {
   return interruptibleDelay(milliseconds, undefined, signal);
 }
@@ -166,30 +185,34 @@ async function reconcile(repos, flavors, signal, { host = false } = {}) {
 }
 
 export function pollDelay({
-  floorMilliseconds,
+  baseMilliseconds,
   capMilliseconds,
-  repoCount,
-  freeCapacity,
-  maxCapacity,
+  activeJobs,
+  repoCount = 1,
+  claimed = false,
   random = Math.random,
 }) {
-  const repoMultiplier = Math.max(1, Math.ceil(repoCount / 20));
-  const scaledFloor = Math.min(floorMilliseconds * repoMultiplier, capMilliseconds);
-  const load = 1 - freeCapacity / maxCapacity;
-  const adaptive = scaledFloor + (capMilliseconds - scaledFloor) * load;
+  if (!claimed && activeJobs >= MAX_ACTIVE_JOBS) return null;
+
+  const loadMultiplier = claimed
+    ? POST_CLAIM_INTERVAL_MULTIPLIER
+    : activeJobs === 0 ? 1 : 4 * 2 ** (activeJobs - 1);
+  const repoMultiplier = claimed ? 1 : Math.max(1, Math.ceil(repoCount / 20));
+  const adaptive = Math.min(
+    baseMilliseconds * loadMultiplier * repoMultiplier,
+    capMilliseconds,
+  );
   const jittered = adaptive * (1 - POLL_JITTER + random() * POLL_JITTER * 2);
-  return Math.max(floorMilliseconds, Math.min(jittered, capMilliseconds));
+  return Math.min(jittered, capMilliseconds);
 }
 
 /**
  * Continuously counts queued work and mints unpinned ephemeral runners.
  */
 export async function runDispatcher({
-  maxConcurrent = 4,
+  maxConcurrent = MAX_ACTIVE_JOBS,
   pollIntervalMs = 15_000,
-  pollMaxIntervalMs = Number(
-    process.env.RUNNERIZE_POLL_MAX_INTERVAL_MS ?? DEFAULT_POLL_MAX_INTERVAL_MS,
-  ),
+  pollMaxIntervalMs,
   idleTimeoutMs = 120_000,
   reconcileMs = 300_000,
   drainTimeoutMs = environmentDuration('RUNNERIZE_DRAIN_TIMEOUT_MS', DEFAULT_DRAIN_TIMEOUT_MS),
@@ -203,6 +226,11 @@ export async function runDispatcher({
   acquireGuardLease = createGuardLease,
   drainDelay = abortableDelay,
 } = {}) {
+  pollMaxIntervalMs ??= Number(
+    process.env.RUNNERIZE_POLL_MAX_INTERVAL_MS
+      ?? pollIntervalMs * DEFAULT_POLL_MAX_INTERVAL_MULTIPLIER,
+  );
+
   for (const [name, value] of Object.entries({
     pollIntervalMs,
     pollMaxIntervalMs,
@@ -229,14 +257,29 @@ export async function runDispatcher({
   const slotFreed = createNotifier();
   let lastReconcile = 0;
   let lastRepoCount = 0;
-  const waitForNextPoll = (repoCount) => interruptibleDelay(pollDelay({
-    floorMilliseconds: pollIntervalMs,
-    capMilliseconds: pollMaxIntervalMs,
-    repoCount,
-    freeCapacity: semaphore.free(),
-    maxCapacity: maxConcurrent,
-    random,
-  }), slotFreed, signal);
+  const waitForNextPoll = async (repoCount, { claimed = false } = {}) => {
+    if (claimed) {
+      await abortableDelay(pollDelay({
+        baseMilliseconds: pollIntervalMs,
+        capMilliseconds: pollMaxIntervalMs,
+        activeJobs: launches.size,
+        claimed: true,
+        random,
+      }), signal);
+      if (launches.size >= MAX_ACTIVE_JOBS) return waitForNotification(slotFreed, signal);
+      return;
+    }
+    if (launches.size >= MAX_ACTIVE_JOBS) return waitForNotification(slotFreed, signal);
+
+    const delay = pollDelay({
+      baseMilliseconds: pollIntervalMs,
+      capMilliseconds: pollMaxIntervalMs,
+      activeJobs: launches.size,
+      repoCount,
+      random,
+    });
+    return interruptibleDelay(delay, slotFreed, signal);
+  };
 
   const unassignedKey = (repo, flavor) => `${flavor}\0${repo}`;
   const incrementUnassigned = (repo, flavor) => {
@@ -287,6 +330,7 @@ export async function runDispatcher({
       }
       if (signal?.aborted) break;
 
+      let claimed = false;
       for (const flavor of flavors) {
         if (signal?.aborted || semaphore.free() === 0) break;
 
@@ -325,112 +369,115 @@ export async function runDispatcher({
           demand - unassigned,
           semaphore.free(),
           flavorCap - flavorActive,
+          MAX_ACTIVE_JOBS - launches.size,
+          1,
         ));
         log('demand_counted', { flavor: flavor.key, demand, unassigned, toMint });
 
-        for (let minted = 0; minted < toMint && !signal?.aborted; minted += 1) {
-          const target = perRepo.find(
-            (entry) => entry.unmet > 0 && (repoBackoffUntil.get(entry.repo) ?? 0) <= Date.now(),
-          );
-          if (!target) break;
-          target.unmet -= 1;
+        if (toMint === 0) continue;
+        const target = perRepo.find(
+          (entry) => entry.unmet > 0 && (repoBackoffUntil.get(entry.repo) ?? 0) <= Date.now(),
+        );
+        if (!target) continue;
 
-          if (!(await isStillPrivate(target.repo, { signal }))) {
-            log('mint_skipped_not_private', { repo: target.repo, flavor: flavor.key });
-            continue;
-          }
-          if (signal?.aborted || semaphore.free() === 0) break;
-
-          semaphore.acquire();
-          incrementUnassigned(target.repo, flavor.key);
-          activeByFlavor.set(flavor.key, (activeByFlavor.get(flavor.key) ?? 0) + 1);
-
-          let launchPromise;
-          launchPromise = (async () => {
-            let unassigned = true;
-            let runnerId;
-            const decrementUnassignedOnce = () => {
-              if (!unassigned) return;
-              unassigned = false;
-              decrementUnassigned(target.repo, flavor.key);
-            };
-
-            try {
-              const {
-                encodedJitConfig,
-                runnerId: generatedRunnerId,
-                runnerName,
-              } = await generateJitConfig(target.repo, flavor.labels);
-              // JIT creation is deliberately non-abortable: if GitHub creates a runner,
-              // the response must arrive so this process can launch or deregister it.
-              runnerId = generatedRunnerId;
-              // Once registered, the runner must launch even if shutdown arrived while
-              // GitHub was generating its config; otherwise an orphan is left behind.
-              log('runner_launching', { repo: target.repo, flavor: flavor.key, runnerName });
-
-              const lifecycle = launches.get(launchPromise);
-              lifecycle.runnerName = runnerName;
-              lifecycle.runnerId = runnerId;
-
-              let result;
-              try {
-                result = await flavor.launch(encodedJitConfig, {
-                  idleTimeoutMs,
-                  maxLifetimeMs: runnerMaxLifetimeMs,
-                  onStarted: decrementUnassignedOnce,
-                  onControl: ({ name, stop }) => {
-                    lifecycle.resourceName = name;
-                    lifecycle.stop = stop;
-                  },
-                });
-                if (!result?.startedJob) {
-                  throw new Error('runner exited without starting a job');
-                }
-              } catch (error) {
-                repoBackoffUntil.set(target.repo, Date.now() + LAUNCH_FAILURE_BACKOFF_MS);
-                try {
-                  await deleteRunner(target.repo, runnerId);
-                } catch (deleteError) {
-                  log('runner_deregister_error', {
-                    repo: target.repo,
-                    flavor: flavor.key,
-                    runnerId,
-                    ...errorFields(deleteError),
-                  });
-                }
-                throw error;
-              }
-
-              log('runner_exited', {
-                repo: target.repo,
-                flavor: flavor.key,
-                startedJob: true,
-              });
-            } catch (error) {
-              log('runner_launch_error', {
-                repo: target.repo,
-                flavor: flavor.key,
-                ...errorFields(error),
-              });
-            } finally {
-              decrementUnassignedOnce();
-              const flavorActive = Math.max(0, (activeByFlavor.get(flavor.key) ?? 1) - 1);
-              if (flavorActive === 0) activeByFlavor.delete(flavor.key);
-              else activeByFlavor.set(flavor.key, flavorActive);
-              semaphore.release();
-              slotFreed.notify();
-              launches.delete(launchPromise);
-            }
-          })();
-          launches.set(launchPromise, {
-            repo: target.repo,
-            flavor: flavor.key,
-            runnerName: 'registration pending',
-          });
+        if (!(await isStillPrivate(target.repo, { signal }))) {
+          log('mint_skipped_not_private', { repo: target.repo, flavor: flavor.key });
+          continue;
         }
+        if (signal?.aborted || semaphore.free() === 0 || launches.size >= MAX_ACTIVE_JOBS) break;
+
+        semaphore.acquire();
+        incrementUnassigned(target.repo, flavor.key);
+        activeByFlavor.set(flavor.key, (activeByFlavor.get(flavor.key) ?? 0) + 1);
+
+        const lifecycle = {
+          repo: target.repo,
+          flavor: flavor.key,
+          runnerName: 'registration pending',
+        };
+        let runnerUnassigned = true;
+        const decrementUnassignedOnce = () => {
+          if (!runnerUnassigned) return;
+          runnerUnassigned = false;
+          decrementUnassigned(target.repo, flavor.key);
+        };
+        const runLifecycle = async () => {
+          let runnerId;
+          try {
+            const {
+              encodedJitConfig,
+              runnerId: generatedRunnerId,
+              runnerName,
+            } = await generateJitConfig(target.repo, flavor.labels);
+            // JIT creation is deliberately non-abortable: if GitHub creates a runner,
+            // the response must arrive so this process can launch or deregister it.
+            runnerId = generatedRunnerId;
+            // Once registered, the runner must launch even if shutdown arrived while
+            // GitHub was generating its config; otherwise an orphan is left behind.
+            log('runner_launching', { repo: target.repo, flavor: flavor.key, runnerName });
+
+            lifecycle.runnerName = runnerName;
+            lifecycle.runnerId = runnerId;
+
+            let result;
+            try {
+              result = await flavor.launch(encodedJitConfig, {
+                idleTimeoutMs,
+                maxLifetimeMs: runnerMaxLifetimeMs,
+                onStarted: decrementUnassignedOnce,
+                onControl: ({ name, stop }) => {
+                  lifecycle.resourceName = name;
+                  lifecycle.stop = stop;
+                },
+              });
+              if (!result?.startedJob) {
+                throw new Error('runner exited without starting a job');
+              }
+            } catch (error) {
+              repoBackoffUntil.set(target.repo, Date.now() + LAUNCH_FAILURE_BACKOFF_MS);
+              try {
+                await deleteRunner(target.repo, runnerId);
+              } catch (deleteError) {
+                log('runner_deregister_error', {
+                  repo: target.repo,
+                  flavor: flavor.key,
+                  runnerId,
+                  ...errorFields(deleteError),
+                });
+              }
+              throw error;
+            }
+
+            log('runner_exited', {
+              repo: target.repo,
+              flavor: flavor.key,
+              startedJob: true,
+            });
+          } catch (error) {
+            log('runner_launch_error', {
+              repo: target.repo,
+              flavor: flavor.key,
+              ...errorFields(error),
+            });
+          }
+        };
+        const executionPromise = Promise.resolve().then(runLifecycle);
+        let launchPromise;
+        launchPromise = executionPromise.finally(() => {
+          decrementUnassignedOnce();
+          const flavorActive = Math.max(0, (activeByFlavor.get(flavor.key) ?? 1) - 1);
+          if (flavorActive === 0) activeByFlavor.delete(flavor.key);
+          else activeByFlavor.set(flavor.key, flavorActive);
+          semaphore.release();
+          launches.delete(launchPromise);
+          slotFreed.notify();
+        });
+        launches.set(launchPromise, lifecycle);
+        claimed = true;
+        break;
       }
 
-      await waitForNextPoll(repos.length);
+      await waitForNextPoll(repos.length, { claimed });
     }
   } finally {
     log('dispatcher_draining', { inflight: launches.size, timeoutMs: drainTimeoutMs });

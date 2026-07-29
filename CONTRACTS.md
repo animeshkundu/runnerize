@@ -21,20 +21,23 @@ These contracts are FROZEN. Implement to these signatures exactly so modules int
 **NEVER pin a runner to a `job.id`.** GitHub's scheduler assigns any label-matching queued job to a fresh runner, so a "runner for job A" may consume job B; job.id dedup then starves A. Instead scale **count**:
 
 ```
-every POLL_INTERVAL (default 15s, adaptive with repo count):
+every adaptive interval (base 15s, also scaled with repo count):
+  active = locally minted runner lifecycles that have not exited
+  if active == 5: stop polling until a lifecycle completes
+  interval = base when active==0, else 4*base*2^(active-1)
   repos = listOwnedPrivateRepos()                 // private && owner==me && type==User && !fork
   for each FLAVOR the host can serve (linux always; windows if Windows Sandbox enabled; macos if on a Mac):
     demand = sum over repos of countQueuedMatchingJobs(repo, flavor.labels)
              // POLL COMPLETENESS: scan runs with status IN {queued, in_progress}, then their /jobs where status=="queued";
              //   count jobs whose runs-on labels ⊆ flavor.labels. bare [self-hosted] → the linux (default) flavor only.
     inflight = runnersRecentlyMintedNotYetConsumed(flavor)     // damp double-mint across polls
-    toMint = clamp(demand - inflight, 0, semaphore.free())
-    repeat toMint times:
+    if demand > inflight and capacity is free:
       repo = a repo with unmet queued demand for this flavor
       if not (await isStillPrivate(repo)) : continue           // FAIL-CLOSED re-check right before mint
       semaphore.acquire()
       jit = await generateJitConfig(repo, flavor.labels)
       flavor.launch(jit, { idleTimeoutMs }).finally(() => { semaphore.release(); markConsumed(flavor) })
+      stop this poll after the one claim; wait 20*base before polling again
   Reconcile (startup + every RECONCILE_INTERVAL, default 5min): per repo listRunners() → deleteRunner() for offline/stale
     ephemeral registrations; reap orphaned run.sh PIDs + leftover temp dirs from a prior crash.
 ```
@@ -80,7 +83,7 @@ export async function deleteRunner(fullName, id);                  // void
 export async function detectFlavors();                             // FLAVOR[] the host can serve now
 
 // src/dispatcher.js
-export async function runDispatcher({ maxConcurrent=4, pollIntervalMs=15000, idleTimeoutMs=120000, reconcileMs=300000, signal });
+export async function runDispatcher({ maxConcurrent=5, pollIntervalMs=15000, idleTimeoutMs=120000, reconcileMs=300000, signal });
 ```
 
 Language: modern ESM, small pure functions, defensive (timeouts, try/finally). No secrets in logs. No AI/Anthropic/Claude attribution anywhere.
