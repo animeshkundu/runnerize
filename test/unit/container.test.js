@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, mkdtemp, writeFile, mkdir, rm, access, chmod } from 'node:fs/promises';
-import { constants, writeFileSync } from 'node:fs';
+import { constants, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { overrideProcess } from '../helpers/platform-override.js';
 import { SpawnStub } from '../helpers/process-stub.js';
@@ -60,6 +60,12 @@ function lifecycleCalls(stub) {
 function observationDirectory(child) {
   const volume = child.args.find((arg) => arg.endsWith(':/runnerize-observation'));
   return volume?.slice(0, -':/runnerize-observation'.length);
+}
+
+function mountedInnerScript(child) {
+  const suffix = ':/inner.sh:ro';
+  const volume = child.args.find((arg) => arg.endsWith(suffix));
+  return volume?.slice(0, -suffix.length);
 }
 
 function writeObservation(child, observation) {
@@ -164,6 +170,44 @@ test('linux.launch resolves { startedJob: true } after a job-start line and clea
       stub.restore();
     }
   });
+});
+
+test('linux.launch materializes shell-syntax-valid inner scripts with and without teardown capture', async (t) => {
+  if (spawnSync('bash', ['--version'], { stdio: 'ignore' }).error) {
+    t.skip('bash is unavailable');
+    return;
+  }
+
+  for (const captureTeardown of [false, true]) {
+    await withLinuxLaunch(async (linux) => {
+      const stub = containerStub((child) => {
+        const script = mountedInnerScript(child);
+        assert.ok(script, 'the runner container mounts the materialized inner script');
+        const materialized = readFileSync(script, 'utf8');
+        const syntax = spawnSync('bash', ['-n'], { input: materialized, encoding: 'utf8' });
+        assert.equal(
+          syntax.status,
+          0,
+          `bash -n rejected inner.sh with teardown capture ${captureTeardown ? 'enabled' : 'disabled'}:\n${syntax.stderr}`,
+        );
+        if (captureTeardown) {
+          writeObservation(child, {
+            memoryMetricsAvailable: false,
+            memoryMetricsUnavailableReason: 'representative unavailable metrics',
+          });
+        }
+        child.close(0);
+      }).install();
+      try {
+        await linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          ...(captureTeardown ? { onTeardownObservation: () => {} } : {}),
+        });
+      } finally {
+        stub.restore();
+      }
+    });
+  }
 });
 
 test('linux passes through usable KVM and advertises the capability', async () => {

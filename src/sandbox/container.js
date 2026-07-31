@@ -605,16 +605,6 @@ runner_pgid=
 disk_monitor_pid=
 finished=0
 
-json_string() {
-  local value="$1"
-  value="\${value//\\/\\\\}"
-  value="\${value//\"/\\\"}"
-  value="\${value//$'\n'/\\n}"
-  value="\${value//$'\r'/\\r}"
-  value="\${value//$'\t'/\\t}"
-  printf '"%s"' "$value"
-}
-
 sample_disk() {
   local current
   [[ "$observation_dir" && "$workdir" ]] || return 0
@@ -676,7 +666,9 @@ write_observation() {
       if [[ -r "$cgroup_root/memory.events" ]]; then
         while read -r key value; do
           [[ "$key" && "$value" =~ ^[0-9]+$ ]] || continue
-          memory_events_json+="$separator$(json_string "$key"):$value"
+          local entry
+          printf -v entry '%s"%s":%s' "$separator" "$key" "$value"
+          memory_events_json+="$entry"
           separator=,
         done < "$cgroup_root/memory.events"
       fi
@@ -704,7 +696,7 @@ write_observation() {
       printf ',"memoryCgroupVersion":%s,"memoryPeakBytes":%s' "$cgroup_version" "$memory_peak"
       [[ "$cgroup_version" == 2 ]] && printf ',"memoryEvents":%s' "$memory_events_json"
     else
-      printf ',"memoryMetricsUnavailableReason":%s' "$(json_string "$unavailable_reason")"
+      printf ',"memoryMetricsUnavailableReason":"%s"' "$unavailable_reason"
     fi
     if [[ "$disk_peak_kib" =~ ^[0-9]+$ ]]; then
       printf ',"workdirDiskPeakBytes":%s' "$((disk_peak_kib * 1024))"
