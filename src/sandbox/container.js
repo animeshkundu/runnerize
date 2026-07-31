@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -192,6 +192,9 @@ printf 'runner ALL=(root) NOPASSWD: /opt/runnerize/libexec/buildah-build\\n' > /
 chmod 0440 /etc/sudoers.d/runnerize-container-build
 visudo -cf /etc/sudoers >/dev/null
 `;
+const STOPPED_CONTAINER_STATES = new Set(['configured', 'created', 'dead', 'exited', 'stopped']);
+const INSPECT_EVIDENCE_FIELDS = ['OOMKilled', 'ExitCode', 'Status', 'Error', 'StartedAt', 'FinishedAt'];
+const activeRunnerContainers = new Set();
 
 function appendBounded(current, chunk) {
   const combined = Buffer.concat([current, Buffer.from(chunk)]);
@@ -455,9 +458,107 @@ function invocation(target, runtimeArgs, env) {
   };
 }
 
-async function stopContainer(target, name) {
-  const args = ['rm', '-f', name];
-  const call = invocation(target, args, process.env);
+async function killContainer(target, name, signal) {
+  const call = invocation(target, ['kill', '--signal', signal, name], process.env);
+  try {
+    await collect(call.command, call.args, { env: call.env, timeoutMs: CLEANUP_TIMEOUT_MS });
+  } catch {
+    // The container may already have exited.
+  }
+}
+
+async function inspectContainer(target, name) {
+  const call = invocation(target, ['inspect', '--format', '{{json .State}}', name], process.env);
+  const { stdout } = await collect(call.command, call.args, {
+    env: call.env,
+    timeoutMs: CLEANUP_TIMEOUT_MS,
+  });
+  return JSON.parse(stdout.trim());
+}
+
+function normalizeObservation(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('observation.json did not contain an object');
+  }
+  const observation = {};
+  if (value.memoryMetricsAvailable === true) {
+    if (![1, 2].includes(value.memoryCgroupVersion)) {
+      throw new Error('observation.json contained an invalid memory cgroup version');
+    }
+    if (!Number.isSafeInteger(value.memoryPeakBytes) || value.memoryPeakBytes < 0) {
+      throw new Error('observation.json contained an invalid memory peak');
+    }
+    observation.memoryMetricsAvailable = true;
+    observation.memoryCgroupVersion = value.memoryCgroupVersion;
+    observation.memoryPeakBytes = value.memoryPeakBytes;
+    if (value.memoryEvents && typeof value.memoryEvents === 'object' && !Array.isArray(value.memoryEvents)) {
+      observation.memoryEvents = Object.fromEntries(Object.entries(value.memoryEvents).filter(
+        ([key, count]) => key && Number.isSafeInteger(count) && count >= 0,
+      ));
+    }
+  } else {
+    observation.memoryMetricsAvailable = false;
+    if (typeof value.memoryMetricsUnavailableReason === 'string' && value.memoryMetricsUnavailableReason) {
+      observation.memoryMetricsUnavailableReason = value.memoryMetricsUnavailableReason;
+    }
+  }
+  if (Number.isSafeInteger(value.workdirDiskPeakBytes) && value.workdirDiskPeakBytes >= 0) {
+    observation.workdirDiskPeakBytes = value.workdirDiskPeakBytes;
+  }
+  return observation;
+}
+
+async function readObservation(target, observationDir) {
+  let contents;
+  if (target.distro) {
+    contents = await readTextFile(target, `${observationDir}/observation.json`);
+  } else {
+    contents = await readFile(path.join(observationDir, 'observation.json'), 'utf8');
+  }
+  return normalizeObservation(JSON.parse(contents));
+}
+
+async function readTextFile(target, file) {
+  const command = target.distro ? 'wsl.exe' : 'cat';
+  const args = target.distro
+    ? ['-d', target.distro, '-e', 'cat', '--', file]
+    : ['--', file];
+  const { stdout } = await collect(command, args, { timeoutMs: CLEANUP_TIMEOUT_MS });
+  return stdout;
+}
+
+async function createWslObservationDir(distro) {
+  const { stdout } = await wslShell(distro, `
+set -euo pipefail
+directory="$(mktemp -d /tmp/runnerize-observation.XXXXXX)"
+chmod 0777 "$directory"
+printf '%s' "$directory"
+`);
+  return stdout.trim();
+}
+
+async function removeWslDirectory(distro, directory) {
+  if (!directory) return;
+  try {
+    await collect('wsl.exe', ['-d', distro, '-e', 'rm', '-rf', '--', directory], {
+      timeoutMs: CLEANUP_TIMEOUT_MS,
+    });
+  } catch {
+    // Best-effort cleanup after the observation has been consumed.
+  }
+}
+
+async function waitForContainerExit(target, name) {
+  const call = invocation(target, ['wait', name], process.env);
+  try {
+    await collect(call.command, call.args, { env: call.env, timeoutMs: CLEANUP_TIMEOUT_MS });
+  } catch {
+    // Inspection below remains useful if waiting is unsupported or times out.
+  }
+}
+
+async function removeContainer(target, name) {
+  const call = invocation(target, ['rm', '-f', name], process.env);
   try {
     await collect(call.command, call.args, { env: call.env, timeoutMs: CLEANUP_TIMEOUT_MS });
     return true;
@@ -468,19 +569,26 @@ async function stopContainer(target, name) {
       container: name,
       error: error instanceof Error ? error.message : String(error),
     }));
+    // A later orphan-reaping pass can retry failed cleanup.
     return false;
   }
 }
 
-async function listRunnerContainers(target) {
+async function listRunnerContainers(target, { stoppedOnly = false } = {}) {
   const call = invocation(target, [
-    'ps', '-a', '--filter', 'name=^runnerize-', '--format', '{{.Names}}',
+    'ps', '-a', '--filter', 'name=^runnerize-', '--format', '{{.Names}}\t{{.State}}',
   ], process.env);
   const { stdout } = await collect(call.command, call.args, {
     env: call.env,
     timeoutMs: CLEANUP_TIMEOUT_MS,
   });
-  return stdout.split(/\r?\n/).map((name) => name.trim()).filter((name) => name.startsWith('runnerize-'));
+  return stdout.split(/\r?\n/).map((line) => {
+    const [name, state] = line.trim().split(/\t/, 2);
+    return { name, state: state?.toLowerCase() };
+  }).filter(({ name, state }) => (
+    name.startsWith('runnerize-')
+      && (!stoppedOnly || STOPPED_CONTAINER_STATES.has(state))
+  )).map(({ name }) => name);
 }
 
 // Keep runner-output heuristics here so lifecycle wording changes have one update point.
@@ -490,27 +598,196 @@ function isJobStartLine(line) {
 
 const INNER_SCRIPT = `#!/usr/bin/env bash
 set -euo pipefail
+observation_dir="\${RUNNERIZE_OBSERVE:-}"
+workdir=
+runner_pid=
+runner_pgid=
+disk_monitor_pid=
+finished=0
+
+sample_disk() {
+  local current
+  [[ "$observation_dir" && "$workdir" ]] || return 0
+  current="$(du -sk -- "$workdir/_work" 2>/dev/null | awk '{print $1}' || true)"
+  if [[ "$current" =~ ^[0-9]+$ ]]; then
+    local previous=0
+    [[ -f "$observation_dir/disk-peak-kib" ]] && previous="$(cat "$observation_dir/disk-peak-kib" 2>/dev/null || printf 0)"
+    if [[ ! "$previous" =~ ^[0-9]+$ || "$current" -gt "$previous" ]]; then
+      printf '%s\n' "$current" > "$observation_dir/disk-peak-kib.tmp"
+      mv -f "$observation_dir/disk-peak-kib.tmp" "$observation_dir/disk-peak-kib"
+    fi
+  fi
+}
+
+monitor_disk() {
+  local sleep_pid=
+  trap 'if [[ "$sleep_pid" ]]; then kill "$sleep_pid" 2>/dev/null || true; fi; exit 0' TERM INT HUP
+  while [[ "$workdir" && -d "$workdir" ]]; do
+    sample_disk
+    sleep 5 &
+    sleep_pid=$!
+    wait "$sleep_pid" || break
+    sleep_pid=
+  done
+}
+
+write_observation() {
+  [[ "$observation_dir" ]] || return 0
+  mkdir -p "$observation_dir"
+  sample_disk
+
+  local cgroup_version=
+  local cgroup_path=
+  local memory_peak=
+  local memory_available=false
+  local unavailable_reason=
+  local memory_events_json='{}'
+  local disk_peak_kib=
+  local hierarchy controllers candidate
+  while IFS=: read -r hierarchy controllers candidate; do
+    if [[ "$hierarchy" == 0 && -z "$controllers" ]]; then
+      cgroup_version=2
+      cgroup_path="$candidate"
+    fi
+    if [[ ",\${controllers}," == *,memory,* ]]; then
+      cgroup_version=1
+      cgroup_path="$candidate"
+    fi
+  done < /proc/self/cgroup
+
+  if [[ "$cgroup_version" == 2 ]]; then
+    local cgroup_root="/sys/fs/cgroup/\${cgroup_path#/}"
+    memory_peak="$(cat "$cgroup_root/memory.peak" 2>/dev/null || true)"
+    if [[ "$memory_peak" =~ ^[0-9]+$ ]]; then
+      memory_available=true
+      local separator=
+      local key value
+      memory_events_json='{'
+      if [[ -r "$cgroup_root/memory.events" ]]; then
+        while read -r key value; do
+          [[ "$key" && "$value" =~ ^[0-9]+$ ]] || continue
+          local entry
+          printf -v entry '%s"%s":%s' "$separator" "$key" "$value"
+          memory_events_json+="$entry"
+          separator=,
+        done < "$cgroup_root/memory.events"
+      fi
+      memory_events_json+='}'
+    else
+      unavailable_reason='cgroup v2 memory.peak is unavailable; rootless runtimes may require systemd Delegate=yes and a delegated memory controller'
+    fi
+  elif [[ "$cgroup_version" == 1 ]]; then
+    local cgroup_root="/sys/fs/cgroup/memory/\${cgroup_path#/}"
+    memory_peak="$(cat "$cgroup_root/memory.max_usage_in_bytes" 2>/dev/null || true)"
+    if [[ "$memory_peak" =~ ^[0-9]+$ ]]; then
+      memory_available=true
+    else
+      unavailable_reason='cgroup v1 memory.max_usage_in_bytes is unavailable; rootless runtimes may require systemd Delegate=yes and a delegated memory controller'
+    fi
+  else
+    unavailable_reason='no cgroup memory controller was exposed; rootless runtimes may require systemd Delegate=yes and a delegated memory controller'
+  fi
+
+  disk_peak_kib="$(cat "$observation_dir/disk-peak-kib" 2>/dev/null || true)"
+  local tmp="$observation_dir/observation.json.tmp"
+  {
+    printf '{"memoryMetricsAvailable":%s' "$memory_available"
+    if [[ "$memory_available" == true ]]; then
+      printf ',"memoryCgroupVersion":%s,"memoryPeakBytes":%s' "$cgroup_version" "$memory_peak"
+      [[ "$cgroup_version" == 2 ]] && printf ',"memoryEvents":%s' "$memory_events_json"
+    else
+      printf ',"memoryMetricsUnavailableReason":"%s"' "$unavailable_reason"
+    fi
+    if [[ "$disk_peak_kib" =~ ^[0-9]+$ ]]; then
+      printf ',"workdirDiskPeakBytes":%s' "$((disk_peak_kib * 1024))"
+    fi
+    printf '}\n'
+  } > "$tmp"
+  mv -f "$tmp" "$observation_dir/observation.json"
+}
+
+finish() {
+  local status=$?
+  [[ "$finished" == 0 ]] || return "$status"
+  finished=1
+  trap - EXIT TERM INT HUP
+  if [[ "$runner_pid" && "$runner_pid" != "$BASHPID" ]]; then
+    if [[ "$runner_pgid" =~ ^[0-9]+$ ]]; then
+      kill -TERM -- "-$runner_pgid" 2>/dev/null || true
+    else
+      kill -TERM "$runner_pid" 2>/dev/null || true
+    fi
+    for _ in 1 2 3 4 5; do
+      kill -0 "$runner_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$runner_pid" 2>/dev/null; then
+      if [[ "$runner_pgid" =~ ^[0-9]+$ ]]; then
+        kill -KILL -- "-$runner_pgid" 2>/dev/null || true
+      else
+        kill -KILL "$runner_pid" 2>/dev/null || true
+      fi
+    fi
+  fi
+  if [[ "$disk_monitor_pid" ]]; then
+    kill -TERM "$disk_monitor_pid" 2>/dev/null || true
+    wait "$disk_monitor_pid" 2>/dev/null || true
+  fi
+  write_observation || true
+  [[ "$workdir" ]] && rm -rf -- "$workdir"
+  return "$status"
+}
+trap finish EXIT
+terminate_runner() {
+  local signal="$1"
+  local status="$2"
+  if [[ "$runner_pid" && "$runner_pid" != "$BASHPID" ]]; then
+    if [[ "$runner_pgid" =~ ^[0-9]+$ ]]; then
+      kill -"$signal" -- "-$runner_pgid" 2>/dev/null || true
+    else
+      kill -"$signal" "$runner_pid" 2>/dev/null || true
+    fi
+  fi
+  exit "$status"
+}
+trap 'terminate_runner TERM 143' TERM
+trap 'terminate_runner INT 130' INT
+trap 'terminate_runner HUP 129' HUP
+
 if [[ "\${RUNNERIZE_CONTAINER_BUILD_PROFILE:-}" ]]; then
 ${BUILD_SETUP_SCRIPT}
   workdir="$(runuser -u runner -- mktemp -d)"
-  trap 'rm -rf "$workdir"' EXIT
   cp -a /rsrc/. "$workdir/"
   chown -R runner:runner "$workdir"
   rm -rf "$workdir"/_work "$workdir"/_diag "$workdir"/.runner "$workdir"/.credentials*
-  exec runuser -u runner -- env \
+  monitor_disk &
+  disk_monitor_pid=$!
+  setsid runuser -u runner -- env \
     JITCFG="$JITCFG" \
     MAX_LIFETIME_SECONDS="\${MAX_LIFETIME_SECONDS:-604800}" \
     PATH="${BUILD_BIN_DIR}:$PATH" \
     timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-604800}s" \
-    "$workdir/run.sh" --jitconfig "$JITCFG"
+    "$workdir/run.sh" --jitconfig "$JITCFG" &
+else
+  workdir="$(mktemp -d)"
+  cp -a /rsrc/. "$workdir/"
+  cd "$workdir"
+  rm -rf _work _diag .runner .credentials*
+  export RUNNER_ALLOW_RUNASROOT=1
+  monitor_disk &
+  disk_monitor_pid=$!
+  setsid timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-604800}s" \
+    ./run.sh --jitconfig "$JITCFG" &
 fi
-workdir="$(mktemp -d)"
-trap 'rm -rf "$workdir"' EXIT
-cp -a /rsrc/. "$workdir/"
-cd "$workdir"
-rm -rf _work _diag .runner .credentials*
-export RUNNER_ALLOW_RUNASROOT=1
-exec timeout --signal=TERM --kill-after=10s "\${MAX_LIFETIME_SECONDS:-604800}s" ./run.sh --jitconfig "$JITCFG"
+runner_pid=$!
+runner_pgid=$runner_pid
+set +e
+wait "$runner_pid"
+runner_status=$?
+set -e
+runner_pid=
+runner_pgid=
+exit "$runner_status"
 `;
 
 export const linux = {
@@ -541,10 +818,9 @@ export const linux = {
     if (!reconciliationComplete || protectedRunnerNames.size) return 0;
     const target = await backend();
     if (!target) return 0;
-    const names = await listRunnerContainers(target);
-    const removed = await Promise.all(
-      names.map((name) => stopContainer(target, name)),
-    );
+    const names = (await listRunnerContainers(target))
+      .filter((name) => !activeRunnerContainers.has(name));
+    const removed = await Promise.all(names.map((name) => removeContainer(target, name)));
     return removed.filter(Boolean).length;
   },
 
@@ -554,6 +830,7 @@ export const linux = {
     onStarted,
     onControl,
     onFailureDiagnostics,
+    onTeardownObservation,
   } = {}) {
     if (!encodedJitConfig || typeof encodedJitConfig !== 'string') {
       throw new TypeError('encodedJitConfig must be a non-empty string');
@@ -602,25 +879,44 @@ export const linux = {
 
     let temporary;
     let mountedScript;
+    let observationDir;
+    let name;
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let failed = false;
+    let startedJob = false;
+    let termination;
+    let forceKill;
+    let cleanupDoneResolve;
+    const cleanupDone = new Promise((resolve) => { cleanupDoneResolve = resolve; });
+    let containerStartedAt;
+
     try {
       const runnerDir = process.env.RUNNERIZE_RUNNER_DIR || await ensureRunnerBinary({ os: 'linux', arch: 'x64' });
       let mountedRunner;
       if (target.distro) {
         mountedRunner = await stageWslRunner(target.distro, runnerDir);
         mountedScript = await createWslInnerScript(target.distro);
+        observationDir = await createWslObservationDir(target.distro);
       } else {
         temporary = await mkdtemp(path.join(os.tmpdir(), 'runnerize-'));
         mountedScript = path.join(temporary, 'inner.sh');
+        observationDir = path.join(temporary, 'observation');
+        await mkdir(observationDir, { mode: 0o777 });
+        await chmod(observationDir, 0o777);
         await writeFile(mountedScript, INNER_SCRIPT, { mode: 0o644 });
         await chmod(mountedScript, 0o644);
         mountedRunner = runnerDir;
       }
 
-      const name = `runnerize-${randomUUID()}`;
+      name = `runnerize-${randomUUID()}`;
+      activeRunnerContainers.add(name);
       const args = [
-        'run', '--rm', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
+        'run', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
+        '-e', 'RUNNERIZE_OBSERVE=/runnerize-observation',
         '-v', `${mountedRunner}:/rsrc:ro`,
         '-v', `${mountedScript}:/inner.sh:ro`,
+        '-v', `${observationDir}:/runnerize-observation`,
         ...(kvm ? ['--device', '/dev/kvm'] : []),
         ...(containerBuild ? buildContainerArgs(image) : [image]),
         'bash', '/inner.sh',
@@ -637,35 +933,22 @@ export const linux = {
           env: call.env,
           stdio: ['ignore', 'pipe', 'pipe'],
         });
-        let startedJob = false;
         let stdoutRemainder = '';
         let stderrRemainder = '';
-        let stdout = Buffer.alloc(0);
-        let stderr = Buffer.alloc(0);
         let timedOut = false;
         let settled = false;
         let forceTimer;
         let killTimer;
         let lifetimeExpired = false;
 
-        const failureDiagnostics = () => {
-          try {
-            onFailureDiagnostics?.({
-              stdout: stdout.toString(),
-              stderr: stderr.toString(),
-            });
-          } catch {
-            // Diagnostics must not change the launch outcome.
-          }
-        };
-        const settle = (callback, { failed = false } = {}) => {
+        const settle = (callback, { failed: didFail = false } = {}) => {
           if (settled) return;
           settled = true;
+          failed = didFail;
           clearTimeout(timer);
           clearTimeout(lifetimeTimer);
           if (forceTimer) clearTimeout(forceTimer);
           if (killTimer) clearTimeout(killTimer);
-          if (failed) failureDiagnostics();
           callback();
         };
         const observeOutput = (text, remainder) => {
@@ -680,9 +963,14 @@ export const linux = {
           return nextRemainder;
         };
         const terminate = () => {
-          void stopContainer(target, name);
+          if (settled) return Promise.resolve();
+          if (termination) return termination;
+          termination = killContainer(target, name, 'TERM');
           child.kill('SIGTERM');
-          killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+          killTimer = setTimeout(() => {
+            forceKill = killContainer(target, name, 'KILL');
+            child.kill('SIGKILL');
+          }, KILL_GRACE_MS);
           killTimer.unref?.();
           forceTimer = setTimeout(() => settle(
             () => lifetimeExpired
@@ -691,8 +979,15 @@ export const linux = {
             { failed: true },
           ), FORCE_SETTLE_MS);
           forceTimer.unref?.();
+          return termination;
         };
-        onControl?.({ name, stop: async () => { terminate(); await stopContainer(target, name); } });
+        onControl?.({
+          name,
+          stop: async () => {
+            await terminate();
+            await cleanupDone;
+          },
+        });
         const timer = setTimeout(() => {
           if (startedJob) return;
           timedOut = true;
@@ -706,15 +1001,25 @@ export const linux = {
         lifetimeTimer.unref?.();
 
         child.stdout.on('data', (chunk) => {
-          stdout = appendBounded(stdout, chunk);
-          stdoutRemainder = observeOutput(chunk.toString(), stdoutRemainder);
+          try {
+            stdout = appendBounded(stdout, chunk);
+            stdoutRemainder = observeOutput(chunk.toString(), stdoutRemainder);
+          } catch (error) {
+            settle(() => reject(error), { failed: true });
+          }
         });
         child.stderr.on('data', (chunk) => {
-          const text = chunk.toString();
-          stderr = appendBounded(stderr, chunk);
-          stderrRemainder = observeOutput(text, stderrRemainder);
+          try {
+            stderr = appendBounded(stderr, chunk);
+            stderrRemainder = observeOutput(chunk.toString(), stderrRemainder);
+          } catch (error) {
+            settle(() => reject(error), { failed: true });
+          }
         });
+        const markContainerStarted = () => { containerStartedAt ??= Date.now(); };
         child.once('error', (error) => settle(() => reject(error), { failed: true }));
+        child.once('spawn', markContainerStarted);
+        if (child.pid !== undefined) markContainerStarted();
         child.once('close', (code) => settle(() => {
           if (lifetimeExpired) reject(new Error(`runner exceeded maximum lifetime of ${maxLifetimeMs}ms`));
           else if (timedOut) resolve({ startedJob: false });
@@ -723,11 +1028,77 @@ export const linux = {
         }, { failed: lifetimeExpired || timedOut || code !== 0 }));
       });
     } catch (error) {
+      failed = true;
       if (containerBuild) invalidateContainerBuildProbe();
       throw error;
     } finally {
-      if (target.distro) await removeWslFile(target.distro, mountedScript);
-      else if (temporary) await rm(temporary, { recursive: true, force: true });
+      try {
+        if (termination) await termination;
+        if (forceKill) await forceKill;
+        let inspect;
+        try {
+          inspect = await inspectContainer(target, name);
+          if (!STOPPED_CONTAINER_STATES.has(inspect.Status?.toLowerCase())) {
+            await waitForContainerExit(target, name);
+            inspect = await inspectContainer(target, name);
+          }
+        } catch {
+          // Inspection is best-effort and must not change the launch outcome.
+        }
+        if (failed) {
+          try {
+            onFailureDiagnostics?.({
+              stdout: stdout.toString(),
+              stderr: stderr.toString(),
+              ...(inspect ? { inspect } : {}),
+            });
+          } catch {
+            // Diagnostics must not change the launch outcome.
+          }
+        }
+        if (name) {
+          let measured;
+          try {
+            measured = await readObservation(target, observationDir);
+          } catch (error) {
+            measured = {
+              memoryMetricsAvailable: false,
+              memoryMetricsUnavailableReason:
+                `final cgroup observation unavailable (${error.message}); rootless runtimes may require systemd Delegate=yes and a delegated memory controller`,
+            };
+          }
+          const observation = {
+            container: name,
+            runtime: target.runtime,
+            startedJob,
+            failed,
+            durationMs: Math.max(0, Date.now() - (containerStartedAt ?? Date.now())),
+            ...measured,
+          };
+          if (inspect) {
+            observation.inspect = inspect;
+            for (const field of INSPECT_EVIDENCE_FIELDS) {
+              if (Object.hasOwn(inspect, field)) observation[field] = inspect[field];
+            }
+          }
+          try {
+            await onTeardownObservation?.(observation);
+          } catch {
+            // Observability must not change the launch outcome.
+          } finally {
+            await removeContainer(target, name);
+          }
+        }
+        if (target.distro) {
+          await removeWslFile(target.distro, mountedScript);
+          await removeWslDirectory(target.distro, observationDir);
+        } else if (temporary) {
+          await rm(temporary, { recursive: true, force: true });
+        }
+      } finally {
+        if (name) activeRunnerContainers.delete(name);
+        cleanupDoneResolve();
+      }
     }
   },
 };

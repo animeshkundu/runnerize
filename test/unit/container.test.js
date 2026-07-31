@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, mkdtemp, writeFile, mkdir, rm, access, chmod } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { overrideProcess } from '../helpers/platform-override.js';
 import { SpawnStub } from '../helpers/process-stub.js';
@@ -14,10 +14,19 @@ import { RUNNERIZE_VERSION_LABEL } from '../../src/version.js';
 
 const CONTAINER_SRC = fileURLToPath(new URL('../../src/sandbox/container.js', import.meta.url));
 
+const DEFAULT_INSPECT_STATE = {
+  ExitCode: 0,
+  OOMKilled: false,
+  Error: '',
+  Status: 'exited',
+  StartedAt: '2026-01-01T00:00:00Z',
+  FinishedAt: '2026-01-01T00:01:00Z',
+};
+
 // Helper handler: auto-completes the incidental probe spawns (`--version`, `image
-// inspect`, `rm -f`) so only the main runner container (`--name ...`) is left for the
-// test to drive. Returns the SpawnStub.
-function containerStub(onContainer) {
+// inspect`, container inspect, and cleanup) so only the main runner container
+// (`--name ...`) is left for the test to drive. Returns the SpawnStub.
+function containerStub(onContainer, { inspect = DEFAULT_INSPECT_STATE } = {}) {
   return new SpawnStub((child, stub) => {
     const args = child.args ?? [];
     const isContainer = args.includes('--name');
@@ -28,6 +37,75 @@ function containerStub(onContainer) {
     // KVM is absent unless a test opts in; all other probe / teardown calls succeed.
     if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
       child.close(1);
+      return;
+    }
+    if (args[0] === 'inspect' && args.includes('{{json .State}}')) {
+      child.emitStdout(`${JSON.stringify(inspect)}\n`);
+      child.close(0);
+      return;
+    }
+    if (child.command === 'cat' || (child.command === 'wsl.exe' && args.includes('cat'))) {
+      child.close(1);
+      return;
+    }
+    child.emitStdout('ok\n');
+    child.close(0);
+  });
+}
+
+function lifecycleCalls(stub) {
+  return stub.children.filter((child) => ['inspect', 'kill', 'rm', 'wait'].includes(child.args?.[0]));
+}
+
+function observationDirectory(child) {
+  const volume = child.args.find((arg) => arg.endsWith(':/runnerize-observation'));
+  return volume?.slice(0, -':/runnerize-observation'.length);
+}
+
+function mountedInnerScript(child) {
+  const suffix = ':/inner.sh:ro';
+  const volume = child.args.find((arg) => arg.endsWith(suffix));
+  return volume?.slice(0, -suffix.length);
+}
+
+function writeObservation(child, observation) {
+  const directory = observationDirectory(child);
+  if (!directory) throw new Error('runner container did not mount an observation directory');
+  writeFileSync(path.join(directory, 'observation.json'), JSON.stringify(observation));
+}
+
+function cgroupStub(onContainer, {
+  inspect = DEFAULT_INSPECT_STATE,
+  memoryPeak = 1048576,
+  memoryEvents = { low: 0, high: 3, max: 0, oom: 2, oom_kill: 1 },
+  v1Peak,
+  workdirDiskPeak = 4096,
+} = {}) {
+  return new SpawnStub((child, stub) => {
+    const args = child.args ?? [];
+    if (args.includes('--name')) {
+      writeObservation(child, v1Peak === undefined ? {
+        memoryMetricsAvailable: true,
+        memoryCgroupVersion: 2,
+        memoryPeakBytes: memoryPeak,
+        memoryEvents,
+        workdirDiskPeakBytes: workdirDiskPeak,
+      } : {
+        memoryMetricsAvailable: true,
+        memoryCgroupVersion: 1,
+        memoryPeakBytes: v1Peak,
+        workdirDiskPeakBytes: workdirDiskPeak,
+      });
+      onContainer?.(child, stub);
+      return;
+    }
+    if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
+      child.close(1);
+      return;
+    }
+    if (args[0] === 'inspect' && args.includes('{{json .State}}')) {
+      child.emitStdout(`${JSON.stringify(inspect)}\n`);
+      child.close(0);
       return;
     }
     child.emitStdout('ok\n');
@@ -86,10 +164,50 @@ test('linux.launch resolves { startedJob: true } after a job-start line and clea
       // JIT config is passed via env, never on argv.
       assert.equal(container.options.env.JITCFG, 'deadbeef');
       assert.ok(!container.args.includes('deadbeef'), 'the jit config never appears as an argv token');
+      assert.ok(!container.args.includes('--rm'), 'the runtime preserves exit evidence until explicit cleanup');
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), ['inspect', 'rm']);
     } finally {
       stub.restore();
     }
   });
+});
+
+test('linux.launch materializes shell-syntax-valid inner scripts with and without teardown capture', async (t) => {
+  if (spawnSync('bash', ['--version'], { stdio: 'ignore' }).error) {
+    t.skip('bash is unavailable');
+    return;
+  }
+
+  for (const captureTeardown of [false, true]) {
+    await withLinuxLaunch(async (linux) => {
+      const stub = containerStub((child) => {
+        const script = mountedInnerScript(child);
+        assert.ok(script, 'the runner container mounts the materialized inner script');
+        const materialized = readFileSync(script, 'utf8');
+        const syntax = spawnSync('bash', ['-n'], { input: materialized, encoding: 'utf8' });
+        assert.equal(
+          syntax.status,
+          0,
+          `bash -n rejected inner.sh with teardown capture ${captureTeardown ? 'enabled' : 'disabled'}:\n${syntax.stderr}`,
+        );
+        if (captureTeardown) {
+          writeObservation(child, {
+            memoryMetricsAvailable: false,
+            memoryMetricsUnavailableReason: 'representative unavailable metrics',
+          });
+        }
+        child.close(0);
+      }).install();
+      try {
+        await linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          ...(captureTeardown ? { onTeardownObservation: () => {} } : {}),
+        });
+      } finally {
+        stub.restore();
+      }
+    });
+  }
 });
 
 test('linux passes through usable KVM and advertises the capability', async () => {
@@ -292,12 +410,16 @@ test('linux keeps labels and spawn args unchanged when optional capabilities are
       await linux.launch('cfg', { idleTimeoutMs: 5000 });
       const container = stub.find('--name');
       const name = container.args[container.args.indexOf('--name') + 1];
-      const runnerMount = container.args[container.args.indexOf('-v') + 1];
-      const scriptMount = container.args[container.args.lastIndexOf('-v') + 1];
+      const volumeIndexes = container.args.flatMap((arg, index) => arg === '-v' ? [index] : []);
+      const runnerMount = container.args[volumeIndexes[0] + 1];
+      const scriptMount = container.args[volumeIndexes[1] + 1];
+      const observationMount = container.args[volumeIndexes[2] + 1];
       assert.deepEqual(container.args, [
-        'run', '--rm', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
+        'run', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
+        '-e', 'RUNNERIZE_OBSERVE=/runnerize-observation',
         '-v', runnerMount,
         '-v', scriptMount,
+        '-v', observationMount,
         'example/image:latest', 'bash', '/inner.sh',
       ]);
     } finally {
@@ -359,6 +481,192 @@ test('linux.launch: idle watchdog force-settles and releases when a job never st
   });
 });
 
+test('linux.launch emits one cgroup v2 teardown observation after a successful job', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const observations = [];
+    const stub = cgroupStub((child) => {
+      child.startJob();
+      child.close(0);
+    }).install();
+    try {
+      const result = await linux.launch('cfg', {
+        idleTimeoutMs: 5000,
+        onTeardownObservation: (observation) => observations.push(observation),
+      });
+      assert.deepEqual(result, { startedJob: true });
+      assert.equal(observations.length, 1);
+      assert.equal(observations[0].startedJob, true);
+      assert.equal(observations[0].failed, false);
+      assert.equal(observations[0].memoryMetricsAvailable, true);
+      assert.equal(observations[0].memoryCgroupVersion, 2);
+      assert.equal(observations[0].memoryPeakBytes, 1048576);
+      assert.deepEqual(observations[0].memoryEvents, {
+        low: 0,
+        high: 3,
+        max: 0,
+        oom: 2,
+        oom_kill: 1,
+      });
+      assert.ok(Number.isFinite(observations[0].durationMs));
+      assert.equal(observations[0].workdirDiskPeakBytes, 4096);
+      assert.deepEqual(observations[0].inspect.OOMKilled, false);
+      assert.deepEqual(observations[0].inspect.ExitCode, 0);
+      assert.deepEqual(observations[0].OOMKilled, false);
+      assert.deepEqual(observations[0].ExitCode, 0);
+      assert.equal(observations[0].Status, 'exited');
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch includes OOM crash evidence in the same teardown observation', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const observations = [];
+    const inspect = { ...DEFAULT_INSPECT_STATE, ExitCode: 137, OOMKilled: true };
+    const stub = cgroupStub((child) => child.close(137), { inspect }).install();
+    try {
+      await assert.rejects(
+        () => linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          onTeardownObservation: (observation) => observations.push(observation),
+        }),
+        /exited with code 137/,
+      );
+      assert.equal(observations.length, 1);
+      assert.equal(observations[0].failed, true);
+      assert.equal(observations[0].memoryPeakBytes, 1048576);
+      assert.equal(observations[0].memoryEvents.oom_kill, 1);
+      assert.equal(observations[0].inspect.OOMKilled, true);
+      assert.equal(observations[0].inspect.ExitCode, 137);
+      assert.equal(observations[0].OOMKilled, true);
+      assert.equal(observations[0].ExitCode, 137);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch falls back to the cgroup v1 peak counter', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const observations = [];
+    const stub = cgroupStub((child) => {
+      child.startJob();
+      child.close(0);
+    }, { v1Peak: 2097152 }).install();
+    try {
+      await linux.launch('cfg', {
+        idleTimeoutMs: 5000,
+        onTeardownObservation: (observation) => observations.push(observation),
+      });
+      assert.equal(observations.length, 1);
+      assert.equal(observations[0].memoryMetricsAvailable, true);
+      assert.equal(observations[0].memoryCgroupVersion, 1);
+      assert.equal(observations[0].memoryPeakBytes, 2097152);
+      assert.equal(observations[0].memoryEvents, undefined);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch reports unavailable cgroup counters instead of an empty peak field', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const observations = [];
+    const stub = containerStub((child) => {
+      child.startJob();
+      child.close(0);
+    }).install();
+    try {
+      await linux.launch('cfg', {
+        idleTimeoutMs: 5000,
+        onTeardownObservation: (observation) => observations.push(observation),
+      });
+      assert.equal(observations.length, 1);
+      assert.equal(observations[0].memoryMetricsAvailable, false);
+      assert.equal(observations[0].memoryPeakBytes, undefined);
+      assert.match(observations[0].memoryMetricsUnavailableReason, /cgroup/i);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch: force-kill escalation still inspects and removes the container', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const stub = containerStub((child) => {
+      const origKill = child.kill.bind(child);
+      child.kill = (signal) => {
+        const result = origKill(signal);
+        if (signal === 'SIGKILL') queueMicrotask(() => child.close(137));
+        return result;
+      };
+    }).install();
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...rest) => realSetTimeout(fn, ms === 1000 ? 5 : ms, ...rest);
+    try {
+      assert.deepEqual(
+        await withKeepAlive(linux.launch('cfg', { idleTimeoutMs: 30 })),
+        { startedJob: false },
+      );
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), [
+        'kill', 'kill', 'inspect', 'rm',
+      ]);
+      assert.deepEqual(
+        lifecycleCalls(stub).filter((child) => child.args[0] === 'kill')
+          .map((child) => child.args[child.args.indexOf('--signal') + 1]),
+        ['TERM', 'KILL'],
+      );
+    } finally {
+      global.setTimeout = realSetTimeout;
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch: waits for a terminal runtime state before reporting evidence', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const diagnostics = [];
+    let inspections = 0;
+    const stub = new SpawnStub((child) => {
+      const args = child.args ?? [];
+      if (args.includes('--name')) {
+        child.close(137);
+      } else if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
+        child.close(1);
+      } else if (args[0] === 'inspect' && args.includes('{{json .State}}')) {
+        inspections += 1;
+        const lifecycleInspection = Math.max(0, inspections - 1);
+        child.emitStdout(`${JSON.stringify({
+          ...DEFAULT_INSPECT_STATE,
+          ExitCode: lifecycleInspection === 0 ? 0 : 137,
+          Status: lifecycleInspection === 0 ? 'running' : 'exited',
+        })}\n`);
+        child.close(0);
+      } else {
+        child.emitStdout('ok\n');
+        child.close(0);
+      }
+    }).install();
+    try {
+      await assert.rejects(
+        () => linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          onFailureDiagnostics: (output) => diagnostics.push(output),
+        }),
+        /exited with code 137/,
+      );
+      assert.equal(diagnostics[0].inspect.Status, 'exited');
+      assert.equal(diagnostics[0].inspect.ExitCode, 137);
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), [
+        'inspect', 'wait', 'inspect', 'rm',
+      ]);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
 test('linux.launch: idle watchdog reports bounded diagnostics and preserves its return contract', async () => {
   await withLinuxLaunch(async (linux) => {
     const stdout = `${'o'.repeat(70 * 1024)}stdout-tail`;
@@ -383,22 +691,66 @@ test('linux.launch: idle watchdog reports bounded diagnostics and preserves its 
       assert.ok(Buffer.byteLength(diagnostics[0].stderr) <= 64 * 1024, 'stderr is bounded');
       assert.match(diagnostics[0].stdout, /stdout-tail$/, 'stdout retains the most recent output');
       assert.match(diagnostics[0].stderr, /stderr-tail$/, 'stderr retains the most recent output');
-      // stopContainer issued `rm -f <name>` against the runtime.
-      const teardown = stub.children.find((c) => (c.args ?? []).includes('rm') && (c.args ?? []).includes('-f'));
-      assert.ok(teardown, 'watchdog force-removed the container');
+      assert.deepEqual(diagnostics[0].inspect, DEFAULT_INSPECT_STATE);
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), ['kill', 'inspect', 'rm']);
     } finally {
       stub.restore();
     }
   });
 });
 
-test('linux.launch: rejects with diagnostics when the container exits non-zero', async () => {
+test('linux.launch: rejects with inspect evidence and removes a non-zero container', async () => {
   await withLinuxLaunch(async (linux) => {
     const diagnostics = [];
+    const inspect = {
+      ExitCode: 137,
+      OOMKilled: true,
+      Error: '',
+      Status: 'exited',
+      StartedAt: '2026-01-01T00:00:00Z',
+      FinishedAt: '2026-01-01T00:01:00Z',
+    };
     const stub = containerStub((child) => {
       child.emitStdout('runner setup started\n');
-      child.emitStderr('podman: image pull failed\n');
-      child.close(125);
+      child.emitStderr('runner stopped unexpectedly\n');
+      child.close(137);
+    }, { inspect }).install();
+    try {
+      await assert.rejects(
+        () => linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          onFailureDiagnostics: (output) => diagnostics.push(output),
+        }),
+        /exited with code 137/,
+      );
+      assert.deepEqual(diagnostics, [{
+        stdout: 'runner setup started\n',
+        stderr: 'runner stopped unexpectedly\n',
+        inspect,
+      }]);
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), ['inspect', 'rm']);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch: inspection failure preserves the launch error and still removes the container', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const diagnostics = [];
+    const stub = new SpawnStub((child) => {
+      const args = child.args ?? [];
+      if (args.includes('--name')) {
+        child.emitStderr('runner failed\n');
+        child.close(125);
+      } else if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
+        child.close(1);
+      } else if (args[0] === 'inspect' && args.includes('{{json .State}}')) {
+        child.close(1);
+      } else {
+        child.emitStdout('ok\n');
+        child.close(0);
+      }
     }).install();
     try {
       await assert.rejects(
@@ -408,10 +760,114 @@ test('linux.launch: rejects with diagnostics when the container exits non-zero',
         }),
         /exited with code 125/,
       );
-      assert.deepEqual(diagnostics, [{
-        stdout: 'runner setup started\n',
-        stderr: 'podman: image pull failed\n',
-      }]);
+      assert.deepEqual(diagnostics, [{ stdout: '', stderr: 'runner failed\n' }]);
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), ['inspect', 'rm']);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch: spawn errors still inspect and remove the named container', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const diagnostics = [];
+    const stub = containerStub((child) => child.fail(new Error('spawn failed'))).install();
+    try {
+      await assert.rejects(
+        () => linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          onFailureDiagnostics: (output) => diagnostics.push(output),
+        }),
+        /spawn failed/,
+      );
+      assert.equal(diagnostics.length, 1);
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), ['inspect', 'rm']);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch: callback errors mid-flight still inspect and remove the container', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const stub = containerStub((child) => child.startJob()).install();
+    try {
+      await assert.rejects(
+        () => linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          onStarted: () => { throw new Error('callback failed'); },
+        }),
+        /callback failed/,
+      );
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), ['inspect', 'rm']);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.launch: maximum lifetime kills, inspects, and removes the container', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const diagnostics = [];
+    const inspect = { ...DEFAULT_INSPECT_STATE, ExitCode: 124 };
+    const stub = containerStub((child) => {
+      child.startJob();
+      const origKill = child.kill.bind(child);
+      child.kill = (sig) => { const result = origKill(sig); queueMicrotask(() => child.close(124)); return result; };
+    }, { inspect }).install();
+    try {
+      await assert.rejects(
+        () => withKeepAlive(linux.launch('cfg', {
+          idleTimeoutMs: 5000,
+          maxLifetimeMs: 30,
+          onFailureDiagnostics: (output) => diagnostics.push(output),
+        })),
+        /exceeded maximum lifetime/,
+      );
+      assert.deepEqual(diagnostics[0].inspect, inspect);
+      assert.deepEqual(lifecycleCalls(stub).map((child) => child.args[0]), ['kill', 'inspect', 'rm']);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+test('linux.reapOrphans does not touch host containers while any runner is protected', async () => {
+  const restoreProc = overrideProcess({ platform: 'linux' });
+  const stub = new SpawnStub(() => {
+    throw new Error('protected runners must prevent host container enumeration');
+  }).install();
+  try {
+    const { linux } = await freshImport('../../src/sandbox/container.js');
+    assert.equal(await linux.reapOrphans({
+      protectedRunnerNames: new Set(['github-runner-active']),
+      reconciliationComplete: true,
+    }), 0);
+    assert.equal(stub.children.length, 0);
+  } finally {
+    stub.restore();
+    restoreProc();
+  }
+});
+
+test('linux.reapOrphans reports only containers the runtime removed', async () => {
+  await withLinuxLaunch(async (linux) => {
+    const stub = new SpawnStub((child) => {
+      const args = child.args ?? [];
+      if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
+        child.close(1);
+      } else if (args[0] === 'ps') {
+        child.emitStdout('runnerize-removed\texited\nrunnerize-retained\texited\n');
+        child.close(0);
+      } else if (args[0] === 'rm' && args.at(-1) === 'runnerize-retained') {
+        child.close(1);
+      } else {
+        child.emitStdout('ok\n');
+        child.close(0);
+      }
+    }).install();
+    try {
+      assert.equal(await linux.reapOrphans({ reconciliationComplete: true }), 1);
     } finally {
       stub.restore();
     }
@@ -572,7 +1028,8 @@ test('INNER_SCRIPT invariant: operates on a throwaway workdir, never the read-on
   const source = await readContainerSource();
   const inner = extractInnerScript(source);
   assert.match(inner, /workdir="\$\(mktemp -d\)"/, 'a fresh workdir per run');
-  assert.match(inner, /trap 'rm -rf "\$workdir"' EXIT/, 'workdir is cleaned on exit');
+  assert.match(inner, /trap finish EXIT/, 'the supervisor always samples before cleanup');
+  assert.match(inner, /rm -rf -- "\$workdir"/, 'workdir is cleaned after final sampling');
   assert.doesNotMatch(inner, /rm -rf[^\n]*\/rsrc/, 'never deletes the mounted runner source');
   assert.match(inner, /run\.sh" --jitconfig "\$JITCFG"|run\.sh --jitconfig "\$JITCFG"/,
     'launches run.sh with the jit config from env');
@@ -624,7 +1081,25 @@ test('INNER_SCRIPT gives a non-root runner only the isolated image-build helper'
     'security does not depend on heuristic Dockerfile scanning');
   assert.match(source, /ln -sf container-build \/opt\/runnerize\/bin\/docker/);
   assert.match(source, /ln -sf container-build \/opt\/runnerize\/bin\/podman/);
-  assert.match(source, /exec runuser -u runner -- env/, 'the Actions runner remains non-root');
+  assert.match(source, /setsid runuser -u runner -- env/, 'the Actions runner remains non-root');
+});
+
+test('INNER_SCRIPT preserves final metrics before deleting the job workdir', async () => {
+  const source = await readContainerSource();
+  const inner = extractInnerScript(source);
+  assert.match(inner, /trap finish EXIT/);
+  assert.match(inner, /setsid runuser -u runner -- env/);
+  assert.match(inner, /setsid timeout --signal=TERM --kill-after=10s/);
+  assert.match(inner, /kill -TERM -- "-\$runner_pgid"/);
+  assert.match(inner, /memory\.peak/);
+  assert.match(inner, /memory\.max_usage_in_bytes/);
+  assert.match(inner, /memory\.events/);
+  assert.match(inner, /du -sk -- "\$workdir\/_work"/);
+  assert.match(inner, /wait "\$runner_pid"/);
+  assert.doesNotMatch(inner, /wait "\$runner_pid" 2>\/dev\/null \|\| true/,
+    'EXIT cleanup must not block on an already-reaped runner while the disk monitor is alive');
+  assert.match(inner, /mv -f "\$tmp" "\$observation_dir\/observation\.json"/);
+  assert.ok(inner.indexOf('write_observation || true') < inner.indexOf('rm -rf -- "$workdir"'));
 });
 
 test('WSL forwards the max lifetime and the inner script has a defensive default', async () => {

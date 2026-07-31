@@ -343,7 +343,8 @@ async function withMacosService({ force = false, linuxRuntime = false } = {}, ac
 }
 
 async function withLinuxService({ active = false, imageDetails, imagePullFails = false, image,
-  systemdProbeFails = false, staleExecStart = false, transientMainPid = false } = {}, action) {
+  systemdProbeFails = false, staleExecStart = false, transientMainPid = false,
+  killFails = false } = {}, action) {
   const calls = [];
   const home = mkdtempSync(join(tmpdir(), 'runnerize-linux-service-'));
   const oldToken = process.env.GH_TOKEN;
@@ -371,6 +372,12 @@ async function withLinuxService({ active = false, imageDetails, imagePullFails =
         if (serviceActive) return '';
         const error = new Error('inactive');
         error.status = 3;
+        throw error;
+      }
+      if (command.includes('kill') && killFails) {
+        const error = new Error("systemctl: unrecognized option '--kill-whom=all'");
+        error.status = 1;
+        error.stderr = "systemctl: unrecognized option '--kill-whom=all'";
         throw error;
       }
       if (command.includes('start') || command.includes('restart')) serviceActive = true;
@@ -733,6 +740,7 @@ test('systemd install materializes a cache-independent package release', async (
     const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
     const release = join(releases, readdirSync(releases)[0]);
     assert.ok(unit.replaceAll('\\\\', '\\').includes(join(release, 'bin', 'runnerize.js')));
+    assert.match(unit, /^Delegate=yes$/m);
     assert.ok(existsSync(join(release, 'src', 'service.js')));
     assert.ok(existsSync(join(release, 'package.json')));
   });
@@ -753,6 +761,16 @@ test('systemd reinstall creates a new immutable release and restarts an active d
       && call.args.slice(3).join(' ') === 'systemctl --user restart runnerize.service'));
     assert.ok(!calls.some((call) => call.file === 'bash'
       && call.args.slice(3).join(' ') === 'systemctl --user start runnerize.service'));
+  });
+});
+
+test('a failed force-kill does not abort the install; the restart still runs', async () => {
+  // systemd < 252 rejects --kill-whom, which once turned a cosmetic incompatibility
+  // into linux=unavailable and left the old dispatcher running.
+  await withLinuxService({ active: true, killFails: true }, async (service, calls) => {
+    await service.installService({ force: true });
+    assert.ok(calls.some((call) => call.file === 'bash'
+      && call.args.slice(3).join(' ') === 'systemctl --user restart runnerize.service'));
   });
 });
 

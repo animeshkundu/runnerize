@@ -29,6 +29,7 @@ export class FakeChild extends EventEmitter {
     this.stdout = new EventEmitter();
     this.stderr = new EventEmitter();
     this.signals = [];
+    this.pid = undefined;
     this.killed = false;
   }
 
@@ -66,7 +67,10 @@ export class SpawnStub {
   spawn(command, args, options) {
     const child = new FakeChild(command, args, options);
     this.children.push(child);
-    queueMicrotask(() => this.handler(child, this));
+    queueMicrotask(() => {
+      child.emit('spawn');
+      this.handler(child, this);
+    });
     return child;
   }
 
