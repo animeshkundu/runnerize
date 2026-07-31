@@ -16,7 +16,11 @@ const CLEANUP_TIMEOUT_MS = 5_000;
 const KILL_GRACE_MS = 1_000;
 const FORCE_SETTLE_MS = 7_000;
 const DIAGNOSTICS_MAX_BYTES = 64 * 1024;
+const RUNTIME_PROBE_TIMEOUT_MS = 10_000;
+const WSL_OPERATION_TIMEOUT_MS = 30_000;
+const IMAGE_OPERATION_TIMEOUT_MS = 300_000;
 const CAPABILITY_PROBE_TIMEOUT_MS = 60_000;
+const CAPABILITY_PROBE_TTL_MS = 5 * 60_000;
 const KVM_PROBE_TIMEOUT_MS = 5_000;
 const BASE_LINUX_LABELS = ['self-hosted', 'linux', 'x64', RUNNERIZE_VERSION_LABEL];
 const BUILD_CAPABILITY_LABEL = 'container-build';
@@ -197,7 +201,10 @@ function appendBounded(current, chunk) {
 }
 
 function collect(command, args, options = {}) {
-  const { timeoutMs, ...spawnOptions } = options;
+  const { timeoutMs = WSL_OPERATION_TIMEOUT_MS, ...spawnOptions } = options;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError('subprocess timeoutMs must be a positive finite number');
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptions });
     let stdout = '';
@@ -209,11 +216,11 @@ function collect(command, args, options = {}) {
       if (timer) clearTimeout(timer);
       callback();
     };
-    const timer = timeoutMs ? setTimeout(() => {
+    const timer = setTimeout(() => {
       child.kill('SIGKILL');
       settle(() => reject(new Error(`${command} timed out after ${timeoutMs}ms`)));
-    }, timeoutMs) : null;
-    timer?.unref?.();
+    }, timeoutMs);
+    timer.unref?.();
     child.stdout?.on('data', (chunk) => { stdout += chunk; });
     child.stderr?.on('data', (chunk) => { stderr += chunk; });
     child.once('error', (error) => settle(() => reject(error)));
@@ -226,7 +233,7 @@ function collect(command, args, options = {}) {
 async function nativeRuntime() {
   for (const runtime of ['podman', 'docker']) {
     try {
-      await collect(runtime, ['--version']);
+      await collect(runtime, ['--version'], { timeoutMs: RUNTIME_PROBE_TIMEOUT_MS });
       return runtime;
     } catch {
       // Try the next runtime.
@@ -239,7 +246,9 @@ async function wslDistributions() {
   const configured = process.env.RUNNERIZE_WSL_DISTRO;
   if (configured) return [configured];
   try {
-    const { stdout } = await collect('wsl.exe', ['-l', '-q']);
+    const { stdout } = await collect('wsl.exe', ['-l', '-q'], {
+      timeoutMs: WSL_OPERATION_TIMEOUT_MS,
+    });
     return stdout.replaceAll('\0', '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   } catch {
     return [];
@@ -251,7 +260,9 @@ async function wslRuntime() {
   for (const distro of await wslDistributions()) {
     for (const runtime of ['podman', 'docker']) {
       try {
-        await collect('wsl.exe', ['-d', distro, '-e', runtime, '--version']);
+        await collect('wsl.exe', ['-d', distro, '-e', runtime, '--version'], {
+          timeoutMs: RUNTIME_PROBE_TIMEOUT_MS,
+        });
         return { runtime, distro };
       } catch {
         // Keep looking for an available runtime.
@@ -295,11 +306,14 @@ function containerBuildsRequested() {
 
 async function hasUsableContainerBuild(target, image) {
   if (!target || !containerBuildsRequested()) {
-    linux.containerBuildProbeKey = null;
+    invalidateContainerBuildProbe();
     return false;
   }
   const probeKey = `${target.runtime}\0${target.distro || ''}\0${image}`;
-  if (linux.containerBuildProbeKey === probeKey) return true;
+  if (linux.containerBuildProbeKey === probeKey
+    && Date.now() - linux.containerBuildProbeResolvedAt < CAPABILITY_PROBE_TTL_MS) {
+    return true;
+  }
   const args = ['run', '--rm', ...buildContainerArgs(image), 'bash', '-lc', `
 set -euo pipefail
 ${BUILD_SETUP_SCRIPT}
@@ -341,11 +355,17 @@ rm -rf "$context"
   try {
     await collect(call.command, call.args, { env: call.env, timeoutMs: CAPABILITY_PROBE_TIMEOUT_MS });
     linux.containerBuildProbeKey = probeKey;
+    linux.containerBuildProbeResolvedAt = Date.now();
     return true;
   } catch {
-    linux.containerBuildProbeKey = null;
+    invalidateContainerBuildProbe();
     return false;
   }
+}
+
+function invalidateContainerBuildProbe() {
+  linux.containerBuildProbeKey = null;
+  linux.containerBuildProbeResolvedAt = 0;
 }
 
 function shellQuote(value) {
@@ -353,12 +373,20 @@ function shellQuote(value) {
 }
 
 async function wslPath(distro, windowsPath) {
-  const { stdout } = await collect('wsl.exe', ['-d', distro, '-e', 'wslpath', '-a', windowsPath]);
+  const { stdout } = await collect(
+    'wsl.exe',
+    ['-d', distro, '-e', 'wslpath', '-a', windowsPath],
+    { timeoutMs: WSL_OPERATION_TIMEOUT_MS },
+  );
   return stdout.trim();
 }
 
 function wslShell(distro, script, args = []) {
-  return collect('wsl.exe', ['-d', distro, '-e', 'bash', '-lc', script, 'runnerize', ...args]);
+  return collect(
+    'wsl.exe',
+    ['-d', distro, '-e', 'bash', '-lc', script, 'runnerize', ...args],
+    { timeoutMs: WSL_OPERATION_TIMEOUT_MS },
+  );
 }
 
 async function stageWslRunner(distro, runnerDir) {
@@ -379,8 +407,15 @@ if [[ ! -x "$destination/run.sh" ]]; then
   trap 'rm -rf "$temporary"' EXIT
   cp -a "$source_dir"/. "$temporary"/
   [[ -x "$temporary/run.sh" ]] || { echo 'runner source is missing run.sh' >&2; exit 1; }
-  if mv -T "$temporary" "$destination" 2>/dev/null; then
-    trap - EXIT
+  move_error="$(mktemp "$HOME/.cache/runnerize/runners/.move-error.XXXXXX")"
+  if mv -T "$temporary" "$destination" 2>"$move_error"; then
+    rm -f "$move_error"
+  elif [[ ! -x "$destination/run.sh" ]]; then
+    cat "$move_error" >&2
+    rm -f "$move_error"
+    exit 1
+  else
+    rm -f "$move_error"
   fi
 fi
 printf '%s' "$destination"
@@ -425,8 +460,15 @@ async function stopContainer(target, name) {
   const call = invocation(target, args, process.env);
   try {
     await collect(call.command, call.args, { env: call.env, timeoutMs: CLEANUP_TIMEOUT_MS });
-  } catch {
-    // It may have exited between the watchdog firing and cleanup.
+    return true;
+  } catch (error) {
+    console.warn(JSON.stringify({
+      time: new Date().toISOString(),
+      event: 'container_remove_error',
+      container: name,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    return false;
   }
 }
 
@@ -477,6 +519,7 @@ export const linux = {
   kvm: false,
   containerBuild: false,
   containerBuildProbeKey: null,
+  containerBuildProbeResolvedAt: 0,
 
   async available() {
     const target = await backend();
@@ -491,13 +534,18 @@ export const linux = {
     return Boolean(target);
   },
 
-  async reapOrphans({ protectedRunnerNames = new Set() } = {}) {
-    if (protectedRunnerNames.size) return 0;
+  async reapOrphans({
+    protectedRunnerNames = new Set(),
+    reconciliationComplete = false,
+  } = {}) {
+    if (!reconciliationComplete || protectedRunnerNames.size) return 0;
     const target = await backend();
     if (!target) return 0;
     const names = await listRunnerContainers(target);
-    await Promise.all(names.map((name) => stopContainer(target, name)));
-    return names.length;
+    const removed = await Promise.all(
+      names.map((name) => stopContainer(target, name)),
+    );
+    return removed.filter(Boolean).length;
   },
 
   async launch(encodedJitConfig, {
@@ -521,51 +569,69 @@ export const linux = {
     if (!target) throw new Error('podman or docker is required for the linux flavor');
     const kvm = linux.kvm && await hasUsableKvm(target);
     const image = process.env.RUNNERIZE_LINUX_IMAGE || DEFAULT_LINUX_IMAGE;
-    const containerBuild = linux.containerBuild && await hasUsableContainerBuild(target, image);
-    if (target.distro) {
-      const inspect = invocation(target, ['image', 'inspect', image], process.env);
-      try {
-        await collect(inspect.command, inspect.args, { env: inspect.env });
-      } catch {
-        const pull = invocation(target, ['pull', image], process.env);
-        await collect(pull.command, pull.args, { env: pull.env });
+    let containerBuild = false;
+    if (linux.containerBuild) {
+      containerBuild = await hasUsableContainerBuild(target, image);
+      if (!containerBuild) {
+        linux.containerBuild = false;
+        linux.labels = linux.labels.filter((label) => label !== BUILD_CAPABILITY_LABEL);
       }
-    } else {
-      await ensureImage(image);
     }
-
-    const runnerDir = process.env.RUNNERIZE_RUNNER_DIR || await ensureRunnerBinary({ os: 'linux', arch: 'x64' });
-    let temporary;
-    let mountedRunner;
-    let mountedScript;
-    if (target.distro) {
-      mountedRunner = await stageWslRunner(target.distro, runnerDir);
-      mountedScript = await createWslInnerScript(target.distro);
-    } else {
-      temporary = await mkdtemp(path.join(os.tmpdir(), 'runnerize-'));
-      mountedScript = path.join(temporary, 'inner.sh');
-      await writeFile(mountedScript, INNER_SCRIPT, { mode: 0o644 });
-      await chmod(mountedScript, 0o644);
-      mountedRunner = runnerDir;
-    }
-
-    const name = `runnerize-${randomUUID()}`;
-    const args = [
-      'run', '--rm', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
-      '-v', `${mountedRunner}:/rsrc:ro`,
-      '-v', `${mountedScript}:/inner.sh:ro`,
-      ...(kvm ? ['--device', '/dev/kvm'] : []),
-      ...(containerBuild ? buildContainerArgs(image) : [image]),
-      'bash', '/inner.sh',
-    ];
-    const env = {
-      ...process.env,
-      JITCFG: encodedJitConfig,
-      MAX_LIFETIME_SECONDS: String(Math.max(1, Math.ceil(maxLifetimeMs / 1000))),
-    };
-    const call = invocation(target, args, env);
-
     try {
+      if (target.distro) {
+        const inspect = invocation(target, ['image', 'inspect', image], process.env);
+        try {
+          await collect(inspect.command, inspect.args, {
+            env: inspect.env,
+            timeoutMs: IMAGE_OPERATION_TIMEOUT_MS,
+          });
+        } catch {
+          const pull = invocation(target, ['pull', image], process.env);
+          await collect(pull.command, pull.args, {
+            env: pull.env,
+            timeoutMs: IMAGE_OPERATION_TIMEOUT_MS,
+          });
+        }
+      } else {
+        await ensureImage(image);
+      }
+    } catch (error) {
+      if (containerBuild) invalidateContainerBuildProbe();
+      throw error;
+    }
+
+    let temporary;
+    let mountedScript;
+    try {
+      const runnerDir = process.env.RUNNERIZE_RUNNER_DIR || await ensureRunnerBinary({ os: 'linux', arch: 'x64' });
+      let mountedRunner;
+      if (target.distro) {
+        mountedRunner = await stageWslRunner(target.distro, runnerDir);
+        mountedScript = await createWslInnerScript(target.distro);
+      } else {
+        temporary = await mkdtemp(path.join(os.tmpdir(), 'runnerize-'));
+        mountedScript = path.join(temporary, 'inner.sh');
+        await writeFile(mountedScript, INNER_SCRIPT, { mode: 0o644 });
+        await chmod(mountedScript, 0o644);
+        mountedRunner = runnerDir;
+      }
+
+      const name = `runnerize-${randomUUID()}`;
+      const args = [
+        'run', '--rm', '--name', name, '-e', 'JITCFG', '-e', 'MAX_LIFETIME_SECONDS',
+        '-v', `${mountedRunner}:/rsrc:ro`,
+        '-v', `${mountedScript}:/inner.sh:ro`,
+        ...(kvm ? ['--device', '/dev/kvm'] : []),
+        ...(containerBuild ? buildContainerArgs(image) : [image]),
+        'bash', '/inner.sh',
+      ];
+      const env = {
+        ...process.env,
+        JITCFG: encodedJitConfig,
+        MAX_LIFETIME_SECONDS: String(Math.max(1, Math.ceil(maxLifetimeMs / 1000))),
+      };
+      const call = invocation(target, args, env);
+
       return await new Promise((resolve, reject) => {
         const child = spawn(call.command, call.args, {
           env: call.env,
@@ -656,9 +722,12 @@ export const linux = {
           else reject(new Error(`${target.runtime} runner container exited with code ${code}: ${stderr.toString().trim()}`));
         }, { failed: lifetimeExpired || timedOut || code !== 0 }));
       });
+    } catch (error) {
+      if (containerBuild) invalidateContainerBuildProbe();
+      throw error;
     } finally {
       if (target.distro) await removeWslFile(target.distro, mountedScript);
-      else await rm(temporary, { recursive: true, force: true });
+      else if (temporary) await rm(temporary, { recursive: true, force: true });
     }
   },
 };

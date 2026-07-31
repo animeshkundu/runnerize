@@ -182,6 +182,60 @@ test('linux advertises functional opt-in container builds and configures the job
   });
 });
 
+test('linux expires the container-build capability cache', async () => {
+  await withLinuxLaunch(async (linux) => {
+    process.env.RUNNERIZE_CONTAINER_BUILDS = '1';
+    const realNow = Date.now;
+    let now = 1_000_000;
+    Date.now = () => now;
+    const stub = new SpawnStub((child) => {
+      if (child.args.includes('exec 3<>/dev/kvm')) child.close(1);
+      else { child.emitStdout('ok\n'); child.close(0); }
+    }).install();
+    try {
+      await linux.available();
+      const countProbes = () => stub.children.filter((child) =>
+        child.args.some((arg) => String(arg).includes('runnerize-capability-probe'))).length;
+      assert.equal(countProbes(), 1);
+      now += 5 * 60_000 - 1;
+      await linux.available();
+      assert.equal(countProbes(), 1, 'cached capability remains valid before its TTL');
+      now += 2;
+      await linux.available();
+      assert.equal(countProbes(), 2, 'capability is re-probed after its TTL');
+    } finally {
+      stub.restore();
+      Date.now = realNow;
+    }
+  });
+});
+
+test('linux invalidates the container-build capability after launch setup fails', async () => {
+  await withLinuxLaunch(async (linux) => {
+    process.env.RUNNERIZE_CONTAINER_BUILDS = '1';
+    let inspectFails = false;
+    let pullFails = false;
+    const stub = new SpawnStub((child) => {
+      const args = child.args ?? [];
+      if (args.includes('exec 3<>/dev/kvm')) child.close(1);
+      else if (args.includes('inspect') && inspectFails) child.close(1);
+      else if (args.includes('pull') && pullFails) child.close(1);
+      else { child.emitStdout('ok\n'); child.close(0); }
+    }).install();
+    try {
+      await linux.available();
+      assert.ok(linux.containerBuildProbeKey);
+      inspectFails = true;
+      pullFails = true;
+      await assert.rejects(() => linux.launch('cfg', { idleTimeoutMs: 5000 }));
+      assert.equal(linux.containerBuildProbeKey, null);
+      assert.equal(linux.containerBuildProbeResolvedAt, 0);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
 test('linux treats an explicit falsey RUNNERIZE_CONTAINER_BUILDS as off, not as truthy', async () => {
   for (const value of ['0', 'false', 'no', 'off', 'OFF', ' 0 ']) {
     await withLinuxLaunch(async (linux) => {
@@ -364,6 +418,91 @@ test('linux.launch: rejects with diagnostics when the container exits non-zero',
   });
 });
 
+test('linux orphan reconciliation fails closed without complete runner discovery', async () => {
+  const restoreProc = overrideProcess({ platform: 'linux' });
+  const stub = new SpawnStub(() => {
+    throw new Error('incomplete reconciliation must not enumerate containers');
+  }).install();
+  try {
+    const { linux } = await freshImport('../../src/sandbox/container.js');
+    assert.equal(await linux.reapOrphans(), 0);
+    assert.equal(stub.children.length, 0);
+  } finally {
+    stub.restore();
+    restoreProc();
+  }
+});
+
+test('linux orphan reconciliation reaps all containers after a complete empty discovery', async () => {
+  const restoreProc = overrideProcess({ platform: 'linux' });
+  const removed = [];
+  const stub = new SpawnStub((child) => {
+    if (child.args.includes('--version')) {
+      child.emitStdout('podman 5\n');
+      child.close(0);
+      return;
+    }
+    if (child.args.includes('ps')) {
+      child.emitStdout('runnerize-first\nrunnerize-second\nunrelated\n');
+      child.close(0);
+      return;
+    }
+    if (child.args.includes('rm')) {
+      removed.push(child.args.at(-1));
+      child.close(0);
+      return;
+    }
+    child.close(1);
+  }).install();
+  try {
+    const { linux } = await freshImport('../../src/sandbox/container.js');
+    const count = await linux.reapOrphans({ reconciliationComplete: true });
+    assert.equal(count, 2);
+    assert.deepEqual(removed.sort(), ['runnerize-first', 'runnerize-second']);
+  } finally {
+    stub.restore();
+    restoreProc();
+  }
+});
+
+test('linux orphan reconciliation does not count failed removals', async () => {
+  const restoreProc = overrideProcess({ platform: 'linux' });
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (line) => { warnings.push(JSON.parse(line)); };
+  const stub = new SpawnStub((child) => {
+    if (child.args.includes('--version')) {
+      child.emitStdout('podman 5\n');
+      child.close(0);
+      return;
+    }
+    if (child.args.includes('ps')) {
+      child.emitStdout('runnerize-removed\nrunnerize-failed\n');
+      child.close(0);
+      return;
+    }
+    if (child.args.at(-1) === 'runnerize-failed') {
+      child.emitStderr('permission denied\n');
+      child.close(1);
+      return;
+    }
+    child.close(0);
+  }).install();
+  try {
+    const { linux } = await freshImport('../../src/sandbox/container.js');
+    const count = await linux.reapOrphans({ reconciliationComplete: true });
+    assert.equal(count, 1);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].event, 'container_remove_error');
+    assert.equal(warnings[0].container, 'runnerize-failed');
+    assert.match(warnings[0].error, /permission denied/);
+  } finally {
+    stub.restore();
+    console.warn = originalWarn;
+    restoreProc();
+  }
+});
+
 test('linux.available: true when a container runtime is present, false when none is', async () => {
   const restoreProc = overrideProcess({ platform: 'linux' });
   try {
@@ -520,6 +659,44 @@ async function bashSupportsMvT() {
     return false;
   }
 }
+
+test('staging script surfaces a failed move when no valid destination exists', async () => {
+  const source = await readContainerSource();
+  const script = extractStagingScript(source)
+    .replace('version="$("$source_dir/bin/Runner.Listener" --version)"', 'version="2.999.1"')
+    .replaceAll('-x "$destination/run.sh"', '-f "$destination/run.sh"')
+    .replace('-x "$temporary/run.sh"', '-f "$temporary/run.sh"')
+    .replace(
+      'mv -T "$temporary" "$destination"',
+      "bash -c 'echo forced move failure >&2; exit 73'",
+    );
+  const setup = `
+set -euo pipefail
+root="$(mktemp -d)"
+trap 'rm -rf "$root"' EXIT
+export HOME="$root/home"
+source_dir="$root/source"
+mkdir -p "$HOME" "$source_dir/bin"
+printf '#!/bin/sh\\n' > "$source_dir/run.sh"
+bash -c "$RUNNERIZE_STAGE_SCRIPT" runnerize "$source_dir"
+`;
+
+  await assert.rejects(
+    new Promise((resolve, reject) => {
+      const child = spawn('bash', ['-c', setup], {
+        env: { ...process.env, RUNNERIZE_STAGE_SCRIPT: script },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('close', (code) => (code === 0
+        ? resolve()
+        : reject(new Error(`stage exited ${code}: ${stderr}`))));
+    }),
+    /forced move failure/,
+  );
+});
 
 test('staging script is race-safe under concurrency (real bash + mv -T)', async (t) => {
   if (!(await bashSupportsMvT())) {

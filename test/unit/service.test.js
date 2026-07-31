@@ -32,7 +32,7 @@ function installStubs({ exec, spawn, platformName = 'win32', home }) {
 
 function successfulHarness(options = {}) {
   const calls = [];
-  let cachedNodeChecks = 0;
+  let installedNodeChecks = 0;
   const registeredActions = new Map();
   const registeredArguments = new Map();
   for (const taskName of options.installedTasks ?? []) registeredActions.set(taskName, true);
@@ -189,6 +189,10 @@ function successfulHarness(options = {}) {
     if (command[0] === 'whoami') return 'ani\n';
     if (command[0] === 'ps') return options.noSystemd ? 'init' : 'systemd';
     if (command[0] === 'sh' && command.includes('printf %s "$HOME"')) return '/home/ani';
+    if (command[0] === 'sh' && command[1] === '-c' && command[3] === 'runnerize-node-migrate') {
+      if (!options.legacyNode) throw new Error('legacy node missing');
+      return 'v24.18.0';
+    }
     if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('/etc/os-release')) return options.osRelease ?? 'ubuntu debian';
     if (command[0] === 'cat' && command[1]?.endsWith('/.config/systemd/user/runnerize.service')) {
       if (!options.wslInstalledRoot) throw new Error('unit missing');
@@ -222,8 +226,8 @@ function successfulHarness(options = {}) {
     }
     if (command[0] === 'wslpath') return '/mnt/c/Users/Ani/runnerize';
     if (command[0]?.endsWith('/bin/node') && command[1] === '--version') {
-      cachedNodeChecks += 1;
-      if (options.cachedNode === false && cachedNodeChecks === 1) throw new Error('cached node missing');
+      installedNodeChecks += 1;
+      if (options.installedNode === false && installedNodeChecks === 1) throw new Error('installed node missing');
       return 'v24.18.0';
     }
     return '';
@@ -338,21 +342,56 @@ async function withMacosService({ force = false, linuxRuntime = false } = {}, ac
   }
 }
 
-async function withLinuxService({ active = false, imageDetails, imagePullFails = false, image } = {}, action) {
+async function withLinuxService({ active = false, imageDetails, imagePullFails = false, image,
+  systemdProbeFails = false, staleExecStart = false, transientMainPid = false } = {}, action) {
   const calls = [];
   const home = mkdtempSync(join(tmpdir(), 'runnerize-linux-service-'));
   const oldToken = process.env.GH_TOKEN;
   const oldImage = process.env.RUNNERIZE_LINUX_IMAGE;
+  let serviceActive = active;
+  let installedBin;
+  let mainPidChecks = 0;
   process.env.GH_TOKEN = 'test-token';
   if (image) process.env.RUNNERIZE_LINUX_IMAGE = image;
   else delete process.env.RUNNERIZE_LINUX_IMAGE;
   const exec = (file, args, options = {}) => {
     calls.push({ kind: 'exec', file, args, options });
+    if (file === 'bash' && args.includes('systemctl')) {
+      assert.equal(args[0], '-c', 'systemctl does not source login profiles into captured output');
+      assert.match(args[1], /XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\)/);
+      assert.match(args[1], /DBUS_SESSION_BUS_ADDRESS=unix:path=\$XDG_RUNTIME_DIR\/bus/);
+      const command = args.slice(3);
+      if (command.includes('is-active')) {
+        if (systemdProbeFails) {
+          const error = new Error('Failed to connect to bus');
+          error.status = 1;
+          error.stderr = 'Failed to connect to bus: environment unavailable';
+          throw error;
+        }
+        if (serviceActive) return '';
+        const error = new Error('inactive');
+        error.status = 3;
+        throw error;
+      }
+      if (command.includes('start') || command.includes('restart')) serviceActive = true;
+      if (command.includes('--property=MainPID')) {
+        mainPidChecks += 1;
+        return transientMainPid && mainPidChecks === 1 ? '0\n' : '4242\n';
+      }
+      return '';
+    }
     if (file === 'systemctl' && args.includes('is-active')) {
-      if (active) return '';
+      if (serviceActive) return '';
       const error = new Error('inactive');
       error.status = 3;
       throw error;
+    }
+    if (file === 'readlink' && args[0] === '-f') return process.execPath;
+    if (file === 'bash' && args[1]?.includes('/proc/$1/cmdline')) {
+      const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
+      installedBin = unit.match(/ExecStart="[^"]+" "([^"]+)"/)?.[1]
+        ?.replaceAll('\\\\', '\\');
+      return `${process.execPath}\0${staleExecStart ? '/home/ani/.local/share/runnerize/bin/runnerize.js' : installedBin}\0run\0`;
     }
     if (file === 'podman' && args[0] === '--version') return 'podman 5\n';
     if (file === 'podman' && args[0] === 'pull' && imagePullFails) throw new Error('pull failed');
@@ -506,7 +545,7 @@ test('service status treats a stable release as newer than its prerelease', asyn
     } finally {
       console.log = originalLog;
     }
-    assert.ok(logs.some((line) => /installed=1\.0\.0-beta\.1 running=no status=STALE/.test(line)));
+    assert.ok(logs.some((line) => /installed=1\.0\.0-beta\.1 running=yes status=STALE/.test(line)));
   });
 });
 
@@ -710,20 +749,50 @@ test('systemd reinstall creates a new immutable release and restarts an active d
     const installed = readdirSync(releases);
     assert.equal(installed.length, 2);
     assert.ok(installed.includes(firstRelease));
-    assert.ok(calls.some((call) => call.file === 'systemctl'
-      && call.args.join(' ') === '--user restart runnerize.service'));
-    assert.ok(!calls.some((call) => call.file === 'systemctl'
-      && call.args.join(' ') === '--user start runnerize.service'));
+    assert.ok(calls.some((call) => call.file === 'bash'
+      && call.args.slice(3).join(' ') === 'systemctl --user restart runnerize.service'));
+    assert.ok(!calls.some((call) => call.file === 'bash'
+      && call.args.slice(3).join(' ') === 'systemctl --user start runnerize.service'));
   });
 });
 
 test('systemd first install starts without restarting', async () => {
   await withLinuxService({}, async (service, calls) => {
     await service.installService();
-    assert.ok(calls.some((call) => call.file === 'systemctl'
-      && call.args.join(' ') === '--user start runnerize.service'));
-    assert.ok(!calls.some((call) => call.file === 'systemctl'
-      && call.args.join(' ') === '--user restart runnerize.service'));
+    assert.ok(calls.some((call) => call.file === 'bash'
+      && call.args.slice(3).join(' ') === 'systemctl --user start runnerize.service'));
+    assert.ok(!calls.some((call) => call.file === 'bash'
+      && call.args.slice(3).join(' ') === 'systemctl --user restart runnerize.service'));
+  });
+});
+
+test('systemd install treats a failed user-bus probe as an error, not inactive', async () => {
+  await withLinuxService({ systemdProbeFails: true }, async (service, calls, home) => {
+    await assert.rejects(
+      () => service.installService(),
+      /Could not determine whether runnerize\.service is active: Failed to connect to bus/,
+    );
+    assert.equal(existsSync(join(home, '.config', 'systemd', 'user', 'runnerize.service')), false);
+    assert.ok(!calls.some((call) => call.file === 'bash'
+      && call.args.slice(3).includes('start')));
+  });
+});
+
+test('systemd install retries while the restarted unit is acquiring its MainPID', async () => {
+  await withLinuxService({ transientMainPid: true }, async (service, calls) => {
+    await service.installService();
+    const mainPidChecks = calls.filter((call) => call.file === 'bash'
+      && call.args.includes('--property=MainPID'));
+    assert.equal(mainPidChecks.length, 2);
+  });
+});
+
+test('systemd install fails when the running process still uses a stale ExecStart', async () => {
+  await withLinuxService({ staleExecStart: true }, async (service) => {
+    await assert.rejects(
+      () => service.installService(),
+      /did not start the intended executable.*runnerize\.js.*PID 4242 is running.*\.local\/share\/runnerize\/bin\/runnerize\.js/,
+    );
   });
 });
 
@@ -764,13 +833,13 @@ test('Windows status reports independent WSL and native installed versions', asy
 });
 
 test('Windows install skips docker-desktop, reuses PATH Node, and delegates service install', async () => {
-  await withWindowsService({ cachedNode: false }, async (service, harness, appData) => {
+  await withWindowsService({ installedNode: false }, async (service, harness, appData) => {
     await service.installService();
     const whoami = harness.calls.find((call) => commandOf(call)[0] === 'whoami');
     assert.ok(whoami.args.includes('Ubuntu'));
     assert.ok(harness.calls.some((call) => {
       const command = commandOf(call);
-      return command[0] === 'bash' && command[1] === '-lc'
+      return command[0] === 'bash' && command[1] === '-c'
         && command.includes('/usr/bin/node')
         && command.some((value) => String(value).startsWith('/home/ani/.local/share/runnerize-service/releases/'))
         && command.includes('install');
@@ -999,21 +1068,41 @@ test('Windows install prints an ordered GitHub login fallback when no native cre
   });
 });
 
-test('Windows install reuses the cached Node without downloading on reinstall', async () => {
+test('Windows install reuses the durable Node without downloading on reinstall', async () => {
   await withWindowsService({}, async (service, harness) => {
     await service.installService();
     assert.ok(harness.calls.some((call) => {
       const command = commandOf(call);
-      return command[0] === '/home/ani/.cache/runnerize/node/v24.18.0/bin/node'
+      return command[0] === '/home/ani/.local/share/runnerize/node/v24.18.0/bin/node'
         && command[1] === '--version';
     }));
     assert.ok(!harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
-    assert.ok(harness.calls.some((call) => commandOf(call).includes('/home/ani/.cache/runnerize/node/v24.18.0/bin/node')));
+    assert.ok(harness.calls.some((call) => commandOf(call).includes('/home/ani/.local/share/runnerize/node/v24.18.0/bin/node')));
+    assert.ok(harness.calls.some((call) => {
+      const command = commandOf(call);
+      return command[0] === 'rm' && command[1] === '-rf'
+        && command[2] === '/home/ani/.cache/runnerize/node';
+    }), 'removes the legacy disposable Node copy after service verification');
+  });
+});
+
+test('Windows install migrates a valid legacy Node into durable storage', async () => {
+  await withWindowsService({ installedNode: false, legacyNode: true }, async (service, harness) => {
+    await service.installService();
+    const migration = harness.calls.find((call) => {
+      const command = commandOf(call);
+      return command[0] === 'sh' && command[3] === 'runnerize-node-migrate';
+    });
+    assert.ok(migration, 'the legacy cache location is checked for migration');
+    assert.ok(migration.args.includes('/home/ani/.cache/runnerize/node/v24.18.0'));
+    assert.ok(migration.args.includes('/home/ani/.local/share/runnerize/node/v24.18.0'));
+    assert.ok(!harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
+    assert.ok(harness.calls.some((call) => commandOf(call).includes('/home/ani/.local/share/runnerize/node/v24.18.0/bin/node')));
   });
 });
 
 test('Windows install persists a Windows token and downloads pinned Node when absent', async () => {
-  await withWindowsService({ noGh: true, token: 'test-token', nodeAbsent: true, cachedNode: false }, async (service, harness) => {
+  await withWindowsService({ noGh: true, token: 'test-token', nodeAbsent: true, installedNode: false }, async (service, harness) => {
     await service.installService();
     const tokenWrite = harness.calls.find((call) => {
       const command = commandOf(call);
@@ -1036,7 +1125,7 @@ test('Windows install persists a Windows token and downloads pinned Node when ab
 });
 
 test('Windows install downloads Node when PATH points to Node 16 even if its path says v20', async () => {
-  await withWindowsService({ nodeOutput: '/opt/node-v20/bin/node\nv16.20.2\n', cachedNode: false }, async (service, harness) => {
+  await withWindowsService({ nodeOutput: '/opt/node-v20/bin/node\nv16.20.2\n', installedNode: false }, async (service, harness) => {
     await service.installService();
     assert.ok(harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
   });
@@ -1061,7 +1150,7 @@ test('Windows install fails actionably before runtime installation when systemd 
 });
 
 test('Windows install completes preflight before probing or installing Node', async () => {
-  await withWindowsService({ noGh: true, nodeAbsent: true, cachedNode: false, noWsb: true }, async (service, harness) => {
+  await withWindowsService({ noGh: true, nodeAbsent: true, installedNode: false, noWsb: true }, async (service, harness) => {
     await assert.rejects(service.installService(), /Run: gh auth login/);
     assert.ok(!harness.calls.some((call) => commandOf(call)[2]?.includes('sha256sum -c')));
   });

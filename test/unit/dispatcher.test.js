@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pollDelay, runDispatcher } from '../../src/dispatcher.js';
 import { runnerNamePrefix } from '../../src/github.js';
-import { GitHubStub } from '../helpers/github-stub.js';
+import { GitHubStub, githubResponse } from '../helpers/github-stub.js';
 import { FakeFlavor, installFakeFlavor, waitFor, tick } from '../helpers/dispatcher-harness.js';
 
 // A dispatcher test session: installs the GitHub stub + a controllable linux flavor,
@@ -812,10 +812,10 @@ test('guard release failure does not bypass the caller drain hook', async () => 
   });
 });
 
-test('startup reconciliation reaps host resources before polling', async () => {
+test('startup reconciliation reaps host resources after complete runner discovery', async () => {
   const flavor = new FakeFlavor();
-  let orphanReaps = 0;
-  flavor.reapOrphans = async () => { orphanReaps += 1; return 1; };
+  const reapCalls = [];
+  flavor.reapOrphans = async (options) => { reapCalls.push(options); return 1; };
   await runSession({
     flavor,
     github: {
@@ -825,7 +825,76 @@ test('startup reconciliation reaps host resources before polling', async () => {
   }, async ({ start, events }) => {
     start();
     assert.ok(await waitFor(() => events('reconcile_complete').length === 1));
-    assert.equal(orphanReaps, 1);
+    assert.equal(reapCalls.length, 1);
+    assert.equal(reapCalls[0].reconciliationComplete, true);
+    assert.equal(reapCalls[0].protectedRunnerNames.size, 0);
+  });
+});
+
+test('startup reconciliation skips host reaping when runner discovery is incomplete', async () => {
+  const flavor = new FakeFlavor();
+  let orphanReaps = 0;
+  flavor.reapOrphans = async () => { orphanReaps += 1; return 1; };
+  await runSession({
+    flavor,
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/startup-failure', private: true }],
+      faults: {
+        listRunners: () => new Response('{"message":"boom"}', {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        }),
+      },
+    },
+  }, async ({ start, events }) => {
+    start();
+    assert.ok(await waitFor(() => events('reconcile_complete').length === 1));
+    assert.equal(orphanReaps, 0);
+    assert.equal(events('host_reconcile_skipped').length, 1);
+    assert.equal(
+      events('host_reconcile_skipped')[0].reason,
+      'incomplete_runner_discovery',
+    );
+    assert.equal(events('reconcile_complete')[0].reconciliationComplete, false);
+  });
+});
+
+test('failed stale-runner deletion keeps reconciling but prevents host reaping', async () => {
+  const flavor = new FakeFlavor();
+  let orphanReaps = 0;
+  flavor.reapOrphans = async () => { orphanReaps += 1; return 1; };
+  let deletionAttempts = 0;
+  await runSession({
+    flavor,
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/delete-failure', private: true }],
+      runners: {
+        'me/delete-failure': [
+          { id: 1, name: `${runnerNamePrefix()}one`, status: 'offline', labels: flavor.labels },
+          { id: 2, name: `${runnerNamePrefix()}two`, status: 'offline', labels: flavor.labels },
+        ],
+      },
+      faults: {
+        deleteRunner: () => {
+          deletionAttempts += 1;
+          return deletionAttempts === 1
+            ? githubResponse({ message: 'boom' }, { status: 500 })
+            : undefined;
+        },
+      },
+    },
+  }, async ({ start, stub, events }) => {
+    start();
+    assert.ok(await waitFor(() => events('reconcile_complete').length === 1));
+    assert.equal(stub.countCalls('DELETE', /\/actions\/runners\//), 2);
+    assert.equal(orphanReaps, 0);
+    assert.equal(events('reconcile_error').length, 1);
+    assert.equal(events('reconcile_error')[0].runnerId, 1);
+    assert.equal(events('runner_reconciled').length, 1);
+    assert.equal(events('runner_reconciled')[0].runnerId, 2);
+    assert.equal(events('reconcile_complete')[0].reconciliationComplete, false);
   });
 });
 

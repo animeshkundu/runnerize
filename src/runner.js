@@ -7,19 +7,38 @@ import { spawn } from 'node:child_process';
 
 const API_URL = 'https://api.github.com/repos/actions/runner/releases/latest';
 const USER_AGENT = 'runnerize/0.1';
+const RUNTIME_PROBE_TIMEOUT_MS = 10_000;
+const IMAGE_OPERATION_TIMEOUT_MS = 300_000;
+const EXTRACTION_TIMEOUT_MS = 120_000;
 
 function run(command, args, options = {}) {
+  const { timeoutMs, ...spawnOptions } = options;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError('subprocess timeoutMs must be a positive finite number');
+  }
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...options });
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptions });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const settle = (callback) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      callback();
+    };
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      settle(() => reject(new Error(`${command} timed out after ${timeoutMs}ms`)));
+    }, timeoutMs);
+    timer.unref?.();
     child.stdout?.on('data', (chunk) => { stdout += chunk; });
     child.stderr?.on('data', (chunk) => { stderr += chunk; });
-    child.once('error', reject);
-    child.once('close', (code) => {
+    child.once('error', (error) => settle(() => reject(error)));
+    child.once('close', (code) => settle(() => {
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`${command} exited with code ${code}: ${stderr.trim()}`));
-    });
+    }));
   });
 }
 
@@ -131,8 +150,12 @@ export async function ensureRunnerBinary({ os: osName, arch }) {
     const actual = createHash('sha256').update(await readFile(archive)).digest('hex');
     if (actual !== expected) throw new Error(`SHA-256 verification failed for ${assetName}`);
 
-    await run(extractionCommand(), ['-xf', archive, '-C', extracted]);
-    if (osName === 'darwin') await run('xattr', ['-c', '-r', extracted]);
+    await run(extractionCommand(), ['-xf', archive, '-C', extracted], {
+      timeoutMs: EXTRACTION_TIMEOUT_MS,
+    });
+    if (osName === 'darwin') {
+      await run('xattr', ['-c', '-r', extracted], { timeoutMs: EXTRACTION_TIMEOUT_MS });
+    }
     if (!(await exists(path.join(extracted, osName === 'win32' ? 'run.cmd' : 'run.sh')))) {
       throw new Error('extracted actions runner is missing its run script');
     }
@@ -150,7 +173,7 @@ export async function ensureRunnerBinary({ os: osName, arch }) {
 
 async function commandAvailable(command) {
   try {
-    await run(command, ['--version']);
+    await run(command, ['--version'], { timeoutMs: RUNTIME_PROBE_TIMEOUT_MS });
     return true;
   } catch {
     return false;
@@ -162,13 +185,13 @@ export async function ensureImage(image, { refresh = false } = {}) {
   const runtime = await commandAvailable('podman') ? 'podman' : await commandAvailable('docker') ? 'docker' : null;
   if (!runtime) throw new Error('podman or docker is required for the linux flavor');
   if (refresh) {
-    await run(runtime, ['pull', image]);
+    await run(runtime, ['pull', image], { timeoutMs: IMAGE_OPERATION_TIMEOUT_MS });
     return;
   }
   try {
-    await run(runtime, ['image', 'inspect', image]);
+    await run(runtime, ['image', 'inspect', image], { timeoutMs: IMAGE_OPERATION_TIMEOUT_MS });
   } catch {
-    await run(runtime, ['pull', image]);
+    await run(runtime, ['pull', image], { timeoutMs: IMAGE_OPERATION_TIMEOUT_MS });
   }
 }
 
@@ -177,7 +200,9 @@ export async function localImageDetails(image) {
   const runtime = await commandAvailable('podman') ? 'podman' : await commandAvailable('docker') ? 'docker' : null;
   if (!runtime) return { reference: image, runtime: null, digest: null, created: null };
   try {
-    const { stdout } = await run(runtime, ['image', 'inspect', image]);
+    const { stdout } = await run(runtime, ['image', 'inspect', image], {
+      timeoutMs: IMAGE_OPERATION_TIMEOUT_MS,
+    });
     const details = JSON.parse(stdout)?.[0] ?? {};
     const digest = details.Digest
       ?? details.RepoDigests?.find((value) => value.includes('@sha256:'))?.split('@')[1]

@@ -223,8 +223,11 @@ export const macos = {
     }
   },
 
-  async reapOrphans({ protectedRunnerNames = new Set() } = {}) {
-    if (protectedRunnerNames.size) return 0;
+  async reapOrphans({
+    protectedRunnerNames = new Set(),
+    reconciliationComplete = false,
+  } = {}) {
+    if (!reconciliationComplete || protectedRunnerNames.size) return 0;
     const { stdout } = await collect('tart', ['list', '--format', 'json'], { timeoutMs: CLEANUP_TIMEOUT_MS });
     const entries = JSON.parse(stdout);
     const names = entries.map((entry) => entry.name ?? entry.Name)
