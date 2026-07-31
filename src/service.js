@@ -689,6 +689,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Delegate=yes
 ExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(installation.bin)} run${runOnly ? ` --only ${quoteSystemd(runOnly)}` : ''}
 ${environmentFile}Restart=always
 RestartSec=5
@@ -704,7 +705,15 @@ WantedBy=default.target
   if (wasActive) {
     console.log('Restarting the running dispatcher to load the new version…');
     if (force) {
-      systemdUserRun(['systemctl', '--user', 'kill', '--kill-whom=all', '--signal=SIGKILL', unitName]);
+      // `systemctl kill` already targets every process in the unit, and naming that
+      // explicitly breaks on systemd < 252, where the option is spelled --kill-who.
+      // The kill only front-runs the restart below, so a failure must not abort the
+      // install — that turned a cosmetic incompatibility into linux=unavailable.
+      try {
+        systemdUserRun(['systemctl', '--user', 'kill', '--signal=SIGKILL', unitName]);
+      } catch (error) {
+        console.warn(`Could not force-kill the running dispatcher; restarting instead: ${error.message}`);
+      }
     }
     systemdUserRun(['systemctl', '--user', 'restart', unitName]);
   } else {

@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const API_ROOT = 'https://api.github.com';
 const DEFAULT_TIMEOUT_MS = 20_000;
+const JOB_CORRELATION_TIMEOUT_MS = 30_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 // Periodic re-resolution prevents a long-lived dispatcher from outliving a CLI-rotated credential.
 const TOKEN_CACHE_TTL_MS = 5 * 60_000;
@@ -422,6 +423,57 @@ export async function generateJitConfig(fullName, labels, { signal } = {}) {
     runnerId: data.runner.id,
     runnerName: data.runner.name,
   };
+}
+
+export async function findRunnerJob(fullName, runnerName, { signal } = {}) {
+  if (typeof runnerName !== 'string' || !runnerName) return null;
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(abortError(signal));
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(
+    () => controller.abort(new Error(`runner job correlation timed out after ${JOB_CORRELATION_TIMEOUT_MS}ms`)),
+    JOB_CORRELATION_TIMEOUT_MS,
+  );
+  timer.unref?.();
+
+  try {
+    const repo = repoPath(fullName);
+    const runsById = new Map();
+
+    for (const status of ['in_progress', 'completed']) {
+      const runs = await paginated(
+        (page) => `/repos/${repo}/actions/runs?status=${status}&per_page=100&page=${page}`,
+        undefined,
+        (data) => data?.workflow_runs,
+        { signal: controller.signal },
+      );
+      for (const run of runs) runsById.set(run.id, run);
+    }
+
+    for (const run of runsById.values()) {
+      const jobs = await paginated(
+        (page) => `/repos/${repo}/actions/runs/${encodeURIComponent(run.id)}/jobs?per_page=100&page=${page}`,
+        undefined,
+        (data) => data?.jobs,
+        { signal: controller.signal },
+      );
+      const job = jobs.find((candidate) => candidate.runner_name === runnerName);
+      if (job) {
+        return {
+          workflowRunId: run.id,
+          workflowId: run.workflow_id,
+          workflowName: run.name,
+          workflowJobId: job.id,
+          workflowJobName: job.name,
+        };
+      }
+    }
+    return null;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
 }
 
 export async function listRunners(fullName, { signal } = {}) {

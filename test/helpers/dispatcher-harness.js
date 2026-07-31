@@ -23,7 +23,14 @@ export class FakeFlavor {
     this.launch = this.launch.bind(this);
   }
 
-  async launch(encodedJitConfig, { idleTimeoutMs, maxLifetimeMs, onStarted, onControl } = {}) {
+  async launch(encodedJitConfig, {
+    idleTimeoutMs,
+    maxLifetimeMs,
+    onStarted,
+    onControl,
+    onFailureDiagnostics,
+    onTeardownObservation,
+  } = {}) {
     let resolve;
     let reject;
     const done = new Promise((res, rej) => { resolve = res; reject = rej; });
@@ -37,6 +44,8 @@ export class FakeFlavor {
       succeed(result = { startedJob: true }) { resolve(result); },
       settle(result) { resolve(result); },
       fail(error) { reject(error instanceof Error ? error : new Error(String(error))); },
+      observe(observation) { return onTeardownObservation?.(observation); },
+      diagnose(diagnostics) { return onFailureDiagnostics?.(diagnostics); },
     };
     this.launches.push(launch);
     onControl?.({
@@ -47,7 +56,10 @@ export class FakeFlavor {
       },
     });
     // Run the scripted behavior on a microtask so the dispatcher can register the launch.
-    queueMicrotask(() => this.behavior(launch, this));
+    queueMicrotask(() => {
+      Promise.resolve(this.behavior(launch, this))
+        .catch((error) => launch.fail(error));
+    });
     return done;
   }
 }

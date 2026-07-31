@@ -1,6 +1,7 @@
 import {
   countQueuedMatchingJobs,
   deleteRunner,
+  findRunnerJob,
   generateJitConfig,
   isStillPrivate,
   listOwnedPrivateRepos,
@@ -461,6 +462,40 @@ export async function runDispatcher({
                 onControl: ({ name, stop }) => {
                   lifecycle.resourceName = name;
                   lifecycle.stop = stop;
+                },
+                onFailureDiagnostics: ({ stdout, stderr, inspect }) => {
+                  log('runner_failure_diagnostics', {
+                    repo: target.repo,
+                    flavor: flavor.key,
+                    runnerId,
+                    runnerName,
+                    container: lifecycle.resourceName,
+                    stdout,
+                    stderr,
+                    ...(inspect ?? {}),
+                  });
+                },
+                onTeardownObservation: async (observation) => {
+                  let workflow;
+                  try {
+                    workflow = await findRunnerJob(target.repo, runnerName);
+                  } catch (error) {
+                    log('runner_job_correlation_error', {
+                      repo: target.repo,
+                      flavor: flavor.key,
+                      runnerId,
+                      runnerName,
+                      ...errorFields(error),
+                    });
+                  }
+                  log('runner_resource_observation', {
+                    repo: target.repo,
+                    flavor: flavor.key,
+                    runnerId,
+                    runnerName,
+                    ...(workflow ?? {}),
+                    ...observation,
+                  });
                 },
               });
               if (!result?.startedJob) {

@@ -85,6 +85,84 @@ function holdingBehavior({ markStarted = false } = {}) {
   return (launch) => { if (markStarted) launch.markStarted(); /* never settle */ };
 }
 
+test('runner teardown observation is logged once with repository and workflow identifiers', async () => {
+  const flavor = new FakeFlavor();
+  flavor.behavior = async (launch) => {
+    launch.markStarted();
+    await launch.observe({
+      container: 'runnerize-observed',
+      runtime: 'podman',
+      durationMs: 1250,
+      memoryMetricsAvailable: true,
+      memoryCgroupVersion: 2,
+      memoryPeakBytes: 1048576,
+      memoryEvents: { high: 1, oom: 0, oom_kill: 0 },
+      OOMKilled: false,
+      ExitCode: 0,
+      Status: 'exited',
+    });
+    launch.succeed();
+  };
+
+  await runSession({
+    flavor,
+    github: {
+      user: { login: 'me', type: 'User' },
+      repos: [{ full_name: 'me/observed', private: true }],
+      runs: { 'me/observed': [{ id: 91, status: 'queued', workflow_id: 93, name: 'CI' }] },
+      jobs: { 91: [{ id: 92, name: 'build', status: 'queued', labels: ['self-hosted', 'linux', 'x64'] }] },
+      onRequest: (method, pathname, { url }) => {
+        if (method === 'GET' && pathname === '/repos/me/observed/actions/runs') {
+          const status = url.searchParams.get('status');
+          if (status === 'completed') return githubResponse({ workflow_runs: [] });
+          if (status === 'in_progress') {
+            return githubResponse({ workflow_runs: [{ id: 91, workflow_id: 93, name: 'CI' }] });
+          }
+        }
+        if (method === 'GET' && pathname === '/repos/me/observed/actions/runs/91/jobs'
+          && !url.searchParams.has('filter')) {
+          return githubResponse({ jobs: [{
+            id: 92,
+            name: 'build',
+            status: 'queued',
+            labels: ['self-hosted', 'linux', 'x64'],
+            runner_name: 'runnerize-gen-1',
+          }] });
+        }
+        return undefined;
+      },
+    },
+  }, async ({ start, controller, events }) => {
+    const done = start();
+    assert.ok(await waitFor(() => events('runner_resource_observation').length === 1));
+    controller.abort();
+    await done;
+    assert.deepEqual(events('runner_resource_observation'), [{
+      time: events('runner_resource_observation')[0].time,
+      event: 'runner_resource_observation',
+      repo: 'me/observed',
+      flavor: 'linux',
+      runnerId: 1001,
+      runnerName: 'runnerize-gen-1',
+      workflowRunId: 91,
+      workflowId: 93,
+      workflowName: 'CI',
+      workflowJobId: 92,
+      workflowJobName: 'build',
+      container: 'runnerize-observed',
+      runtime: 'podman',
+      durationMs: 1250,
+      memoryMetricsAvailable: true,
+      memoryCgroupVersion: 2,
+      memoryPeakBytes: 1048576,
+      memoryEvents: { high: 1, oom: 0, oom_kill: 0 },
+      OOMKilled: false,
+      ExitCode: 0,
+      Status: 'exited',
+    }]);
+  });
+});
+
 test('runDispatcher validates its numeric options', async () => {
   const signal = new AbortController().signal;
   await assert.rejects(() => runDispatcher({ maxConcurrent: 0, signal }), TypeError);

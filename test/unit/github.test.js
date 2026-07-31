@@ -20,6 +20,50 @@ async function withGithub(config, fn) {
   }
 }
 
+test('findRunnerJob correlates a runner across active and completed workflow jobs', async () => {
+  await withGithub({
+    onRequest: (method, pathname, { url }) => {
+      if (method === 'GET' && pathname === '/repos/me/repo/actions/runs') {
+        const status = url.searchParams.get('status');
+        return githubResponse({
+          workflow_runs: status === 'in_progress'
+            ? [{ id: 91, workflow_id: 93, name: 'CI' }]
+            : [{ id: 94, workflow_id: 95, name: 'Release' }],
+        });
+      }
+      if (method === 'GET' && pathname === '/repos/me/repo/actions/runs/91/jobs') {
+        return githubResponse({ jobs: [{ id: 92, name: 'build', runner_name: 'runnerize-gen-1' }] });
+      }
+      if (method === 'GET' && pathname === '/repos/me/repo/actions/runs/94/jobs') {
+        return githubResponse({ jobs: [] });
+      }
+      return undefined;
+    },
+  }, async (gh) => {
+    assert.deepEqual(await gh.findRunnerJob('me/repo', 'runnerize-gen-1'), {
+      workflowRunId: 91,
+      workflowId: 93,
+      workflowName: 'CI',
+      workflowJobId: 92,
+      workflowJobName: 'build',
+    });
+  });
+});
+
+test('findRunnerJob returns null when no job used the runner', async () => {
+  await withGithub({
+    onRequest: (method, pathname) => {
+      if (method === 'GET' && pathname === '/repos/me/repo/actions/runs') {
+        return githubResponse({ workflow_runs: [] });
+      }
+      return undefined;
+    },
+  }, async (gh) => {
+    assert.equal(await gh.findRunnerJob('me/repo', 'missing-runner'), null);
+    assert.equal(await gh.findRunnerJob('me/repo', ''), null);
+  });
+});
+
 test('getToken resolves from GH_TOKEN and caches', async () => {
   const prev = process.env.GH_TOKEN;
   process.env.GH_TOKEN = '  env-token  ';
