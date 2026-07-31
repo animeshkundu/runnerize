@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { githubResponse } from '../helpers/github-stub.js';
 import { SpawnStub } from '../helpers/process-stub.js';
 import { freshImport } from '../helpers/fresh-module.js';
+import { withKeepAlive } from '../helpers/dispatcher-harness.js';
 
 // runner.js talks to the actions/runner releases API via `fetch` and shells out to a
 // container runtime via `spawn`. Both are stubbed, so version parsing / validation and
@@ -119,6 +120,24 @@ test('ensureImage rejects when no container runtime is available', async () => {
   try {
     await assert.rejects(() => runner.ensureImage('example/image:latest'), /podman or docker is required/);
   } finally {
+    stub.restore();
+  }
+});
+
+test('ensureImage bounds and kills a wedged runtime probe', async () => {
+  const runner = await freshImport('../../src/runner.js');
+  const stub = new SpawnStub(() => {}).install();
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, ms === 10_000 ? 5 : ms, ...args);
+  try {
+    await assert.rejects(
+      withKeepAlive(runner.ensureImage('example/image:latest')),
+      /podman or docker is required/,
+    );
+    assert.equal(stub.children.length, 2, 'both runtime probes settle instead of hanging');
+    assert.ok(stub.children.every((child) => child.signals.includes('SIGKILL')));
+  } finally {
+    global.setTimeout = realSetTimeout;
     stub.restore();
   }
 });

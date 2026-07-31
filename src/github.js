@@ -8,9 +8,14 @@ const execFileAsync = promisify(execFile);
 const API_ROOT = 'https://api.github.com';
 const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_RATE_LIMIT_RETRIES = 3;
+// Periodic re-resolution prevents a long-lived dispatcher from outliving a CLI-rotated credential.
+const TOKEN_CACHE_TTL_MS = 5 * 60_000;
 const etagCache = new Map();
 const ETAG_CACHE_MAX = 500;
 let cachedToken;
+let cachedTokenSource;
+let cachedTokenResolvedAt = 0;
+let tokenResolution;
 let rateLimitPausedUntil = 0;
 let rateLimitGate;
 
@@ -125,27 +130,33 @@ async function paginated(pathForPage, etagPrefix, selectItems = (data) => data, 
   }
 }
 
-export async function getToken({ signal } = {}) {
-  if (cachedToken) return cachedToken;
-  if (signal?.aborted) throw abortError(signal);
+function cacheToken(token, source) {
+  cachedToken = token;
+  cachedTokenSource = source;
+  cachedTokenResolvedAt = Date.now();
+  return token;
+}
 
+function invalidateToken(token) {
+  if (cachedToken !== token) return;
+  cachedToken = undefined;
+  cachedTokenSource = undefined;
+  cachedTokenResolvedAt = 0;
+}
+
+async function resolveToken() {
   const envToken = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
-  if (envToken) {
-    cachedToken = envToken;
-    return cachedToken;
-  }
+  if (envToken) return cacheToken(envToken, 'environment');
 
   try {
     const { stdout } = await execFileAsync('gh', ['auth', 'token'], {
       encoding: 'utf8',
       timeout: DEFAULT_TIMEOUT_MS,
       windowsHide: true,
-      signal,
     });
     const token = stdout.trim();
     if (!token) throw new Error('No GitHub token is available');
-    cachedToken = token;
-    return cachedToken;
+    return cacheToken(token, 'gh');
   } catch (error) {
     if (process.platform !== 'win32') throw error;
     const tokenPath = join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'runnerize', 'windows.token');
@@ -154,15 +165,24 @@ export async function getToken({ signal } = {}) {
       const script = `$ErrorActionPreference = 'Stop'; [Console]::Out.Write([System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath '${tokenPath.replaceAll("'", "''")}' | ConvertTo-SecureString)).Password)`;
       const { stdout } = await execFileAsync('powershell.exe', [
         '-NoProfile', '-NonInteractive', '-Command', script,
-      ], { encoding: 'utf8', timeout: DEFAULT_TIMEOUT_MS, windowsHide: true, signal });
+      ], { encoding: 'utf8', timeout: DEFAULT_TIMEOUT_MS, windowsHide: true });
       const token = stdout.trim();
       if (!token) throw new Error('decrypted token was empty');
-      cachedToken = token;
-      return cachedToken;
+      return cacheToken(token, 'dpapi');
     } catch (decryptError) {
       throw new Error(`Could not decrypt the persisted Windows credential at ${tokenPath}`, { cause: decryptError });
     }
   }
+}
+
+export async function getToken({ signal } = {}) {
+  if (cachedToken && Date.now() - cachedTokenResolvedAt < TOKEN_CACHE_TTL_MS) return cachedToken;
+  if (signal?.aborted) throw abortError(signal);
+
+  if (!tokenResolution) {
+    tokenResolution = resolveToken().finally(() => { tokenResolution = undefined; });
+  }
+  return waitFor(tokenResolution, signal);
 }
 
 export async function api(method, path, {
@@ -171,10 +191,13 @@ export async function api(method, path, {
   timeoutMs = DEFAULT_TIMEOUT_MS,
   signal,
 } = {}) {
-  const token = await getToken({ signal });
+  let token = await getToken({ signal });
+  let tokenSource = cachedToken === token ? cachedTokenSource : undefined;
   const cached = etagKey ? etagCache.get(etagKey) : undefined;
+  let authenticationRetried = false;
+  let rateLimitAttempt = 0;
 
-  for (let attempt = 0; ; attempt += 1) {
+  for (;;) {
     await awaitRateLimit(signal);
 
     const controller = new AbortController();
@@ -210,9 +233,31 @@ export async function api(method, path, {
     }
 
     const data = parseResponseData(text, response.headers.get('content-type') || '');
-    const delay = rateLimitDelayMs(response, data, attempt);
+    if (response.status === 401) {
+      const envToken = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
+      if (tokenSource === 'environment' || envToken === token) {
+        const error = new Error('GitHub authentication failed with status 401; the token comes from GH_TOKEN/GITHUB_TOKEN, so automatic refresh cannot help');
+        error.status = response.status;
+        error.data = data;
+        throw error;
+      }
+      if (authenticationRetried) {
+        const error = new Error('GitHub authentication failed with status 401 after refreshing the token once');
+        error.status = response.status;
+        error.data = data;
+        throw error;
+      }
+      authenticationRetried = true;
+      invalidateToken(token);
+      token = await getToken({ signal });
+      tokenSource = cachedToken === token ? cachedTokenSource : undefined;
+      continue;
+    }
+
+    const delay = rateLimitDelayMs(response, data, rateLimitAttempt);
     if (delay > 0) pauseRateLimit(delay);
-    if (isRateLimited(response, data) && attempt < MAX_RATE_LIMIT_RETRIES) {
+    if (isRateLimited(response, data) && rateLimitAttempt < MAX_RATE_LIMIT_RETRIES) {
+      rateLimitAttempt += 1;
       await awaitRateLimit(signal);
       continue;
     }

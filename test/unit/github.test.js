@@ -55,6 +55,141 @@ test('getToken falls back to `gh auth token` when no env token', async () => {
   }
 });
 
+test('getToken re-resolves a CLI token after the cache TTL', async () => {
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  const originalNow = Date.now;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  let now = 1_000;
+  let tokenNumber = 0;
+  Date.now = () => now;
+  const exec = new ExecFileStub(() => {
+    tokenNumber += 1;
+    return { stdout: `gh-cli-token-${tokenNumber}\n`, stderr: '' };
+  }).install();
+  const gh = await freshImport('../../src/github.js');
+  try {
+    assert.equal(await gh.getToken(), 'gh-cli-token-1');
+    now += 4 * 60_000;
+    assert.equal(await gh.getToken(), 'gh-cli-token-1');
+    now += 2 * 60_000;
+    assert.equal(await gh.getToken(), 'gh-cli-token-2');
+    assert.equal(exec.calls.length, 2);
+  } finally {
+    exec.restore();
+    Date.now = originalNow;
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+  }
+});
+
+test('getToken shares one CLI resolution across concurrent cache misses', async () => {
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  let release;
+  const exec = new ExecFileStub(() => new Promise((resolve) => { release = resolve; })).install();
+  const gh = await freshImport('../../src/github.js');
+  try {
+    const first = gh.getToken();
+    const second = gh.getToken();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(exec.calls.length, 1, 'concurrent callers share the same credential subprocess');
+    release({ stdout: 'shared-token', stderr: '' });
+    assert.deepEqual(await Promise.all([first, second]), ['shared-token', 'shared-token']);
+  } finally {
+    exec.restore();
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+  }
+});
+
+test('api refreshes a CLI token once after 401 and retries the request', async () => {
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  let tokenNumber = 0;
+  const exec = new ExecFileStub(() => {
+    tokenNumber += 1;
+    return { stdout: `token-${tokenNumber}`, stderr: '' };
+  }).install();
+  const authorizations = [];
+  let requestCount = 0;
+  const stub = new GitHubStub({
+    onRequest: (_method, _path, { headers }) => {
+      requestCount += 1;
+      authorizations.push(headers.get('authorization'));
+      if (requestCount === 1) return githubResponse({ message: 'Bad credentials' }, { status: 401 });
+      return githubResponse({ login: 'alice', type: 'User' });
+    },
+  }).install();
+  const gh = await freshImport('../../src/github.js');
+  try {
+    assert.deepEqual(await gh.getUser(), { login: 'alice', type: 'User' });
+    assert.equal(exec.calls.length, 2, 'the credential is resolved once initially and once after 401');
+    assert.deepEqual(authorizations, ['Bearer token-1', 'Bearer token-2']);
+  } finally {
+    stub.restore();
+    exec.restore();
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+  }
+});
+
+test('api surfaces a second 401 after one token refresh', async () => {
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  let tokenNumber = 0;
+  const exec = new ExecFileStub(() => {
+    tokenNumber += 1;
+    return { stdout: `token-${tokenNumber}`, stderr: '' };
+  }).install();
+  const stub = new GitHubStub({
+    onRequest: () => githubResponse({ message: 'Bad credentials' }, { status: 401 }),
+  }).install();
+  const gh = await freshImport('../../src/github.js');
+  try {
+    await assert.rejects(
+      () => gh.getUser(),
+      (error) => error.status === 401 && /after refreshing the token once/.test(error.message),
+    );
+    assert.equal(stub.calls.length, 2, 'the API request is attempted at most twice');
+    assert.equal(exec.calls.length, 2, 'the credential is refreshed exactly once');
+  } finally {
+    stub.restore();
+    exec.restore();
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+  }
+});
+
+test('api reports that an environment token cannot be refreshed after 401', async () => {
+  const prevGh = process.env.GH_TOKEN;
+  const prevGithub = process.env.GITHUB_TOKEN;
+  process.env.GH_TOKEN = 'env-token';
+  delete process.env.GITHUB_TOKEN;
+  const stub = new GitHubStub({
+    onRequest: () => githubResponse({ message: 'Bad credentials' }, { status: 401 }),
+  }).install();
+  const gh = await freshImport('../../src/github.js');
+  try {
+    await assert.rejects(
+      () => gh.getUser(),
+      (error) => error.status === 401 && /GH_TOKEN\/GITHUB_TOKEN.*automatic refresh cannot help/.test(error.message),
+    );
+    assert.equal(stub.calls.length, 1, 'an environment credential is not retried pointlessly');
+  } finally {
+    stub.restore();
+    if (prevGh === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = prevGh;
+    if (prevGithub === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevGithub;
+  }
+});
+
 test('getToken makes DPAPI decrypt failures terminating PowerShell errors', async () => {
   const prevGh = process.env.GH_TOKEN;
   const prevGithub = process.env.GITHUB_TOKEN;

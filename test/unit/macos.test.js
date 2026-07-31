@@ -10,7 +10,10 @@ test('macOS orphan reconciliation preserves resources while a host runner is act
   const stub = new SpawnStub(() => { throw new Error('reconciliation must not enumerate VMs'); }).install();
   try {
     const { macos } = await freshImport('../../src/sandbox/macos.js');
-    assert.equal(await macos.reapOrphans({ protectedRunnerNames: new Set(['host-1']) }), 0);
+    assert.equal(await macos.reapOrphans({
+      protectedRunnerNames: new Set(['host-1']),
+      reconciliationComplete: true,
+    }), 0);
     assert.equal(stub.children.length, 0);
   } finally {
     stub.restore();

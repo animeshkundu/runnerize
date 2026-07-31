@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,8 @@ const packageRoot = dirname(dirname(binPath));
 const SERVICE_PACKAGE_ENTRIES = ['bin', 'src', 'package.json'];
 const ELEVATION_TIMEOUT_MS = 55_000;
 const PROBE_TIMEOUT_MS = 10_000;
+const SYSTEMD_VERIFY_TIMEOUT_MS = 5_000;
+const SYSTEMD_VERIFY_RETRY_MS = 100;
 const INSTALL_TIMEOUT_MS = 120_000;
 const NPM_LOOKUP_TIMEOUT_MS = 10_000;
 const WSL_INSTALL_GUIDANCE = 'In an elevated PowerShell: wsl --install -d Ubuntu\nThen restart Windows if prompted and rerun this command.';
@@ -596,10 +598,72 @@ function materializeSystemdApp() {
   return { root: destination, bin: join(destination, 'bin', 'runnerize.js') };
 }
 
+function systemdUnitIsActive(unitName) {
+  const result = systemdUserResult([
+    'systemctl', '--user', 'is-active', '--quiet', unitName,
+  ], { timeout: PROBE_TIMEOUT_MS });
+  if (result.status === 0) return true;
+  if (result.status === 3 || result.status === 4) return false;
+  const detail = result.stderr?.trim() || result.stdout?.trim()
+    || result.error?.message || `exit code ${result.status}`;
+  throw new Error(`Could not determine whether ${unitName} is active: ${detail}`);
+}
+
+async function verifySystemdInstall(unitName, expectedArgs) {
+  try {
+    accessSync(expectedArgs[0], constants.X_OK);
+  } catch (error) {
+    throw new Error(`${unitName} uses a missing or non-executable interpreter at ${expectedArgs[0]}.`, {
+      cause: error,
+    });
+  }
+
+  const expectedNode = capture('readlink', ['-f', process.execPath], {
+    timeout: PROBE_TIMEOUT_MS,
+  });
+  const deadline = Date.now() + SYSTEMD_VERIFY_TIMEOUT_MS;
+  let lastError;
+
+  do {
+    try {
+      if (!systemdUnitIsActive(unitName)) {
+        throw new Error(`${unitName} is not active after installation.`);
+      }
+      const mainPid = Number.parseInt(systemdUserCapture([
+        'systemctl', '--user', 'show', unitName, '--property=MainPID', '--value',
+      ], { timeout: PROBE_TIMEOUT_MS }), 10);
+      if (!Number.isInteger(mainPid) || mainPid <= 0) {
+        throw new Error(`Could not determine the running process for ${unitName}.`);
+      }
+      const runningNode = capture('readlink', ['-f', `/proc/${mainPid}/exe`], {
+        timeout: PROBE_TIMEOUT_MS,
+      });
+      const runningArgs = capture('bash', [
+        '-c', 'cat -- "/proc/$1/cmdline"', 'runnerize-systemd-verify', String(mainPid),
+      ], { timeout: PROBE_TIMEOUT_MS }).split('\0').filter(Boolean);
+      const argumentsMatch = runningArgs.length === expectedArgs.length
+        && runningArgs.every((argument, index) => argument === expectedArgs[index]);
+      if (runningNode !== expectedNode || !argumentsMatch) {
+        throw new Error(`${unitName} did not start the intended executable ${expectedArgs.join(' ')}; PID ${mainPid} is running ${runningArgs.join(' ') || runningNode || 'an unknown command'}.`);
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise((resolve) => {
+        setTimeout(resolve, Math.min(SYSTEMD_VERIFY_RETRY_MS, remaining));
+      });
+    }
+  } while (Date.now() < deadline);
+
+  throw lastError;
+}
+
 async function installSystemd({ force = false } = {}) {
   await preflightRun();
   const unitName = `${SERVICE_NAME}.service`;
-  const wasActive = captureResult('systemctl', ['--user', 'is-active', '--quiet', unitName]).status === 0;
+  const wasActive = systemdUnitIsActive(unitName);
   // npx runs packages from its disposable cache; keep the service executable independent of it.
   const installation = materializeSystemdApp();
   const unitPath = join(homedir(), '.config', 'systemd', 'user', unitName);
@@ -611,6 +675,12 @@ async function installSystemd({ force = false } = {}) {
     ? `EnvironmentFile=-${quoteSystemd(environmentFilePath)}\n`
     : '';
   const runOnly = process.env.RUNNERIZE_SERVICE_RUN_ONLY;
+  const expectedArgs = [
+    process.execPath,
+    installation.bin,
+    'run',
+    ...(runOnly ? ['--only', runOnly] : []),
+  ];
   mkdirSync(dirname(unitPath), { recursive: true });
   writeFileSync(unitPath, `[Unit]
 Description=runnerize ephemeral GitHub Actions dispatcher
@@ -629,17 +699,18 @@ TimeoutStopSec=infinity
 WantedBy=default.target
 `, { mode: 0o644 });
 
-  run('systemctl', ['--user', 'daemon-reload']);
-  run('systemctl', ['--user', 'enable', unitName]);
+  systemdUserRun(['systemctl', '--user', 'daemon-reload']);
+  systemdUserRun(['systemctl', '--user', 'enable', unitName]);
   if (wasActive) {
     console.log('Restarting the running dispatcher to load the new version…');
     if (force) {
-      run('systemctl', ['--user', 'kill', '--kill-whom=all', '--signal=SIGKILL', unitName]);
+      systemdUserRun(['systemctl', '--user', 'kill', '--kill-whom=all', '--signal=SIGKILL', unitName]);
     }
-    run('systemctl', ['--user', 'restart', unitName]);
+    systemdUserRun(['systemctl', '--user', 'restart', unitName]);
   } else {
-    run('systemctl', ['--user', 'start', unitName]);
+    systemdUserRun(['systemctl', '--user', 'start', unitName]);
   }
+  await verifySystemdInstall(unitName, expectedArgs);
   console.log(`Installed and started ${unitPath}`);
   console.log('To run before login, enable user lingering: loginctl enable-linger "$USER"');
   console.log(`View logs: journalctl --user -u ${SERVICE_NAME} -f`);
@@ -993,9 +1064,26 @@ function persistWslToken({ distro, user, home }, token) {
   return true;
 }
 
-function systemdWslArgs(command) {
+function systemdUserShellArgs(command) {
+  // npx lacks the user-bus environment, which otherwise turns an active service into a false inactive result.
   const script = 'export XDG_RUNTIME_DIR=/run/user/$(id -u); export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; exec "$@"';
-  return ['bash', '-lc', script, 'runnerize-systemd', ...command];
+  return ['-c', script, 'runnerize-systemd', ...command];
+}
+
+function systemdUserResult(command, options = {}) {
+  return captureResult('bash', systemdUserShellArgs(command), options);
+}
+
+function systemdUserCapture(command, options = {}) {
+  return capture('bash', systemdUserShellArgs(command), options);
+}
+
+function systemdUserRun(command, options = {}) {
+  return run('bash', systemdUserShellArgs(command), options);
+}
+
+function systemdWslArgs(command) {
+  return ['bash', ...systemdUserShellArgs(command)];
 }
 
 function validNodeVersion(output) {
@@ -1006,15 +1094,37 @@ function validNodeVersion(output) {
 function ensureWslNode({ distro, user, home }) {
   const requestedVersion = process.env.RUNNERIZE_WSL_NODE_VERSION || DEFAULT_WSL_NODE_VERSION;
   if (!/^v\d+\.\d+\.\d+$/.test(requestedVersion)) throw new Error('RUNNERIZE_WSL_NODE_VERSION must look like v24.18.0.');
-  const installDir = `${home}/.cache/runnerize/node/${requestedVersion}`;
-  const cachedNodePath = `${installDir}/bin/node`;
+  const installDir = `${home}/.local/share/runnerize/node/${requestedVersion}`;
+  const nodePath = `${installDir}/bin/node`;
   try {
-    const cachedVersion = wslCapture(distro, user, [cachedNodePath, '--version']);
-    if (cachedVersion === requestedVersion && validNodeVersion(cachedVersion)) {
-      return { path: cachedNodePath, version: cachedVersion, downloaded: false };
+    const installedVersion = wslCapture(distro, user, [nodePath, '--version']);
+    if (installedVersion === requestedVersion && validNodeVersion(installedVersion)) {
+      return { path: nodePath, version: installedVersion, downloaded: false };
     }
   } catch {
-    // Fall through to PATH probing or installation.
+    // Try migrating the previous cache-based installation before downloading again.
+  }
+
+  const legacyInstallDir = `${home}/.cache/runnerize/node/${requestedVersion}`;
+  const migrationScript = [
+    'set -eu',
+    'source="$1"',
+    'destination="$2"',
+    'if [ -x "$source/bin/node" ] && [ ! -e "$destination" ]; then',
+    '  mkdir -p "$(dirname "$destination")"',
+    '  mv "$source" "$destination"',
+    'fi',
+    '"$destination/bin/node" --version',
+  ].join('\n');
+  try {
+    const migratedVersion = wslCapture(distro, user, [
+      'sh', '-c', migrationScript, 'runnerize-node-migrate', legacyInstallDir, installDir,
+    ]);
+    if (migratedVersion === requestedVersion && validNodeVersion(migratedVersion)) {
+      return { path: nodePath, version: migratedVersion, downloaded: false };
+    }
+  } catch {
+    // Fall through to PATH probing or a fresh verified installation.
   }
 
   try {
@@ -1035,7 +1145,6 @@ function ensureWslNode({ distro, user, home }) {
   if (!/^[a-fA-F0-9]{64}$/.test(expectedHash || '')) {
     throw new Error('Custom RUNNERIZE_WSL_NODE_VERSION requires RUNNERIZE_WSL_NODE_SHA256.');
   }
-  const nodePath = cachedNodePath;
   const script = [
     'set -eu',
     'version="$1"',
@@ -1532,6 +1641,12 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
       ...(force ? ['--force'] : []),
     ];
     wslRun(context.distro, context.user, systemdWslArgs(installCommand));
+    const legacyNodeDir = `${context.home}/.cache/runnerize/node`;
+    try {
+      wslRun(context.distro, context.user, ['rm', '-rf', legacyNodeDir]);
+    } catch (error) {
+      console.warn(`The service is running from durable storage, but the old cached Node installation at ${legacyNodeDir} could not be removed: ${error.message}`);
+    }
     const trigger = await installLogonTrigger(wslTriggerSpec(context), { noElevate, elevationTimeoutMs });
     console.log(`Linux logon trigger: ${trigger.kind} (${trigger.detail})`);
     linuxInstalled = true;
@@ -1643,7 +1758,14 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
       'systemctl', '--user', 'daemon-reload',
     ])));
     bestEffort('wsl.exe', wslArgs(context.distro, context.user, ['loginctl', 'disable-linger', context.user]));
-    bestEffort('wsl.exe', wslArgs(context.distro, context.user, ['rm', '-rf', installationRoot, `${context.home}/.cache/runnerize/node`, `${context.home}/.config/runnerize`]));
+    bestEffort('wsl.exe', wslArgs(context.distro, context.user, [
+      'rm',
+      '-rf',
+      installationRoot,
+      `${context.home}/.local/share/runnerize/node`,
+      `${context.home}/.cache/runnerize/node`,
+      `${context.home}/.config/runnerize`,
+    ]));
   }
 
   for (const taskName of [SERVICE_NAME, 'runnerize-windows', 'runnerize-wsl-keepawake']) {

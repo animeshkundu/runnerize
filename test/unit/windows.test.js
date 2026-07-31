@@ -30,7 +30,10 @@ test('windows orphan reconciliation preserves resources while a host runner is a
   const stub = new SpawnStub(() => { throw new Error('reconciliation must not enumerate sandboxes'); }).install();
   try {
     const { windows } = await freshImport('../../src/sandbox/windows.js');
-    assert.equal(await windows.reapOrphans({ protectedRunnerNames: new Set(['host-1']) }), 0);
+    assert.equal(await windows.reapOrphans({
+      protectedRunnerNames: new Set(['host-1']),
+      reconciliationComplete: true,
+    }), 0);
     assert.equal(stub.children.length, 0);
   } finally {
     stub.restore();

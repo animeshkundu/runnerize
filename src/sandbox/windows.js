@@ -198,8 +198,11 @@ export const windows = {
     }
   },
 
-  async reapOrphans({ protectedRunnerNames = new Set() } = {}) {
-    if (protectedRunnerNames.size) return 0;
+  async reapOrphans({
+    protectedRunnerNames = new Set(),
+    reconciliationComplete = false,
+  } = {}) {
+    if (!reconciliationComplete || protectedRunnerNames.size) return 0;
     const ids = await runningSandboxIds();
     await Promise.all(ids.map((id) => stopSandbox(id)));
     return ids.length;

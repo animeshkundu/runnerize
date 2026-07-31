@@ -143,37 +143,66 @@ function belongsToFlavor(runner, flavors) {
 
 async function reconcile(repos, flavors, signal, { host = false } = {}) {
   let removed = 0;
+  let reconciliationComplete = true;
   const protectedRunnerNames = new Set();
 
   for (const repo of repos) {
-    if (signal?.aborted) break;
+    if (signal?.aborted) {
+      reconciliationComplete = false;
+      break;
+    }
 
+    let hostRunners;
     try {
       const runners = await listRunners(repo.full_name, { signal });
-      const hostRunners = runners.filter(
+      hostRunners = runners.filter(
         (runner) => runner.name.startsWith(RUNNER_NAME_PREFIX)
           && belongsToFlavor(runner, flavors),
       );
       for (const runner of hostRunners) {
         if (runner.status !== 'offline') protectedRunnerNames.add(runner.name);
       }
-      const stale = hostRunners.filter((runner) => runner.status === 'offline');
+    } catch (error) {
+      reconciliationComplete = false;
+      log('reconcile_error', { repo: repo.full_name, ...errorFields(error) });
+      continue;
+    }
 
-      for (const runner of stale) {
-        if (signal?.aborted) break;
+    const stale = hostRunners.filter((runner) => runner.status === 'offline');
+    for (const runner of stale) {
+      if (signal?.aborted) {
+        reconciliationComplete = false;
+        break;
+      }
+      try {
         await deleteRunner(repo.full_name, runner.id, { signal });
         removed += 1;
         log('runner_reconciled', { repo: repo.full_name, runnerId: runner.id });
+      } catch (error) {
+        reconciliationComplete = false;
+        log('reconcile_error', {
+          repo: repo.full_name,
+          runnerId: runner.id,
+          ...errorFields(error),
+        });
       }
-    } catch (error) {
-      log('reconcile_error', { repo: repo.full_name, ...errorFields(error) });
     }
   }
 
-  if (host) {
+  if (signal?.aborted) reconciliationComplete = false;
+
+  if (host && !reconciliationComplete) {
+    log('host_reconcile_skipped', {
+      reason: 'incomplete_runner_discovery',
+      repos: repos.length,
+    });
+  } else if (host) {
     for (const flavor of flavors) {
       try {
-        const count = await flavor.reapOrphans?.({ protectedRunnerNames });
+        const count = await flavor.reapOrphans?.({
+          protectedRunnerNames,
+          reconciliationComplete,
+        });
         removed += count ?? 0;
       } catch (error) {
         log('host_reconcile_error', { flavor: flavor.key, ...errorFields(error) });
@@ -181,7 +210,11 @@ async function reconcile(repos, flavors, signal, { host = false } = {}) {
     }
   }
 
-  log('reconcile_complete', { repos: repos.length, removed });
+  log('reconcile_complete', {
+    repos: repos.length,
+    removed,
+    reconciliationComplete,
+  });
 }
 
 export function pollDelay({
