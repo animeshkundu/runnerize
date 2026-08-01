@@ -20,6 +20,14 @@ const SYSTEMD_VERIFY_TIMEOUT_MS = 5_000;
 const SYSTEMD_VERIFY_RETRY_MS = 100;
 const INSTALL_TIMEOUT_MS = 120_000;
 const NPM_LOOKUP_TIMEOUT_MS = 10_000;
+const KEEPAWAKE_POLL_SECONDS = 30;
+const KEEPAWAKE_RETRY_SECONDS = 15;
+// 20 consecutive failures at 15s apart, so roughly five minutes of sustained unavailability
+// before the holder retires. Long enough to ride out a restarting unit or a booting distro,
+// short enough that an uninstalled runnerize stops holding the host awake.
+const KEEPAWAKE_MAX_CONSECUTIVE_FAILURES = 20;
+const WSL_BOOT_DEADLINE_SECONDS = 600;
+const WSL_BOOT_RETRY_SECONDS = 15;
 const WSL_INSTALL_GUIDANCE = 'In an elevated PowerShell: wsl --install -d Ubuntu\nThen restart Windows if prompted and rerun this command.';
 const GITHUB_AUTH_GUIDANCE = 'Run: gh auth login\nOr set GH_TOKEN/GITHUB_TOKEN. The credential needs Administration, Actions, and Metadata access across all owned private repositories.';
 const DEFAULT_MACOS_IMAGE = 'ghcr.io/cirruslabs/macos-sequoia-base:latest';
@@ -1616,14 +1624,127 @@ function wslKeepAwakeSpec(context) {
   const launcherPath = windowsDataPath('runnerize-wsl-keepawake.ps1');
   const activeArgs = `-d ${windowsCommandLineArg(context.distro)} -u ${windowsCommandLineArg(context.user)} -e bash -lc ${windowsCommandLineArg('export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize')}`;
   mkdirSync(dirname(launcherPath), { recursive: true });
-  writeFileSync(launcherPath, `$ErrorActionPreference = 'SilentlyContinue'\r\nAdd-Type -Namespace Runnerize -Name Native -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'\r\n[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null\r\ntry { while ($true) { & wsl.exe ${activeArgs}; if ($LASTEXITCODE -ne 0) { break }; Start-Sleep -Seconds 30 } } finally { [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) | Out-Null }\r\n`);
+  writeFileSync(launcherPath, [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    'Add-Type -Namespace Runnerize -Name Native -MemberDefinition \'[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);\'',
+    "[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null",
+    '$failures = 0',
+    'try {',
+    '  while ($true) {',
+    // Seeded non-zero so a wsl.exe that never launches at all counts as a failure rather than
+    // inheriting a stale 0 from the previous iteration and reading as success.
+    '    $LASTEXITCODE = 1',
+    `    & wsl.exe ${activeArgs}`,
+    '    if ($LASTEXITCODE -eq 0) {',
+    '      $failures = 0',
+    `      Start-Sleep -Seconds ${KEEPAWAKE_POLL_SECONDS}`,
+    '      continue',
+    '    }',
+    // A single probe failure is not proof runnerize is gone: the unit may be restarting, or the
+    // distro may still be booting. Retiring on the first failure leaves the distro to be idle-
+    // terminated seconds later, which is the whole problem this holder exists to prevent.
+    '    $failures++',
+    `    if ($failures -ge ${KEEPAWAKE_MAX_CONSECUTIVE_FAILURES}) { exit 1 }`,
+    `    Start-Sleep -Seconds ${KEEPAWAKE_RETRY_SECONDS}`,
+    '  }',
+    '} finally {',
+    "  [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) | Out-Null",
+    '}',
+    '',
+  ].join('\r\n'));
   const argument = `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${windowsCommandLineArg(launcherPath)}`;
   return {
     taskName: 'runnerize-wsl-keepawake',
     startupFileName: 'runnerize-wsl-keepawake.vbs',
     execute: powershellPath,
     argument,
+    launcherPath,
     startupCommand: `${windowsCommandLineArg(powershellPath)} ${argument}`,
+  };
+}
+
+function wslBootSpec(context) {
+  const launcherPath = windowsDataPath('runnerize-wsl-boot.ps1');
+  const logPath = windowsDataPath('runnerize-wsl-boot.log');
+  const startArgs = `-d ${windowsCommandLineArg(context.distro)} -u ${windowsCommandLineArg(context.user)} -e bash -lc ${windowsCommandLineArg(systemdStartCommand())}`;
+  mkdirSync(dirname(launcherPath), { recursive: true });
+  writeFileSync(launcherPath, [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$log = ${powershellLiteral(logPath)}`,
+    'function Write-Diag($message) { "$([DateTime]::UtcNow.ToString(\'o\')) $message" | Add-Content -LiteralPath $log }',
+    // S4U runs without an interactive profile, and a WSL2 distro is registered in its owning
+    // user's hive. Recording the effective identity and whether that hive is actually visible is
+    // the difference between a diagnosable cold-boot failure and a silent one that looks
+    // identical to WSL merely being slow to come up.
+    'Write-Diag "boot task running as $(whoami)"',
+    'Write-Diag "Lxss registrations visible: $((Get-ChildItem \'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\' -ErrorAction SilentlyContinue | Measure-Object).Count)"',
+    `$deadline = (Get-Date).AddSeconds(${WSL_BOOT_DEADLINE_SECONDS})`,
+    'while ((Get-Date) -lt $deadline) {',
+    '  Write-Diag "wsl --list --verbose: $(& wsl.exe --list --verbose 2>&1)"',
+    '  $LASTEXITCODE = 1',
+    `  & wsl.exe ${startArgs}`,
+    "  if ($LASTEXITCODE -eq 0) { Write-Diag 'dispatcher start succeeded'; exit 0 }",
+    '  Write-Diag "dispatcher start failed with exit code $LASTEXITCODE; retrying"',
+    `  Start-Sleep -Seconds ${WSL_BOOT_RETRY_SECONDS}`,
+    '}',
+    // Exit non-zero so Task Scheduler's restart policy engages. Falling out of the loop silently
+    // would record a successful run and retire the task until the next boot.
+    "Write-Diag 'giving up: WSL did not become ready before the deadline'",
+    'exit 1',
+    '',
+  ].join('\r\n'));
+  return bootCompanionSpec(`${SERVICE_NAME}-boot`, launcherPath);
+}
+
+function bootCompanionSpec(taskName, launcherPath) {
+  return {
+    taskName,
+    execute: powershellPath,
+    argument: `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${windowsCommandLineArg(launcherPath)}`,
+  };
+}
+
+function startupTaskScript(spec, windowsUser) {
+  return [
+    `$taskName = ${powershellLiteral(spec.taskName)}`,
+    `$user = ${powershellLiteral(windowsUser)}`,
+    `$action = New-ScheduledTaskAction -Execute ${powershellLiteral(spec.execute)} -Argument ${powershellLiteral(spec.argument)}`,
+    '$trigger = New-ScheduledTaskTrigger -AtStartup',
+    // Deliberately not the SYSTEM principal systemStartupTaskScript uses: a WSL2 distro is
+    // registered under the owning user's HKCU hive, so SYSTEM cannot resolve it at all. S4U runs
+    // as that user with no stored password and no interactive session.
+    '$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited',
+    '$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
+    'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop',
+    'Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null',
+  ].join('; ');
+}
+
+// Best-effort by design: this only adds unattended-boot coverage on top of the logon trigger, so a
+// host that refuses the registration keeps working exactly as it did before. Reports instead of
+// throwing so a failure here never fails an otherwise good install.
+async function installStartupCompanion(spec, { noElevate = false, elevationTimeoutMs } = {}) {
+  const windowsUser = currentWindowsUser();
+  const script = startupTaskScript(spec, windowsUser);
+  console.log(`Registering startup task ${spec.taskName}...`);
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
+  ], { encoding: 'utf8', windowsHide: true });
+  // Same post-success powershell.exe crash tolerance as installLogonTrigger: confirm against Task
+  // Scheduler itself rather than trusting the exit code alone.
+  if (result.status === 0 || scheduledTaskMatchesSpec(spec)) {
+    return { ok: true, detail: `task ${spec.taskName} for ${windowsUser}` };
+  }
+  if (isAccessDenied(result) && !noElevate) {
+    const elevated = await runElevated('install', script, { timeoutMs: elevationTimeoutMs });
+    if (elevated.ok && scheduledTaskMatchesSpec(spec)) {
+      return { ok: true, detail: `task ${spec.taskName} for ${windowsUser} (elevated)` };
+    }
+    return { ok: false, reason: elevated.ok ? 'registration could not be confirmed' : elevated.reason };
+  }
+  return {
+    ok: false,
+    reason: result.stderr?.trim() || result.stdout?.trim() || result.error?.message || `exit code ${result.status}`,
   };
 }
 
@@ -1721,9 +1842,25 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
     statuses.push('windows=unavailable');
   }
 
-  if (!windowsInstalled && context && linuxInstalled) {
-    const trigger = await installLogonTrigger(wslKeepAwakeSpec(context), { noElevate, elevationTimeoutMs });
+  // Required whenever the Linux backend is installed, NOT only when the Windows backend is absent.
+  // The Windows dispatcher's own SetThreadExecutionState hold keeps the HOST awake, which is a
+  // different thing: nothing else keeps a WSL client session attached, and WSL idle-terminates the
+  // distro regardless of whether the host is awake. Gating this on !windowsInstalled left the Linux
+  // dispatcher being torn down seconds after every start on hosts that have both backends.
+  if (context && linuxInstalled) {
+    const keepAwake = wslKeepAwakeSpec(context);
+    const trigger = await installLogonTrigger(keepAwake, { noElevate, elevationTimeoutMs });
     console.log(`WSL host keep-awake trigger: ${trigger.kind} (${trigger.detail})`);
+
+    // Companions to the logon triggers, not replacements: an always-on CI host that reboots
+    // unattended never sees a logon, so the at-logon tasks alone leave Linux runners dark until
+    // somebody signs in. The logon tasks are left exactly as they are, so a host where S4U cannot
+    // resolve the distro is no worse off than before.
+    for (const companion of [wslBootSpec(context), bootCompanionSpec(`${keepAwake.taskName}-boot`, keepAwake.launcherPath)]) {
+      const registered = await installStartupCompanion(companion, { noElevate, elevationTimeoutMs });
+      if (registered.ok) console.log(`Unattended startup trigger: ${registered.detail}`);
+      else console.warn(`Could not register the unattended startup task ${companion.taskName}: ${registered.reason}. Linux runners will still start at logon.`);
+    }
   }
 
   console.log(`Backend summary: ${statuses.join(', ')}`);
@@ -1790,7 +1927,7 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
     ]));
   }
 
-  for (const taskName of [SERVICE_NAME, 'runnerize-windows', 'runnerize-wsl-keepawake']) {
+  for (const taskName of [SERVICE_NAME, `${SERVICE_NAME}-boot`, 'runnerize-windows', 'runnerize-wsl-keepawake', 'runnerize-wsl-keepawake-boot']) {
     const script = `Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
     const taskRemoval = captureResult(powershellPath, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
@@ -1817,7 +1954,7 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
   for (const fileName of ['runnerize.vbs', 'runnerize-windows.vbs', 'runnerize-wsl-keepawake.vbs']) {
     rmSync(windowsStartupPath(fileName), { force: true });
   }
-  for (const artifact of ['app', 'releases', 'current-release', 'runnerize-windows.ps1', 'runnerize-wsl-keepawake.ps1', 'windows.token', 'runnerize-windows.log']) {
+  for (const artifact of ['app', 'releases', 'current-release', 'runnerize-windows.ps1', 'runnerize-wsl-keepawake.ps1', 'runnerize-wsl-boot.ps1', 'runnerize-wsl-boot.log', 'windows.token', 'runnerize-windows.log']) {
     rmSync(windowsDataPath(artifact), { recursive: true, force: true });
   }
   if (!noGuard && !noElevate) {
