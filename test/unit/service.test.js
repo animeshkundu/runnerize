@@ -45,7 +45,9 @@ function successfulHarness(options = {}) {
       const elevatedLaunch = command.includes('Start-Process -FilePath');
       const runningProbe = command.includes("$task.State -ne 'Running'");
       if (runningProbe) {
-        if (options.windowsTaskRunning) return '';
+        const taskName = command.match(/-TaskName '([^']*)'/)?.[1];
+        if ((taskName === 'runnerize-windows' && options.windowsTaskRunning)
+          || (taskName === 'runnerize-wsl-keepawake' && options.keepAwakeTaskRunning)) return '';
         const error = new Error('task is not running');
         error.status = 1;
         error.stdout = '';
@@ -54,7 +56,8 @@ function successfulHarness(options = {}) {
       }
       const confirmation = command.includes('[Console]::Out.Write($task.Principal.UserId)');
       const specMatch = command.includes('$a = $task.Actions | Select-Object -First 1');
-      if (options.startTaskFails && command.includes("Start-ScheduledTask -TaskName 'runnerize-windows'")) {
+      if ((options.startTaskFails && command.includes("Start-ScheduledTask -TaskName 'runnerize-windows'"))
+        || (options.startKeepAwakeFails && command.includes("Start-ScheduledTask -TaskName 'runnerize-wsl-keepawake'"))) {
         const error = new Error('could not start task');
         error.status = 1;
         error.stdout = '';
@@ -99,8 +102,9 @@ function successfulHarness(options = {}) {
         throw error;
       }
       if (confirmation) {
-        if (options.taskMissing || (options.accessDenied && (
-
+        const taskName = command.match(/-TaskName '([^']*)'/)?.[1];
+        if (options.taskMissing || (taskName === 'runnerize-wsl-keepawake' && options.keepAwakeTaskRegistered === false)
+          || (options.accessDenied && (
           options.noElevateExpected || options.elevationDeclined || options.elevationError || options.elevationTimeout || options.nullExitCode
         ))) {
           const error = new Error('task missing');
@@ -198,11 +202,29 @@ function successfulHarness(options = {}) {
     }
     if (file !== 'wsl.exe') return '';
     if (args[0] === '--status') return options.status ?? 'Default Distribution: Ubuntu\r\n';
+    if (args[0] === '-l' && args.includes('--running')) {
+      if (options.runningDistroProbeFails) {
+        const error = new Error('running distro probe failed');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = error.message;
+        throw error;
+      }
+      return options.runningDistros ?? '﻿U\0b\0u\0n\0t\0u\0\r\0\n\0';
+    }
     if (args[0] === '-l') return options.distros ?? 'docker-desktop\0\r\nUbuntu\0\r\n';
     const command = args.slice(args.indexOf('-e') + 1);
-    if (command[0] === 'whoami') return 'ani\n';
+    if (command[0] === 'whoami') return `${options.wslUser ?? 'ani'}\n`;
     if (command[0] === 'ps') return options.noSystemd ? 'init' : 'systemd';
     if (command[0] === 'sh' && command.includes('printf %s "$HOME"')) return '/home/ani';
+    if (command[0] === 'sh' && command[1] === '-c' && command[2] === 'command -v sleep') return options.sleepPath ?? '/usr/bin/sleep';
+    if (command[0] === 'bash' && command.includes('is-active') && options.wslUnitInactive) {
+      const error = new Error('inactive');
+      error.status = 3;
+      error.stdout = '';
+      error.stderr = '';
+      throw error;
+    }
     if (command[0] === 'sh' && command[1] === '-c' && command[3] === 'runnerize-node-migrate') {
       if (!options.legacyNode) throw new Error('legacy node missing');
       return 'v24.18.0';
@@ -870,6 +892,74 @@ test('Windows status reports independent WSL and native installed versions', asy
   });
 });
 
+test('Windows status reports a stopped WSL VM without booting it', async () => {
+  await withWindowsService({ runningDistros: '' }, async (service, harness) => {
+    const status = await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
+    const linux = status.services[0];
+    assert.equal(linux.runtimeState, 'vm-stopped');
+    assert.equal(linux.installed, null);
+    assert.equal(linux.running, false);
+    assert.equal(typeof linux.running, 'boolean');
+    assert.ok(!harness.calls.some((call) => call.file === 'wsl.exe' && call.args.includes('-e')));
+  });
+});
+
+test('Windows status distinguishes active and inactive WSL units', async () => {
+  for (const [wslUnitInactive, expectedRuntimeState, expectedRunning] of [
+    [false, 'running', true],
+    [true, 'unit-inactive', false],
+  ]) {
+    await withWindowsService({
+      wslInstalledRoot: '/home/ani/.local/share/runnerize-service/releases/0.8.0.1',
+      wslInstalledVersion: '0.8.0',
+      wslUnitInactive,
+    }, async (service) => {
+      const status = await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
+      assert.equal(status.services[0].runtimeState, expectedRuntimeState);
+      assert.equal(status.services[0].running, expectedRunning);
+      assert.equal(typeof status.services[0].running, 'boolean');
+    });
+  }
+});
+
+test('Windows status reports an unavailable running-distro probe as unknown', async () => {
+  await withWindowsService({ runningDistroProbeFails: true }, async (service, harness) => {
+    const status = await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
+    assert.equal(status.services[0].runtimeState, 'unknown');
+    assert.equal(status.services[0].running, false);
+    assert.ok(!harness.calls.some((call) => call.file === 'wsl.exe' && call.args.includes('-e')));
+  });
+});
+
+test('Windows status reports WSL holder task and Startup fallback health', async () => {
+  await withWindowsService({ keepAwakeTaskRunning: true }, async (service) => {
+    const status = await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
+    assert.deepEqual(status.services[0].holder, { registered: true, running: true, fallback: false, bootRegistered: true, bootRunning: false });
+  });
+
+  await withWindowsService({}, async (service, _harness, appData) => {
+    const startupDirectory = join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
+    mkdirSync(startupDirectory, { recursive: true });
+    writeFileSync(join(startupDirectory, 'runnerize-wsl-keepawake.vbs'), 'fallback');
+    const status = await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
+    assert.deepEqual(status.services[0].holder, { registered: true, running: false, fallback: true, bootRegistered: true, bootRunning: false });
+  });
+
+  await withWindowsService({ keepAwakeTaskRegistered: false }, async (service, _harness, appData) => {
+    const startupDirectory = join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
+    const startupFile = join(startupDirectory, 'runnerize-wsl-keepawake.vbs');
+    mkdirSync(startupDirectory, { recursive: true });
+    writeFileSync(startupFile, 'fallback');
+    const status = await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
+    assert.deepEqual(status.services[0].holder, { registered: false, running: false, fallback: true, bootRegistered: true, bootRunning: false });
+  });
+
+  await withWindowsService({ keepAwakeTaskRegistered: false }, async (service) => {
+    const status = await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
+    assert.deepEqual(status.services[0].holder, { registered: false, running: false, fallback: false, bootRegistered: true, bootRunning: false });
+  });
+});
+
 test('Windows install skips docker-desktop, reuses PATH Node, and delegates service install', async () => {
   await withWindowsService({ installedNode: false }, async (service, harness, appData) => {
     await service.installService();
@@ -961,6 +1051,21 @@ test('Windows update fails if an installed native backend cannot restart', async
   });
 });
 
+test('Windows update boots WSL to preserve the installed Linux backend requirement', async () => {
+  await withWindowsService({
+    runningDistros: '',
+    wslInstalledRoot: '/home/ani/.local/share/runnerize-service/releases/0.8.0.1',
+    wslInstalledVersion: '0.8.0',
+    noSystemd: true,
+  }, async (service, harness) => {
+    await assert.rejects(
+      service.installService({ update: true }),
+      /Could not update every installed runnerize backend: linux/,
+    );
+    assert.ok(harness.calls.some((call) => call.file === 'wsl.exe' && call.args.includes('-e')));
+  });
+});
+
 test('Windows update restores an inactive native task registration when startup fails', async () => {
   await withWindowsService({ recordRegisteredArguments: true }, async (service, harness, appData) => {
     await service.installService();
@@ -980,7 +1085,7 @@ test('Windows update restores an inactive native task registration when startup 
   });
 });
 
-test('Windows install adds the WSL keep-awake holder when the Windows backend fails', async () => {
+test('Windows install adds the WSL keep-awake holder even when the Windows backend fails', async () => {
   await withWindowsService({ windowsTaskFails: true }, async (service, harness, appData) => {
     await service.installService();
     const taskCommands = harness.calls
@@ -1006,16 +1111,15 @@ test('Windows install adds the WSL keep-awake holder when the Windows backend al
   });
 });
 
-test('WSL keep-awake holder rides out transient probe failures before retiring', async () => {
+test('WSL keep-awake holder supervises a held session with bounded backoff', async () => {
   await withWindowsService({}, async (service, harness, appData) => {
     await service.installService();
     const launcher = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
-    assert.ok(!/if \(\$LASTEXITCODE -ne 0\) \{ break \}/.test(launcher), 'does not retire on a single probe failure');
-    assert.match(launcher, /\$failures\+\+/);
-    assert.match(launcher, /if \(\$failures -ge 20\) \{ exit 1 \}/);
-    // Invoke-Wsl returns an explicit code, so a wsl.exe that never launches cannot read as
-    // success via a stale $LASTEXITCODE.
-    assert.match(launcher, /if \(\$null -eq \$p\) \{ return 1 \}/);
+    assert.match(launcher, /& wsl\.exe -d \$distro -u \$user --exec \$sleepPath 2147483647/);
+    assert.match(launcher, /\$backoff = @\(0, 1, 2, 4, 8, 16, 30\)/);
+    assert.match(launcher, /if \(\$heldSeconds -ge 60\)/);
+    assert.match(launcher, /if \(-not \(Test-Path -LiteralPath \$PSCommandPath\)\) \{ break \}/);
+    assert.doesNotMatch(launcher, /Invoke-Wsl/);
   });
 });
 
@@ -1078,31 +1182,22 @@ test('a failed startup companion registration does not fail the install', async 
 test('generated WSL launchers quote arguments so bash expansions survive PowerShell', async () => {
   await withWindowsService({}, async (service, harness, appData) => {
     await service.installService();
-    const keepAwake = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
     const boot = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-boot.ps1'), 'utf8');
-    assert.match(keepAwake, /\$probeArgs = '-d Ubuntu -u ani -e bash -lc "export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\); systemctl --user is-active --quiet runnerize"'/);
     assert.match(boot, /\$startArgs = '-d Ubuntu -u ani -e bash -lc "export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\);/);
     assert.match(boot, /\$XDG_RUNTIME_DIR\/bus/);
-    for (const launcher of [keepAwake, boot]) {
-      // The bash expansions must never sit in an expandable (double-quoted) PowerShell string, and
-      // wsl.exe must not be invoked with them interpolated straight into the call.
-      assert.doesNotMatch(launcher, /& wsl\.exe [^\r\n]*\$\(id -u\)/);
-      assert.doesNotMatch(launcher, /^\s*\$\w+ = "[^\r\n]*\$\(id -u\)/m);
-    }
+    assert.doesNotMatch(boot, /& wsl\.exe [^\r\n]*\$\(id -u\)/);
+    assert.doesNotMatch(boot, /^\s*\$\w+ = "[^\r\n]*\$\(id -u\)/m);
   });
 });
 
-test('WSL invocations are bounded so a wedged wsl.exe cannot block the loop', async () => {
+test('boot WSL invocations are bounded while the held session remains unbounded', async () => {
   await withWindowsService({}, async (service, harness, appData) => {
     await service.installService();
     const keepAwake = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
     const boot = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-boot.ps1'), 'utf8');
-    // A hung probe would otherwise stall the holder without ever advancing $failures, and stall
-    // the boot launcher without ever reaching its deadline check.
-    assert.match(keepAwake, /if \(-not \$p\.WaitForExit\(60000\)\) \{ try \{ \$p\.Kill\(\) \} catch \{ \}; return 1 \}/);
     assert.match(boot, /if \(-not \$p\.WaitForExit\(120000\)\) \{ try \{ \$p\.Kill\(\) \} catch \{ \}; return 1 \}/);
-    assert.match(keepAwake, /if \(\(Invoke-Wsl \$probeArgs\) -eq 0\)/);
     assert.match(boot, /\$code = Invoke-Wsl \$startArgs/);
+    assert.doesNotMatch(keepAwake, /WaitForExit|Invoke-Wsl/);
   });
 });
 
