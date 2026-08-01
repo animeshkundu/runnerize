@@ -242,7 +242,15 @@ test('kvmStatus reports a missing device when virtualization extensions are pres
   await assertKvmStatus('missing-device', {
     status: 'missing-device',
     usable: false,
-    why: 'CPU virtualization extensions are present, but /dev/kvm is missing; enable nested virtualization or expose KVM to this Linux environment.',
+    why: 'CPU virtualization extensions are present, but /dev/kvm is missing; load or expose the KVM device in this Linux environment.',
+  });
+});
+
+test('kvmStatus reports potentially disabled nested virtualization', async () => {
+  await assertKvmStatus('nested-virtualization-disabled', {
+    status: 'nested-virtualization-disabled',
+    usable: false,
+    why: 'This virtualized Linux environment exposes neither CPU virtualization extensions nor /dev/kvm; nested virtualization may be disabled.',
   });
 });
 

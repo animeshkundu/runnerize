@@ -1018,7 +1018,7 @@ async function reportKvmStatus(target) {
   return result;
 }
 
-function preflightWsl(context, { requireSystemd = true } = {}) {
+async function preflightWsl(context, { requireSystemd = true } = {}) {
   if (requireSystemd) {
     const init = wslCapture(context.distro, context.user, ['ps', '-p', '1', '-o', 'comm='], { timeout: PROBE_TIMEOUT_MS });
     if (init !== 'systemd') {
@@ -1027,13 +1027,14 @@ function preflightWsl(context, { requireSystemd = true } = {}) {
   }
 
   const runtime = ensureWslRuntime(context);
+  const kvm = await reportKvmStatus({ runtime, distro: context.distro });
 
   try {
     wslCapture(context.distro, context.user, ['gh', 'auth', 'status'], { timeout: PROBE_TIMEOUT_MS });
-    return { runtime, token: null };
+    return { runtime, token: null, kvm };
   } catch {
     const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
-    if (token) return { runtime, token };
+    if (token) return { runtime, token, kvm };
     throw new Error(`GitHub authentication is not available in WSL distro ${context.distro}.\n${GITHUB_AUTH_GUIDANCE}`);
   }
 }
@@ -1641,7 +1642,7 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
   try {
     context = resolveWslContext();
     console.log(`WSL distro: ${context.distro} (user ${context.user})`);
-    const preflight = preflightWsl(context);
+    const preflight = await preflightWsl(context);
     console.log(`Container runtime: ${preflight.runtime}`);
     const node = ensureWslNode(context);
     console.log(`Linux Node: ${node.path} (${node.version}${node.downloaded ? ', installed and checksum-verified' : ', reused'})`);

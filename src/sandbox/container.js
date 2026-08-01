@@ -285,6 +285,9 @@ const KVM_STATUS_SCRIPT = `
 if [[ ! -e /dev/kvm ]]; then
   if grep -Eqm1 '(^|[[:space:]])(vmx|svm)([[:space:]]|$)' /proc/cpuinfo; then
     printf 'missing-device'
+  elif grep -Eqi 'microsoft|wsl' /proc/sys/kernel/osrelease /proc/version 2>/dev/null \
+    || command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; then
+    printf 'nested-virtualization-disabled'
   else
     printf 'no-virtualization'
   fi
@@ -328,7 +331,13 @@ export async function kvmStatus(target) {
         return {
           status: 'missing-device',
           usable: false,
-          why: 'CPU virtualization extensions are present, but /dev/kvm is missing; enable nested virtualization or expose KVM to this Linux environment.',
+          why: 'CPU virtualization extensions are present, but /dev/kvm is missing; load or expose the KVM device in this Linux environment.',
+        };
+      case 'nested-virtualization-disabled':
+        return {
+          status: 'nested-virtualization-disabled',
+          usable: false,
+          why: 'This virtualized Linux environment exposes neither CPU virtualization extensions nor /dev/kvm; nested virtualization may be disabled.',
         };
       case 'no-virtualization':
         return {
