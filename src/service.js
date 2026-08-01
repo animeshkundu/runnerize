@@ -5,7 +5,7 @@ import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getToken, listOwnedPrivateRepos, listRunners, sanitizeHostname } from './github.js';
 import { installGuard, uninstallGuard } from './guard.js';
-import { DEFAULT_LINUX_IMAGE } from './sandbox/container.js';
+import { DEFAULT_LINUX_IMAGE, kvmStatus } from './sandbox/container.js';
 import { RUNNERIZE_VERSION } from './version.js';
 
 const SERVICE_NAME = 'runnerize';
@@ -1009,7 +1009,16 @@ function ensureWslRuntime({ distro, user }, { install = true } = {}) {
   throw new Error(`No working container runtime was found in WSL distro ${distro}. Install rootless Podman, verify \`podman info\`, then rerun this command. On Debian/Ubuntu run:\n${installCommand}`);
 }
 
-function preflightWsl(context, { requireSystemd = true } = {}) {
+async function reportKvmStatus(target, kvmStatusCheck = kvmStatus) {
+  const result = await kvmStatusCheck(target);
+  console.log(`KVM capability: ${result.status} — ${result.why}`);
+  if (result.command) {
+    printManualSteps('Optional KVM setup', [{ why: result.why, command: result.command }]);
+  }
+  return result;
+}
+
+async function preflightWsl(context, { requireSystemd = true } = {}) {
   if (requireSystemd) {
     const init = wslCapture(context.distro, context.user, ['ps', '-p', '1', '-o', 'comm='], { timeout: PROBE_TIMEOUT_MS });
     if (init !== 'systemd') {
@@ -1018,13 +1027,14 @@ function preflightWsl(context, { requireSystemd = true } = {}) {
   }
 
   const runtime = ensureWslRuntime(context);
+  const kvm = await reportKvmStatus({ runtime, distro: context.distro });
 
   try {
     wslCapture(context.distro, context.user, ['gh', 'auth', 'status'], { timeout: PROBE_TIMEOUT_MS });
-    return { runtime, token: null };
+    return { runtime, token: null, kvm };
   } catch {
     const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
-    if (token) return { runtime, token };
+    if (token) return { runtime, token, kvm };
     throw new Error(`GitHub authentication is not available in WSL distro ${context.distro}.\n${GITHUB_AUTH_GUIDANCE}`);
   }
 }
@@ -1037,14 +1047,16 @@ function nativeRuntime() {
   return null;
 }
 
-export async function preflightRun({ install = true, only } = {}) {
+export async function preflightRun({ install = true, only, kvmStatusCheck = kvmStatus } = {}) {
   const wantsLinux = !only || only.has('linux');
   const wantsWindows = !only || only.has('windows');
   let runtime;
+  let kvm;
   if (platform() === 'win32') {
     if (wantsLinux) {
       const context = resolveWslContext();
       runtime = ensureWslRuntime(context, { install });
+      kvm = await reportKvmStatus({ runtime, distro: context.distro }, kvmStatusCheck);
     }
     if (wantsWindows && !commandExists('wsb.exe')) {
       throw new Error('Windows Sandbox is unavailable. Enable the Windows Sandbox optional feature and retry.');
@@ -1054,6 +1066,7 @@ export async function preflightRun({ install = true, only } = {}) {
     if (!runtime) {
       throw new Error('No working rootless Podman or Docker runtime was found. Install Podman, verify `podman info`, then rerun this command.');
     }
+    kvm = await reportKvmStatus({ runtime }, kvmStatusCheck);
   }
 
   try {
@@ -1062,7 +1075,7 @@ export async function preflightRun({ install = true, only } = {}) {
     throw new Error(`GitHub authentication is not available.\n${GITHUB_AUTH_GUIDANCE}`);
   }
   console.log(`Prerequisites ready: ${runtime ? `container runtime ${runtime}; ` : ''}GitHub credential available.`);
-  return { runtime };
+  return { runtime, kvm };
 }
 
 function persistWslToken({ distro, user, home }, token) {
@@ -1629,7 +1642,7 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
   try {
     context = resolveWslContext();
     console.log(`WSL distro: ${context.distro} (user ${context.user})`);
-    const preflight = preflightWsl(context);
+    const preflight = await preflightWsl(context);
     console.log(`Container runtime: ${preflight.runtime}`);
     const node = ensureWslNode(context);
     console.log(`Linux Node: ${node.path} (${node.version}${node.downloaded ? ', installed and checksum-verified' : ', reused'})`);

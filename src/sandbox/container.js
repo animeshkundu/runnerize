@@ -281,18 +281,115 @@ async function backend() {
   return runtime ? { runtime } : null;
 }
 
-async function hasUsableKvm(target) {
-  if (!target) return false;
+const KVM_SIGNAL_SCRIPT = `
+device_exists=false
+device_usable=false
+virtualization_extensions=false
+virtualized=false
+if [[ -e /dev/kvm ]]; then
+  device_exists=true
+  if exec 3<>/dev/kvm 2>/dev/null; then
+    device_usable=true
+  fi
+fi
+if grep -Eqm1 '(^|[[:space:]])(vmx|svm)([[:space:]]|$)' /proc/cpuinfo; then
+  virtualization_extensions=true
+fi
+if grep -Eqi 'microsoft|wsl' /proc/sys/kernel/osrelease /proc/version 2>/dev/null \
+  || command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; then
+  virtualized=true
+fi
+printf '%s\\t%s\\t%s\\t%s' "$device_exists" "$device_usable" "$virtualization_extensions" "$virtualized"
+`;
+
+function parseKvmSignals(stdout) {
+  const values = stdout.trim().split('\t');
+  if (values.length !== 4 || values.some((value) => value !== 'true' && value !== 'false')) {
+    throw new Error(`unexpected KVM probe result: ${stdout.trim() || 'empty output'}`);
+  }
+  const [deviceExists, deviceUsable, virtualizationExtensions, virtualized] = values
+    .map((value) => value === 'true');
+  return { deviceExists, deviceUsable, virtualizationExtensions, virtualized };
+}
+
+async function probeKvmSignals(target) {
   const command = target.distro ? 'wsl.exe' : 'bash';
   const args = target.distro
-    ? ['-d', target.distro, '-e', 'bash', '-c', 'exec 3<>/dev/kvm']
-    : ['-c', 'exec 3<>/dev/kvm'];
-  try {
-    await collect(command, args, { timeoutMs: KVM_PROBE_TIMEOUT_MS });
-    return true;
-  } catch {
-    return false;
+    ? ['-d', target.distro, '-e', 'bash', '-c', KVM_SIGNAL_SCRIPT]
+    : ['-c', KVM_SIGNAL_SCRIPT];
+  const { stdout } = await collect(command, args, { timeoutMs: KVM_PROBE_TIMEOUT_MS });
+  return parseKvmSignals(stdout);
+}
+
+// A boolean made a one-command permission fix indistinguishable from unsupported hardware.
+export function classifyKvmStatus(signals, target = {}) {
+  const {
+    deviceExists,
+    deviceUsable,
+    virtualizationExtensions,
+    virtualized,
+  } = signals ?? {};
+  if ([deviceExists, deviceUsable, virtualizationExtensions, virtualized]
+    .some((value) => typeof value !== 'boolean') || deviceUsable && !deviceExists) {
+    throw new TypeError('KVM probe signals are invalid');
   }
+  if (deviceUsable) {
+    return {
+      status: 'usable',
+      usable: true,
+      why: 'KVM acceleration is available; Linux runners advertise the kvm label.',
+    };
+  }
+  if (deviceExists) {
+    return {
+      status: 'permission-denied',
+      usable: false,
+      why: '/dev/kvm exists but the dispatcher user cannot open it for reading and writing.',
+      command: target.distro
+        ? 'sudo usermod -aG kvm "$USER"  # then run `wsl.exe --shutdown` from Windows and restart WSL'
+        : 'sudo usermod -aG kvm "$USER"  # then log out and back in',
+    };
+  }
+  if (virtualizationExtensions) {
+    return {
+      status: 'missing-device',
+      usable: false,
+      why: 'CPU virtualization extensions are present, but /dev/kvm is missing; load or expose the KVM device in this Linux environment.',
+    };
+  }
+  if (virtualized) {
+    return {
+      status: 'nested-virtualization-disabled',
+      usable: false,
+      why: 'This virtualized Linux environment exposes neither CPU virtualization extensions nor /dev/kvm; nested virtualization may be disabled.',
+    };
+  }
+  return {
+    status: 'no-virtualization',
+    usable: false,
+    why: 'CPU virtualization extensions (vmx/svm) are not exposed to this Linux environment.',
+  };
+}
+
+export async function kvmStatus(target, { probe = probeKvmSignals } = {}) {
+  if (!target) return {
+    status: 'unavailable',
+    usable: false,
+    why: 'KVM was not checked because no Linux container runtime is available.',
+  };
+  try {
+    return classifyKvmStatus(await probe(target), target);
+  } catch (error) {
+    return {
+      status: 'probe-failed',
+      usable: false,
+      why: `KVM capability could not be determined: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function hasUsableKvm(target) {
+  return (await kvmStatus(target)).usable;
 }
 
 function buildContainerArgs(image) {

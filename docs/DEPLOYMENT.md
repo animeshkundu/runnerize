@@ -244,12 +244,13 @@ boundary.
 ### KVM-accelerated Android tests
 
 runnerize enables KVM automatically when the linux execution environment has a
-usable `/dev/kvm`. Enable CPU virtualization in firmware and expose `/dev/kvm` to
-the Linux host or WSL2 distro. The account running the dispatcher must be able to
-open the device for both reading and writing, commonly by membership in the
-`kvm` group. Log out and back in after changing group membership. No environment
-flag is needed: if the access probe fails, runnerize silently keeps the existing
-linux labels and container arguments.
+usable `/dev/kvm`. Preflight reports whether CPU virtualization extensions are
+absent, `/dev/kvm` is missing, device access is denied, or KVM is usable. The
+account running the dispatcher must be able to open the device for both reading
+and writing, commonly by membership in the `kvm` group. Follow the printed
+`usermod` command when access is denied, then log out and back in; under WSL, run
+`wsl.exe --shutdown` from Windows and restart WSL. No privileged command runs
+automatically, and unavailable KVM remains an informational optional capability.
 
 A capable host advertises the additional `kvm` label and accepts targeted jobs:
 
@@ -264,14 +265,23 @@ not preserved by your runtime configuration, grant the dispatcher user direct
 read/write access through an appropriate host udev rule rather than broadening the
 container's privileges.
 
-Android tooling is an image concern. The default
-`docker.io/catthehacker/ubuntu:full-latest` image includes a JDK but does not
-include the Android SDK, emulator, or Gradle. Build a fat image with the required
-SDK platforms, system image, emulator, and build tools pre-installed, then set:
+The default `docker.io/catthehacker/ubuntu:full-latest` image already includes the
+Android SDK, including platform tools, for headless builds, unit tests, and lint.
+The opt-in `images/android/Containerfile` layers the emulator and an API 35 Google
+APIs x86_64 system image on that unchanged default:
 
 ```sh
-export RUNNERIZE_LINUX_IMAGE=registry.example.com/runnerize-android:latest
+podman build -t localhost/runnerize-android:latest -f images/android/Containerfile .
+export RUNNERIZE_LINUX_IMAGE=localhost/runnerize-android:latest
 ```
+
+Use Docker instead of Podman if preferred, and tag/push the result to a registry
+when the dispatcher cannot use the local tag. The Android additions download about
+2.1 GB compressed and occupy roughly 6 GB installed, on top of the approximately
+18 GB compressed default image; exact sizes change as the upstream base and Android
+packages are revised. Emulator jobs must request `[self-hosted, linux, x64, kvm]`
+after applying any KVM remedy reported
+by preflight.
 
 ---
 

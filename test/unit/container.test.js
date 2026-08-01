@@ -35,8 +35,9 @@ function containerStub(onContainer, { inspect = DEFAULT_INSPECT_STATE } = {}) {
       return;
     }
     // KVM is absent unless a test opts in; all other probe / teardown calls succeed.
-    if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
-      child.close(1);
+    if (child.command === 'bash' && args.some((arg) => String(arg).includes('device_exists=false'))) {
+      child.emitStdout('false\tfalse\ttrue\tfalse');
+      child.close(0);
       return;
     }
     if (args[0] === 'inspect' && args.includes('{{json .State}}')) {
@@ -99,8 +100,9 @@ function cgroupStub(onContainer, {
       onContainer?.(child, stub);
       return;
     }
-    if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
-      child.close(1);
+    if (child.command === 'bash' && args.some((arg) => String(arg).includes('device_exists=false'))) {
+      child.emitStdout('false\tfalse\ttrue\tfalse');
+      child.close(0);
       return;
     }
     if (args[0] === 'inspect' && args.includes('{{json .State}}')) {
@@ -210,6 +212,111 @@ test('linux.launch materializes shell-syntax-valid inner scripts with and withou
   }
 });
 
+async function assertKvmStatus(signals, expected, target = { runtime: 'podman' }) {
+  const { kvmStatus } = await freshImport('../../src/sandbox/container.js');
+  let receivedTarget;
+  const probe = async (value) => {
+    receivedTarget = value;
+    return signals;
+  };
+  assert.deepEqual(await kvmStatus(target, { probe }), expected);
+  assert.equal(receivedTarget, target);
+}
+
+test('kvmStatus reports no virtualization extensions from injected signals', async () => {
+  await assertKvmStatus({
+    deviceExists: false,
+    deviceUsable: false,
+    virtualizationExtensions: false,
+    virtualized: false,
+  }, {
+    status: 'no-virtualization',
+    usable: false,
+    why: 'CPU virtualization extensions (vmx/svm) are not exposed to this Linux environment.',
+  });
+});
+
+test('kvmStatus reports a missing device from injected signals', async () => {
+  await assertKvmStatus({
+    deviceExists: false,
+    deviceUsable: false,
+    virtualizationExtensions: true,
+    virtualized: false,
+  }, {
+    status: 'missing-device',
+    usable: false,
+    why: 'CPU virtualization extensions are present, but /dev/kvm is missing; load or expose the KVM device in this Linux environment.',
+  });
+});
+
+test('kvmStatus reports potentially disabled nested virtualization from injected signals', async () => {
+  await assertKvmStatus({
+    deviceExists: false,
+    deviceUsable: false,
+    virtualizationExtensions: false,
+    virtualized: true,
+  }, {
+    status: 'nested-virtualization-disabled',
+    usable: false,
+    why: 'This virtualized Linux environment exposes neither CPU virtualization extensions nor /dev/kvm; nested virtualization may be disabled.',
+  });
+});
+
+test('kvmStatus reports device permission failure from injected signals', async () => {
+  await assertKvmStatus({
+    deviceExists: true,
+    deviceUsable: false,
+    virtualizationExtensions: true,
+    virtualized: false,
+  }, {
+    status: 'permission-denied',
+    usable: false,
+    why: '/dev/kvm exists but the dispatcher user cannot open it for reading and writing.',
+    command: 'sudo usermod -aG kvm "$USER"  # then log out and back in',
+  });
+});
+
+test('kvmStatus reports a usable device from injected signals', async () => {
+  await assertKvmStatus({
+    deviceExists: true,
+    deviceUsable: true,
+    virtualizationExtensions: true,
+    virtualized: false,
+  }, {
+    status: 'usable',
+    usable: true,
+    why: 'KVM acceleration is available; Linux runners advertise the kvm label.',
+  });
+});
+
+test('kvmStatus reports an injected probe failure', async () => {
+  const { kvmStatus } = await freshImport('../../src/sandbox/container.js');
+  const probe = async () => { throw new Error('synthetic probe failure'); };
+  assert.deepEqual(await kvmStatus({ runtime: 'podman' }, { probe }), {
+    status: 'probe-failed',
+    usable: false,
+    why: 'KVM capability could not be determined: synthetic probe failure',
+  });
+});
+
+test('kvmStatus gathers signals with a bounded shell probe', async () => {
+  const stub = new SpawnStub((child) => {
+    child.emitStdout('true\tfalse\ttrue\tfalse');
+    child.close(0);
+  }).install();
+  try {
+    const { kvmStatus } = await freshImport('../../src/sandbox/container.js');
+    assert.equal((await kvmStatus({ runtime: 'podman' })).status, 'permission-denied');
+    const probe = stub.children[0];
+    assert.equal(probe.command, 'bash');
+    assert.match(probe.args[1], /\[\[ -e \/dev\/kvm \]\]/);
+    assert.match(probe.args[1], /grep -Eqm1 .*\(vmx\|svm\).*\/proc\/cpuinfo/);
+    assert.match(probe.args[1], /exec 3<>\/dev\/kvm/);
+  } finally {
+    stub.restore();
+  }
+});
+
 test('linux passes through usable KVM and advertises the capability', async () => {
   await withLinuxLaunch(async (linux) => {
     const stub = new SpawnStub((child) => {
@@ -219,7 +326,8 @@ test('linux passes through usable KVM and advertises the capability', async () =
         child.close(0);
         return;
       }
-      child.emitStdout('ok\n');
+      if (args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) child.emitStdout('true\ttrue\ttrue\tfalse');
+      else child.emitStdout('ok\n');
       child.close(0);
     }).install();
     try {
@@ -247,8 +355,9 @@ test('linux advertises functional opt-in container builds and configures the job
         child.close(0);
         return;
       }
-      if (args.includes('exec 3<>/dev/kvm')) {
-        child.close(1);
+      if (args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
+        child.emitStdout('false\tfalse\ttrue\tfalse');
+        child.close(0);
         return;
       }
       child.emitStdout('ok\n');
@@ -307,8 +416,13 @@ test('linux expires the container-build capability cache', async () => {
     let now = 1_000_000;
     Date.now = () => now;
     const stub = new SpawnStub((child) => {
-      if (child.args.includes('exec 3<>/dev/kvm')) child.close(1);
-      else { child.emitStdout('ok\n'); child.close(0); }
+      if (child.args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
+        child.emitStdout('false\tfalse\ttrue\tfalse');
+        child.close(0);
+      } else {
+        child.emitStdout('ok\n');
+        child.close(0);
+      }
     }).install();
     try {
       await linux.available();
@@ -335,8 +449,10 @@ test('linux invalidates the container-build capability after launch setup fails'
     let pullFails = false;
     const stub = new SpawnStub((child) => {
       const args = child.args ?? [];
-      if (args.includes('exec 3<>/dev/kvm')) child.close(1);
-      else if (args.includes('inspect') && inspectFails) child.close(1);
+      if (args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
+        child.emitStdout('false\tfalse\ttrue\tfalse');
+        child.close(0);
+      } else if (args.includes('inspect') && inspectFails) child.close(1);
       else if (args.includes('pull') && pullFails) child.close(1);
       else { child.emitStdout('ok\n'); child.close(0); }
     }).install();
@@ -360,8 +476,13 @@ test('linux treats an explicit falsey RUNNERIZE_CONTAINER_BUILDS as off, not as 
       process.env.RUNNERIZE_CONTAINER_BUILDS = value;
       const stub = new SpawnStub((child) => {
         const args = child.args ?? [];
-        if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) child.close(1);
-        else { child.emitStdout('ok\n'); child.close(0); }
+        if (child.command === 'bash' && args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
+          child.emitStdout('false\tfalse\ttrue\tfalse');
+          child.close(0);
+        } else {
+          child.emitStdout('ok\n');
+          child.close(0);
+        }
       }).install();
       try {
         await linux.available();
@@ -381,7 +502,12 @@ test('linux does not advertise container builds when the functional probe fails'
     process.env.RUNNERIZE_CONTAINER_BUILDS = '1';
     const stub = new SpawnStub((child) => {
       const args = child.args ?? [];
-      if (args.includes('exec 3<>/dev/kvm') || args.some((arg) => String(arg).includes('runnerize-capability-probe'))) {
+      if (args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
+        child.emitStdout('false\tfalse\ttrue\tfalse');
+        child.close(0);
+        return;
+      }
+      if (args.some((arg) => String(arg).includes('runnerize-capability-probe'))) {
         child.close(1);
         return;
       }
@@ -632,8 +758,9 @@ test('linux.launch: waits for a terminal runtime state before reporting evidence
       const args = child.args ?? [];
       if (args.includes('--name')) {
         child.close(137);
-      } else if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
-        child.close(1);
+      } else if (child.command === 'bash' && args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
+        child.emitStdout('false\tfalse\ttrue\tfalse');
+        child.close(0);
       } else if (args[0] === 'inspect' && args.includes('{{json .State}}')) {
         inspections += 1;
         const lifecycleInspection = Math.max(0, inspections - 1);
@@ -743,8 +870,9 @@ test('linux.launch: inspection failure preserves the launch error and still remo
       if (args.includes('--name')) {
         child.emitStderr('runner failed\n');
         child.close(125);
-      } else if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
-        child.close(1);
+      } else if (child.command === 'bash' && args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
+        child.emitStdout('false\tfalse\ttrue\tfalse');
+        child.close(0);
       } else if (args[0] === 'inspect' && args.includes('{{json .State}}')) {
         child.close(1);
       } else {
@@ -854,8 +982,9 @@ test('linux.reapOrphans reports only containers the runtime removed', async () =
   await withLinuxLaunch(async (linux) => {
     const stub = new SpawnStub((child) => {
       const args = child.args ?? [];
-      if (child.command === 'bash' && args.includes('exec 3<>/dev/kvm')) {
-        child.close(1);
+      if (child.command === 'bash' && args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
+        child.emitStdout('false\tfalse\ttrue\tfalse');
+        child.close(0);
       } else if (args[0] === 'ps') {
         child.emitStdout('runnerize-removed\texited\nrunnerize-retained\texited\n');
         child.close(0);

@@ -235,6 +235,9 @@ function successfulHarness(options = {}) {
   const spawn = (file, args, spawnOptions = {}) => {
     calls.push({ kind: 'spawn', file, args, options: spawnOptions });
     if (file === 'whoami.exe') return { status: 0, stdout: 'DESKTOP\\ani\n', stderr: '' };
+    if (file === 'wsl.exe' && args.some((arg) => String(arg).includes('device_exists=false'))) {
+      return { status: 0, stdout: 'false\tfalse\ttrue\tfalse', stderr: '' };
+    }
     if (file === 'where.exe' && args[0] === 'wsb.exe') {
       return { status: options.noWsb ? 1 : 0, stdout: options.noWsb ? '' : 'C:\\Windows\\System32\\wsb.exe\n', stderr: '' };
     }
@@ -410,6 +413,9 @@ async function withLinuxService({ active = false, imageDetails, imagePullFails =
   const spawn = (file, args, options = {}) => {
     calls.push({ kind: 'spawn', file, args, options });
     if (file === 'sh') return { status: 0, stdout: '', stderr: '' };
+    if (file === 'bash' && args.some((arg) => String(arg).includes('device_exists=false'))) {
+      return { status: 0, stdout: 'false\tfalse\ttrue\tfalse', stderr: '' };
+    }
     if (file === 'podman' && args[0] === 'info') return { status: 0, stdout: '', stderr: '' };
     return { status: 0, stdout: '', stderr: '' };
   };
@@ -980,6 +986,36 @@ test('Windows install skips Podman installation when a runtime is present', asyn
   await withWindowsService({}, async (service, harness) => {
     await service.installService();
     assert.ok(!harness.calls.some((call) => commandOf(call)[2] === 'sudo -n apt-get update && sudo -n apt-get install -y podman'));
+  });
+});
+
+test('preflight reports injected KVM permission remediation without applying it', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    const logs = [];
+    const originalLog = console.log;
+    const kvmStatusCheck = async (target) => ({
+      status: 'permission-denied',
+      usable: false,
+      why: '/dev/kvm exists but the dispatcher user cannot open it for reading and writing.',
+      command: target.distro
+        ? 'sudo usermod -aG kvm "$USER"  # then run `wsl.exe --shutdown` from Windows and restart WSL'
+        : 'sudo usermod -aG kvm "$USER"  # then log out and back in',
+    });
+    console.log = (message = '') => logs.push(String(message));
+    try {
+      const result = await service.preflightRun({ kvmStatusCheck });
+      assert.equal(result.kvm.status, 'permission-denied');
+      assert.equal(result.kvm.usable, false);
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(logs.some((line) => line.includes('KVM capability: permission-denied')));
+    assert.ok(logs.some((line) => line.includes('sudo usermod -aG kvm "$USER"')));
+    assert.ok(logs.some((line) => line.includes('restart WSL')));
+    assert.ok(logs.some((line) => line.includes('wsl.exe --shutdown')));
+    assert.ok(!harness.calls.some((call) => commandOf(call)[0] === 'sudo'));
+    assert.ok(!harness.calls.some((call) => call.file === 'wsl.exe'
+      && call.args.some((arg) => String(arg).includes('/dev/kvm'))));
   });
 });
 
