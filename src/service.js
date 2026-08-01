@@ -1009,8 +1009,8 @@ function ensureWslRuntime({ distro, user }, { install = true } = {}) {
   throw new Error(`No working container runtime was found in WSL distro ${distro}. Install rootless Podman, verify \`podman info\`, then rerun this command. On Debian/Ubuntu run:\n${installCommand}`);
 }
 
-async function reportKvmStatus(target) {
-  const result = await kvmStatus(target);
+async function reportKvmStatus(target, kvmStatusCheck = kvmStatus) {
+  const result = await kvmStatusCheck(target);
   console.log(`KVM capability: ${result.status} — ${result.why}`);
   if (result.command) {
     printManualSteps('Optional KVM setup', [{ why: result.why, command: result.command }]);
@@ -1047,7 +1047,7 @@ function nativeRuntime() {
   return null;
 }
 
-export async function preflightRun({ install = true, only } = {}) {
+export async function preflightRun({ install = true, only, kvmStatusCheck = kvmStatus } = {}) {
   const wantsLinux = !only || only.has('linux');
   const wantsWindows = !only || only.has('windows');
   let runtime;
@@ -1056,7 +1056,7 @@ export async function preflightRun({ install = true, only } = {}) {
     if (wantsLinux) {
       const context = resolveWslContext();
       runtime = ensureWslRuntime(context, { install });
-      kvm = await reportKvmStatus({ runtime, distro: context.distro });
+      kvm = await reportKvmStatus({ runtime, distro: context.distro }, kvmStatusCheck);
     }
     if (wantsWindows && !commandExists('wsb.exe')) {
       throw new Error('Windows Sandbox is unavailable. Enable the Windows Sandbox optional feature and retry.');
@@ -1066,7 +1066,7 @@ export async function preflightRun({ install = true, only } = {}) {
     if (!runtime) {
       throw new Error('No working rootless Podman or Docker runtime was found. Install Podman, verify `podman info`, then rerun this command.');
     }
-    kvm = await reportKvmStatus({ runtime });
+    kvm = await reportKvmStatus({ runtime }, kvmStatusCheck);
   }
 
   try {

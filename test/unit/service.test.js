@@ -235,8 +235,8 @@ function successfulHarness(options = {}) {
   const spawn = (file, args, spawnOptions = {}) => {
     calls.push({ kind: 'spawn', file, args, options: spawnOptions });
     if (file === 'whoami.exe') return { status: 0, stdout: 'DESKTOP\\ani\n', stderr: '' };
-    if (file === 'wsl.exe' && args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
-      return { status: 0, stdout: options.kvmStatus ?? 'missing-device', stderr: '' };
+    if (file === 'wsl.exe' && args.some((arg) => String(arg).includes('device_exists=false'))) {
+      return { status: 0, stdout: 'false\tfalse\ttrue\tfalse', stderr: '' };
     }
     if (file === 'where.exe' && args[0] === 'wsb.exe') {
       return { status: options.noWsb ? 1 : 0, stdout: options.noWsb ? '' : 'C:\\Windows\\System32\\wsb.exe\n', stderr: '' };
@@ -413,8 +413,8 @@ async function withLinuxService({ active = false, imageDetails, imagePullFails =
   const spawn = (file, args, options = {}) => {
     calls.push({ kind: 'spawn', file, args, options });
     if (file === 'sh') return { status: 0, stdout: '', stderr: '' };
-    if (file === 'bash' && args.some((arg) => String(arg).includes('exec 3<>/dev/kvm'))) {
-      return { status: 0, stdout: 'missing-device', stderr: '' };
+    if (file === 'bash' && args.some((arg) => String(arg).includes('device_exists=false'))) {
+      return { status: 0, stdout: 'false\tfalse\ttrue\tfalse', stderr: '' };
     }
     if (file === 'podman' && args[0] === 'info') return { status: 0, stdout: '', stderr: '' };
     return { status: 0, stdout: '', stderr: '' };
@@ -989,13 +989,21 @@ test('Windows install skips Podman installation when a runtime is present', asyn
   });
 });
 
-test('preflight reports KVM permission remediation without applying it', async () => {
-  await withWindowsService({ kvmStatus: 'permission-denied' }, async (service, harness) => {
+test('preflight reports injected KVM permission remediation without applying it', async () => {
+  await withWindowsService({}, async (service, harness) => {
     const logs = [];
     const originalLog = console.log;
+    const kvmStatusCheck = async (target) => ({
+      status: 'permission-denied',
+      usable: false,
+      why: '/dev/kvm exists but the dispatcher user cannot open it for reading and writing.',
+      command: target.distro
+        ? 'sudo usermod -aG kvm "$USER"  # then run `wsl.exe --shutdown` from Windows and restart WSL'
+        : 'sudo usermod -aG kvm "$USER"  # then log out and back in',
+    });
     console.log = (message = '') => logs.push(String(message));
     try {
-      const result = await service.preflightRun();
+      const result = await service.preflightRun({ kvmStatusCheck });
       assert.equal(result.kvm.status, 'permission-denied');
       assert.equal(result.kvm.usable, false);
     } finally {
@@ -1006,6 +1014,8 @@ test('preflight reports KVM permission remediation without applying it', async (
     assert.ok(logs.some((line) => line.includes('restart WSL')));
     assert.ok(logs.some((line) => line.includes('wsl.exe --shutdown')));
     assert.ok(!harness.calls.some((call) => commandOf(call)[0] === 'sudo'));
+    assert.ok(!harness.calls.some((call) => call.file === 'wsl.exe'
+      && call.args.some((arg) => String(arg).includes('/dev/kvm'))));
   });
 });
 
