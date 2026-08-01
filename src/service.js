@@ -1620,9 +1620,18 @@ function windowsTriggerSpec(launcherPath) {
   };
 }
 
+// Arguments embedded in a generated .ps1 need PowerShell quoting, NOT the Win32 quoting used for
+// a Task Scheduler -Argument string. A double-quoted PowerShell string is expandable, so
+// `$(id -u)` and `$XDG_RUNTIME_DIR` get evaluated on the Windows side and never reach bash: the
+// probe shipped as `/run/user/4096` (Git Bash's id.exe) instead of the WSL uid, which made
+// `systemctl --user` fail every time. Single-quoted literals pass through verbatim.
+function powershellWslArgs(context, command) {
+  return `-d ${powershellLiteral(context.distro)} -u ${powershellLiteral(context.user)} -e bash -lc ${powershellLiteral(command)}`;
+}
+
 function wslKeepAwakeSpec(context) {
   const launcherPath = windowsDataPath('runnerize-wsl-keepawake.ps1');
-  const activeArgs = `-d ${windowsCommandLineArg(context.distro)} -u ${windowsCommandLineArg(context.user)} -e bash -lc ${windowsCommandLineArg('export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize')}`;
+  const activeArgs = powershellWslArgs(context, 'export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize');
   mkdirSync(dirname(launcherPath), { recursive: true });
   writeFileSync(launcherPath, [
     "$ErrorActionPreference = 'SilentlyContinue'",
@@ -1666,7 +1675,7 @@ function wslKeepAwakeSpec(context) {
 function wslBootSpec(context) {
   const launcherPath = windowsDataPath('runnerize-wsl-boot.ps1');
   const logPath = windowsDataPath('runnerize-wsl-boot.log');
-  const startArgs = `-d ${windowsCommandLineArg(context.distro)} -u ${windowsCommandLineArg(context.user)} -e bash -lc ${windowsCommandLineArg(systemdStartCommand())}`;
+  const startArgs = powershellWslArgs(context, systemdStartCommand());
   mkdirSync(dirname(launcherPath), { recursive: true });
   writeFileSync(launcherPath, [
     "$ErrorActionPreference = 'SilentlyContinue'",
@@ -1693,15 +1702,38 @@ function wslBootSpec(context) {
     'exit 1',
     '',
   ].join('\r\n'));
-  return bootCompanionSpec(`${SERVICE_NAME}-boot`, launcherPath);
+  // A finite limit, unlike the keep-awake holder's unlimited one: this launcher is expected to
+  // exit once WSL answers or the deadline passes. If wsl.exe hangs, the loop never reaches its own
+  // deadline check, so Task Scheduler killing the run is what lets the restart policy retry.
+  return bootCompanionSpec(`${SERVICE_NAME}-boot`, launcherPath, { executionTimeLimit: '(New-TimeSpan -Minutes 15)' });
 }
 
-function bootCompanionSpec(taskName, launcherPath) {
+function bootCompanionSpec(taskName, launcherPath, { executionTimeLimit = '([TimeSpan]::Zero)' } = {}) {
   return {
     taskName,
     execute: powershellPath,
+    executionTimeLimit,
     argument: `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${windowsCommandLineArg(launcherPath)}`,
   };
+}
+
+// The generic scheduledTaskMatchesSpec only compares the action, which is not enough to confirm a
+// startup companion: a same-named task carrying the same action but an at-logon trigger or the
+// wrong principal would report success while unattended start stays broken.
+function startupTaskMatchesSpec(spec) {
+  const script = [
+    `$task = Get-ScheduledTask -TaskName ${powershellLiteral(spec.taskName)} -ErrorAction SilentlyContinue`,
+    'if ($null -eq $task) { exit 1 }',
+    '$a = $task.Actions | Select-Object -First 1',
+    `if ($a.Execute -ne ${powershellLiteral(spec.execute)} -or $a.Arguments -ne ${powershellLiteral(spec.argument)}) { exit 1 }`,
+    "if (-not ($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })) { exit 1 }",
+    "if ($task.Principal.LogonType -ne 'S4U') { exit 1 }",
+    'exit 0',
+  ].join('; ');
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ], { encoding: 'utf8', windowsHide: true });
+  return result.status === 0;
 }
 
 function startupTaskScript(spec, windowsUser) {
@@ -1714,7 +1746,7 @@ function startupTaskScript(spec, windowsUser) {
     // registered under the owning user's HKCU hive, so SYSTEM cannot resolve it at all. S4U runs
     // as that user with no stored password and no interactive session.
     '$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited',
-    '$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
+    `$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ${spec.executionTimeLimit} -StartWhenAvailable -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`,
     'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop',
     'Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null',
   ].join('; ');
@@ -1732,12 +1764,12 @@ async function installStartupCompanion(spec, { noElevate = false, elevationTimeo
   ], { encoding: 'utf8', windowsHide: true });
   // Same post-success powershell.exe crash tolerance as installLogonTrigger: confirm against Task
   // Scheduler itself rather than trusting the exit code alone.
-  if (result.status === 0 || scheduledTaskMatchesSpec(spec)) {
+  if (result.status === 0 || startupTaskMatchesSpec(spec)) {
     return { ok: true, detail: `task ${spec.taskName} for ${windowsUser}` };
   }
   if (isAccessDenied(result) && !noElevate) {
     const elevated = await runElevated('install', script, { timeoutMs: elevationTimeoutMs });
-    if (elevated.ok && scheduledTaskMatchesSpec(spec)) {
+    if (elevated.ok && startupTaskMatchesSpec(spec)) {
       return { ok: true, detail: `task ${spec.taskName} for ${windowsUser} (elevated)` };
     }
     return { ok: false, reason: elevated.ok ? 'registration could not be confirmed' : elevated.reason };

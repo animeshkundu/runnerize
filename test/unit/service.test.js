@@ -1065,6 +1065,40 @@ test('a failed startup companion registration does not fail the install', async 
   });
 });
 
+// A double-quoted PowerShell string is expandable, so Win32-style quoting inside a generated .ps1
+// let PowerShell evaluate `$(id -u)` and `$XDG_RUNTIME_DIR` on the Windows side. The probe shipped
+// as /run/user/4096 (Git Bash's id.exe) instead of the WSL uid, so `systemctl --user` failed on
+// every iteration and the holder retired immediately.
+test('generated WSL launchers quote arguments so bash expansions survive PowerShell', async () => {
+  await withWindowsService({}, async (service, harness, appData) => {
+    await service.installService();
+    const keepAwake = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
+    const boot = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-boot.ps1'), 'utf8');
+    assert.match(keepAwake, /-lc 'export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\); systemctl --user is-active --quiet runnerize'/);
+    assert.match(boot, /-lc 'export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\);/);
+    assert.match(boot, /\$XDG_RUNTIME_DIR\/bus/);
+    for (const launcher of [keepAwake, boot]) {
+      // No double-quoted wsl.exe argument may carry a bash expansion: PowerShell would eat it.
+      assert.doesNotMatch(launcher, /& wsl\.exe [^\r\n]*"[^\r\n]*\$\(/);
+      assert.match(launcher, /& wsl\.exe -d 'Ubuntu' -u 'ani' -e bash -lc '/);
+    }
+  });
+});
+
+test('the dispatcher boot task is bounded so a hung wsl.exe cannot pin it forever', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    const bootTask = taskCommands.find((command) => command.includes("$taskName = 'runnerize-boot'"));
+    assert.match(bootTask, /-ExecutionTimeLimit \(New-TimeSpan -Minutes 15\)/);
+    // The keep-awake holder is long-running by design and must stay unlimited.
+    const keepAwakeBoot = taskCommands.find((command) => command.includes("$taskName = 'runnerize-wsl-keepawake-boot'"));
+    assert.match(keepAwakeBoot, /-ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/);
+  });
+});
+
 test('Windows install treats a post-success powershell.exe crash as registered, not failed', async () => {
   await withWindowsService({ registrationCrashesAfterSuccess: true }, async (service, harness, appData) => {
     await service.installService();
