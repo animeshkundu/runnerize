@@ -1914,6 +1914,19 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
     const trigger = await installLogonTrigger(keepAwake, { noElevate, elevationTimeoutMs });
     console.log(`WSL host keep-awake trigger: ${trigger.kind} (${trigger.detail})`);
 
+    // Registering the holder is not enough. Its trigger is at-logon, so without an explicit start
+    // it does not run until the user next signs in, and WSL keeps idle-terminating the distro in
+    // the meantime: the install reports success while Linux runners stay dark. There is nothing to
+    // start when registration fell back to a Startup-folder entry.
+    if (trigger.kind.startsWith('Task Scheduler') && !scheduledTaskIsRunning(keepAwake.taskName)) {
+      try {
+        startScheduledTask(keepAwake.taskName);
+        console.log('WSL host keep-awake holder: started.');
+      } catch (error) {
+        console.warn(`Could not start the WSL keep-awake holder now: ${error.message}. It will start at the next logon.`);
+      }
+    }
+
     // Companions to the logon triggers, not replacements: an always-on CI host that reboots
     // unattended never sees a logon, so the at-logon tasks alone leave Linux runners dark until
     // somebody signs in. The logon tasks are left exactly as they are, so a host where S4U cannot

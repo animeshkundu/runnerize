@@ -1120,6 +1120,19 @@ test('the dispatcher boot task is bounded so a hung wsl.exe cannot pin it foreve
   });
 });
 
+// Registering the holder is not enough: its trigger is at-logon, so without an explicit start the
+// install reports success while WSL keeps idle-terminating the distro until the user next signs in.
+test('Windows install starts the keep-awake holder rather than waiting for the next logon', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    const started = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1))
+      .some((command) => command.includes("Start-ScheduledTask -TaskName 'runnerize-wsl-keepawake'"));
+    assert.ok(started, 'the holder is started during install');
+  });
+});
+
 test('Windows install treats a post-success powershell.exe crash as registered, not failed', async () => {
   await withWindowsService({ registrationCrashesAfterSuccess: true }, async (service, harness, appData) => {
     await service.installService();
