@@ -66,6 +66,24 @@ For Android instrumented tests, a linux host with usable `/dev/kvm` automaticall
 advertises `[self-hosted, linux, x64, kvm]` and passes only that device through to the
 container. See [KVM-accelerated Android tests](docs/DEPLOYMENT.md#kvm-accelerated-android-tests).
 
+### Optional Android emulator image
+
+The default image already contains the Android SDK for builds, unit tests, and lint, but
+keeps the multi-gigabyte emulator and system image out of every runner. Build the opt-in
+image and select it through the existing image variable:
+
+```sh
+podman build -t localhost/runnerize-android:latest -f images/android/Containerfile .
+export RUNNERIZE_LINUX_IMAGE=localhost/runnerize-android:latest
+```
+
+The configured API 35 Google APIs x86_64 system image and emulator add about 2.1 GB of
+compressed downloads (roughly 6 GB installed), on top of the approximately 18 GB compressed
+default image; Google may change package sizes between revisions. Emulator jobs must target
+`[self-hosted, linux, x64, kvm]`. If the `kvm` label is absent, run preflight again and apply
+its reported host remedy; group changes
+require a re-login or, under WSL, `wsl.exe --shutdown` followed by restarting WSL.
+
 Container image builds are on by default. Target `[self-hosted, linux, x64, container-build]`;
 set `RUNNERIZE_CONTAINER_BUILDS=0` on the dispatcher to switch them off. runnerize advertises the
 extra label only after the configured job image completes a real `docker build` as the non-root

@@ -281,18 +281,75 @@ async function backend() {
   return runtime ? { runtime } : null;
 }
 
-async function hasUsableKvm(target) {
-  if (!target) return false;
+const KVM_STATUS_SCRIPT = `
+if [[ ! -e /dev/kvm ]]; then
+  if grep -Eqm1 '(^|[[:space:]])(vmx|svm)([[:space:]]|$)' /proc/cpuinfo; then
+    printf 'missing-device'
+  else
+    printf 'no-virtualization'
+  fi
+elif exec 3<>/dev/kvm 2>/dev/null; then
+  printf 'usable'
+else
+  printf 'permission-denied'
+fi
+`;
+
+// A boolean made a one-command permission fix indistinguishable from unsupported hardware.
+export async function kvmStatus(target) {
+  if (!target) return {
+    status: 'unavailable',
+    usable: false,
+    why: 'KVM was not checked because no Linux container runtime is available.',
+  };
   const command = target.distro ? 'wsl.exe' : 'bash';
   const args = target.distro
-    ? ['-d', target.distro, '-e', 'bash', '-c', 'exec 3<>/dev/kvm']
-    : ['-c', 'exec 3<>/dev/kvm'];
+    ? ['-d', target.distro, '-e', 'bash', '-c', KVM_STATUS_SCRIPT]
+    : ['-c', KVM_STATUS_SCRIPT];
   try {
-    await collect(command, args, { timeoutMs: KVM_PROBE_TIMEOUT_MS });
-    return true;
-  } catch {
-    return false;
+    const { stdout } = await collect(command, args, { timeoutMs: KVM_PROBE_TIMEOUT_MS });
+    switch (stdout.trim()) {
+      case 'usable':
+        return {
+          status: 'usable',
+          usable: true,
+          why: 'KVM acceleration is available; Linux runners advertise the kvm label.',
+        };
+      case 'permission-denied':
+        return {
+          status: 'permission-denied',
+          usable: false,
+          why: '/dev/kvm exists but the dispatcher user cannot open it for reading and writing.',
+          command: target.distro
+            ? 'sudo usermod -aG kvm "$USER"  # then run `wsl.exe --shutdown` from Windows and restart WSL'
+            : 'sudo usermod -aG kvm "$USER"  # then log out and back in',
+        };
+      case 'missing-device':
+        return {
+          status: 'missing-device',
+          usable: false,
+          why: 'CPU virtualization extensions are present, but /dev/kvm is missing; enable nested virtualization or expose KVM to this Linux environment.',
+        };
+      case 'no-virtualization':
+        return {
+          status: 'no-virtualization',
+          usable: false,
+          why: 'CPU virtualization extensions (vmx/svm) are not exposed to this Linux environment.',
+        };
+      default:
+        throw new Error(`unexpected KVM probe result: ${stdout.trim() || 'empty output'}`);
+    }
+  } catch (error) {
+    return {
+      status: 'probe-failed',
+      usable: false,
+      why: `KVM capability could not be determined: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
+}
+
+async function hasUsableKvm(target) {
+  return (await kvmStatus(target)).usable;
 }
 
 function buildContainerArgs(image) {

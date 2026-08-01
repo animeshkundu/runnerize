@@ -1,0 +1,13 @@
+FROM docker.io/catthehacker/ubuntu:full-latest
+
+ARG ANDROID_SYSTEM_IMAGE="system-images;android-35;google_apis;x86_64"
+
+ENV ANDROID_HOME=/usr/local/lib/android/sdk \
+    ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+
+RUN set -eux; \
+    yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null; \
+    "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+      "emulator" \
+      "${ANDROID_SYSTEM_IMAGE}"; \
+    rm -rf /root/.android/cache "${ANDROID_HOME}/.temp"
