@@ -112,10 +112,30 @@ Each backend uses a three-tier Windows logon trigger:
    `.vbs` launcher for the current user. A task and its fallback are never intentionally
    left active together.
 
-These triggers resume at the next interactive logon, not before login. Unattended
-restart requires Windows AutoLogon, which stores reusable credentials and is a
-security trade-off. Windows Sandbox remains unsupported on locked or disconnected
-RDP desktops.
+These triggers resume at the next interactive logon. Alongside each WSL logon
+trigger, runnerize also registers an at-startup companion task (`runnerize-boot`
+and `runnerize-wsl-keepawake-boot`) so an unattended reboot does not leave Linux
+runners dark until somebody signs in.
+
+The companions run as the same user under an S4U principal, never as SYSTEM: a
+WSL2 distro is registered under its owning user's
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss` hive, so a SYSTEM principal
+cannot resolve it at all. Whether S4U loads that hive early enough before login is
+host-specific and depends on batch-logon policy, profile availability, and WSL
+service readiness, so treat the companion as best-effort. It retries until WSL
+answers and records what it saw in
+`%LOCALAPPDATA%\runnerize\runnerize-wsl-boot.log`. The logon triggers are the
+primary path and are unchanged. Windows AutoLogon remains the only fully
+guaranteed unattended restart, and it stores reusable credentials. Windows Sandbox
+remains unsupported on locked or disconnected RDP desktops.
+
+Whenever the Linux backend is installed, runnerize registers a keep-awake holder
+that pings the WSL service every 30 seconds. Keeping the host awake is a separate
+concern: WSL terminates an idle distro once no client session is attached, whether
+or not the host is asleep, so without the holder the Linux dispatcher is torn down
+shortly after each start. The holder tolerates transient probe failures and only
+retires after sustained unavailability, so a restarting unit or a still-booting
+distro does not silently disable it.
 
 Pass `--no-elevate`, or set `RUNNERIZE_NO_ELEVATE` to any non-empty value, to skip
 Tier 2 for scripted installs and managed machines. Either setting is sufficient:

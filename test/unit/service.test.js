@@ -84,6 +84,13 @@ function successfulHarness(options = {}) {
           error.stderr = '';
           throw error;
         }
+        if (options.startupCompanionFails && taskName?.endsWith('-boot')) {
+          const error = new Error('no match');
+          error.status = 1;
+          error.stdout = '';
+          error.stderr = '';
+          throw error;
+        }
         if (registeredActions.get(taskName) === true) return '';
         const error = new Error('no match');
         error.status = 1;
@@ -125,6 +132,13 @@ function successfulHarness(options = {}) {
         error.status = 1;
         error.stdout = '';
         error.stderr = options.registrationCrashesAfterSuccess ? '' : error.message;
+        throw error;
+      }
+      if (options.startupCompanionFails && /\$taskName = '[^']*-boot'/.test(command) && command.includes('Register-ScheduledTask')) {
+        const error = new Error('startup companion registration failed');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = error.message;
         throw error;
       }
       const unregister = command.includes('Unregister-ScheduledTask') && !elevatedLaunch;
@@ -874,12 +888,21 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     assert.equal(task.options.encoding, 'utf8');
     assert.equal(task.options.windowsHide, true);
     assert.match(task.args.at(-1), /New-ScheduledTaskTrigger -AtLogOn/);
-    assert.match(task.args.at(-1), /-d "Ubuntu" -u "ani"/);
+    // Bare, not quoted: wsl.exe does not strip quotes from -d/-u on a raw command line, so
+    // `-d "Ubuntu"` fails with WSL_E_DISTRO_NOT_FOUND and the task starts nothing.
+    assert.match(task.args.at(-1), /-d Ubuntu -u ani -e bash -lc "/);
+    assert.doesNotMatch(task.args.at(-1), /-d "Ubuntu"/);
     assert.match(task.args.at(-1), /systemctl --user start runnerize/);
     assert.ok(harness.calls.some((call) => commandOf(call).includes('RUNNERIZE_SERVICE_RUN_ONLY=linux')));
     const tasks = harness.calls.filter((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
-    assert.equal(tasks.length, 2);
-    assert.ok(tasks.some((call) => call.args.at(-1).includes("$taskName = 'runnerize-windows'")));
+    const registeredNames = tasks.map((call) => call.args.at(-1).match(/\$taskName = '([^']*)'/)?.[1]).sort();
+    assert.deepEqual(registeredNames, [
+      'runnerize',
+      'runnerize-boot',
+      'runnerize-windows',
+      'runnerize-wsl-keepawake',
+      'runnerize-wsl-keepawake-boot',
+    ], 'both logon tasks, the Windows task, and an at-startup companion per WSL task');
     for (const call of tasks) {
       // A trailing Remove-Item run in the same powershell.exe process right after the
       // ScheduledTasks module's CIM cmdlets (Get-/Register-ScheduledTask) reliably crashes
@@ -968,16 +991,157 @@ test('Windows install adds the WSL keep-awake holder when the Windows backend fa
   });
 });
 
+// The keep-awake holder is what keeps a WSL client session attached; the Windows dispatcher's
+// SetThreadExecutionState hold only keeps the host awake. Skipping the holder when both backends
+// install left the Linux dispatcher idle-terminated within a minute of every start.
+test('Windows install adds the WSL keep-awake holder when the Windows backend also succeeds', async () => {
+  await withWindowsService({}, async (service, harness, appData) => {
+    await service.installService();
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    assert.ok(taskCommands.some((command) => command.includes("$taskName = 'runnerize-windows'")));
+    assert.ok(taskCommands.some((command) => command.includes("$taskName = 'runnerize-wsl-keepawake'")));
+    assert.ok(existsSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1')));
+  });
+});
+
+test('WSL keep-awake holder rides out transient probe failures before retiring', async () => {
+  await withWindowsService({}, async (service, harness, appData) => {
+    await service.installService();
+    const launcher = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
+    assert.ok(!/if \(\$LASTEXITCODE -ne 0\) \{ break \}/.test(launcher), 'does not retire on a single probe failure');
+    assert.match(launcher, /\$failures\+\+/);
+    assert.match(launcher, /if \(\$failures -ge 20\) \{ exit 1 \}/);
+    // Invoke-Wsl returns an explicit code, so a wsl.exe that never launches cannot read as
+    // success via a stale $LASTEXITCODE.
+    assert.match(launcher, /if \(\$null -eq \$p\) \{ return 1 \}/);
+  });
+});
+
+test('Windows install registers unattended at-startup companions for the WSL tasks', async () => {
+  await withWindowsService({}, async (service, harness, appData) => {
+    await service.installService();
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    const bootTask = taskCommands.find((command) => command.includes("$taskName = 'runnerize-boot'"));
+    const keepAwakeBoot = taskCommands.find((command) => command.includes("$taskName = 'runnerize-wsl-keepawake-boot'"));
+    assert.ok(bootTask, 'registers the dispatcher boot companion');
+    assert.ok(keepAwakeBoot, 'registers the keep-awake boot companion');
+    for (const command of [bootTask, keepAwakeBoot]) {
+      assert.match(command, /New-ScheduledTaskTrigger -AtStartup/);
+      // A SYSTEM principal cannot resolve a per-user WSL registration, so S4U is load-bearing here.
+      assert.match(command, /-LogonType S4U/);
+      assert.ok(!command.includes('NT AUTHORITY\\SYSTEM'));
+      assert.match(command, /-StartWhenAvailable/);
+    }
+    assert.ok(existsSync(join(appData, 'runnerize', 'runnerize-wsl-boot.ps1')));
+  });
+});
+
+test('the at-startup companion leaves the working logon task untouched', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    const logonTask = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1))
+      .find((command) => command.includes("$taskName = 'runnerize'") && command.includes('Register-ScheduledTask'));
+    assert.ok(logonTask);
+    assert.match(logonTask, /New-ScheduledTaskTrigger -AtLogOn -User \$user/);
+    assert.match(logonTask, /-LogonType Interactive/);
+    assert.ok(!logonTask.includes('S4U'), 'the proven logon path does not move onto the unverified S4U model');
+  });
+});
+
+test('a failed startup companion registration does not fail the install', async () => {
+  await withWindowsService({ startupCompanionFails: true }, async (service, harness, appData) => {
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (message) => warnings.push(String(message));
+    try {
+      await service.installService();
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.ok(warnings.some((warning) => /Linux runners will still start at logon/.test(warning)));
+    assert.ok(existsSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1')));
+  });
+});
+
+// A double-quoted PowerShell string is expandable, so PowerShell-quoting these args let it
+// evaluate `$(id -u)` and `$XDG_RUNTIME_DIR` on the Windows side. The probe shipped as
+// /run/user/4096 (Git Bash's id.exe) instead of the WSL uid, so `systemctl --user` failed on every
+// iteration and the holder retired immediately. The args must stay a Win32 command line (what
+// CreateProcess parses) wrapped in a single-quoted PowerShell literal (so PowerShell passes it
+// through untouched).
+test('generated WSL launchers quote arguments so bash expansions survive PowerShell', async () => {
+  await withWindowsService({}, async (service, harness, appData) => {
+    await service.installService();
+    const keepAwake = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
+    const boot = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-boot.ps1'), 'utf8');
+    assert.match(keepAwake, /\$probeArgs = '-d Ubuntu -u ani -e bash -lc "export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\); systemctl --user is-active --quiet runnerize"'/);
+    assert.match(boot, /\$startArgs = '-d Ubuntu -u ani -e bash -lc "export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\);/);
+    assert.match(boot, /\$XDG_RUNTIME_DIR\/bus/);
+    for (const launcher of [keepAwake, boot]) {
+      // The bash expansions must never sit in an expandable (double-quoted) PowerShell string, and
+      // wsl.exe must not be invoked with them interpolated straight into the call.
+      assert.doesNotMatch(launcher, /& wsl\.exe [^\r\n]*\$\(id -u\)/);
+      assert.doesNotMatch(launcher, /^\s*\$\w+ = "[^\r\n]*\$\(id -u\)/m);
+    }
+  });
+});
+
+test('WSL invocations are bounded so a wedged wsl.exe cannot block the loop', async () => {
+  await withWindowsService({}, async (service, harness, appData) => {
+    await service.installService();
+    const keepAwake = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
+    const boot = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-boot.ps1'), 'utf8');
+    // A hung probe would otherwise stall the holder without ever advancing $failures, and stall
+    // the boot launcher without ever reaching its deadline check.
+    assert.match(keepAwake, /if \(-not \$p\.WaitForExit\(60000\)\) \{ try \{ \$p\.Kill\(\) \} catch \{ \}; return 1 \}/);
+    assert.match(boot, /if \(-not \$p\.WaitForExit\(120000\)\) \{ try \{ \$p\.Kill\(\) \} catch \{ \}; return 1 \}/);
+    assert.match(keepAwake, /if \(\(Invoke-Wsl \$probeArgs\) -eq 0\)/);
+    assert.match(boot, /\$code = Invoke-Wsl \$startArgs/);
+  });
+});
+
+test('the dispatcher boot task is bounded so a hung wsl.exe cannot pin it forever', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    const taskCommands = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1));
+    const bootTask = taskCommands.find((command) => command.includes("$taskName = 'runnerize-boot'"));
+    assert.match(bootTask, /-ExecutionTimeLimit \(New-TimeSpan -Minutes 15\)/);
+    // The keep-awake holder is long-running by design and must stay unlimited.
+    const keepAwakeBoot = taskCommands.find((command) => command.includes("$taskName = 'runnerize-wsl-keepawake-boot'"));
+    assert.match(keepAwakeBoot, /-ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/);
+  });
+});
+
+// Registering the holder is not enough: its trigger is at-logon, so without an explicit start the
+// install reports success while WSL keeps idle-terminating the distro until the user next signs in.
+test('Windows install starts the keep-awake holder rather than waiting for the next logon', async () => {
+  await withWindowsService({}, async (service, harness) => {
+    await service.installService();
+    const started = harness.calls
+      .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
+      .map((call) => call.args.at(-1))
+      .some((command) => command.includes("Start-ScheduledTask -TaskName 'runnerize-wsl-keepawake'"));
+    assert.ok(started, 'the holder is started during install');
+  });
+});
+
 test('Windows install treats a post-success powershell.exe crash as registered, not failed', async () => {
   await withWindowsService({ registrationCrashesAfterSuccess: true }, async (service, harness, appData) => {
     await service.installService();
     const taskCommands = harness.calls
       .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
       .map((call) => call.args.at(-1));
-    // No UAC elevation, no wsl-keepawake fallback, and no Startup-folder fallback: the
-    // registration is confirmed via Get-ScheduledTask and treated as a success outright.
+    // No UAC elevation and no Startup-folder fallback: the registration is confirmed via
+    // Get-ScheduledTask and treated as a success outright.
     assert.ok(!taskCommands.some((command) => command.includes('Start-Process')));
-    assert.ok(!taskCommands.some((command) => command.includes("$taskName = 'runnerize-wsl-keepawake'")));
     assert.equal(existsSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize-windows.vbs')), false);
   });
 });
@@ -1214,9 +1378,9 @@ test('Windows install uses Tier 1 Task Scheduler without elevation when registra
   await withWindowsService({}, async (service, harness) => {
     await service.installService();
     const powershell = harness.calls.filter((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
-    assert.equal(powershell.length, 2);
+    assert.equal(powershell.length, 5, 'both logon tasks, the Windows task, and both at-startup companions');
     assert.equal(powershell[0].kind, 'exec');
-    assert.doesNotMatch(powershell[0].args.at(-1), /Start-Process/);
+    for (const call of powershell) assert.doesNotMatch(call.args.at(-1), /Start-Process/);
   });
 });
 

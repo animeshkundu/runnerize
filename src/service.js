@@ -20,6 +20,16 @@ const SYSTEMD_VERIFY_TIMEOUT_MS = 5_000;
 const SYSTEMD_VERIFY_RETRY_MS = 100;
 const INSTALL_TIMEOUT_MS = 120_000;
 const NPM_LOOKUP_TIMEOUT_MS = 10_000;
+const KEEPAWAKE_POLL_SECONDS = 30;
+const KEEPAWAKE_RETRY_SECONDS = 15;
+// 20 consecutive failures at 15s apart, so roughly five minutes of sustained unavailability
+// before the holder retires. Long enough to ride out a restarting unit or a booting distro,
+// short enough that an uninstalled runnerize stops holding the host awake.
+const KEEPAWAKE_MAX_CONSECUTIVE_FAILURES = 20;
+const KEEPAWAKE_PROBE_TIMEOUT_MS = 60_000;
+const WSL_BOOT_DEADLINE_SECONDS = 600;
+const WSL_BOOT_RETRY_SECONDS = 15;
+const WSL_BOOT_ATTEMPT_TIMEOUT_MS = 120_000;
 const WSL_INSTALL_GUIDANCE = 'In an elevated PowerShell: wsl --install -d Ubuntu\nThen restart Windows if prompted and rerun this command.';
 const GITHUB_AUTH_GUIDANCE = 'Run: gh auth login\nOr set GH_TOKEN/GITHUB_TOKEN. The credential needs Administration, Actions, and Metadata access across all owned private repositories.';
 const DEFAULT_MACOS_IMAGE = 'ghcr.io/cirruslabs/macos-sequoia-base:latest';
@@ -1539,7 +1549,7 @@ async function installLogonTrigger(spec, { noElevate = false, elevationTimeoutMs
 }
 
 function wslTriggerSpec(context) {
-  const argument = `-d ${windowsCommandLineArg(context.distro)} -u ${windowsCommandLineArg(context.user)} -e bash -lc ${windowsCommandLineArg(systemdStartCommand())}`;
+  const argument = wslCommandLine(context, systemdStartCommand());
   return {
     taskName: SERVICE_NAME,
     startupFileName: 'runnerize.vbs',
@@ -1612,18 +1622,191 @@ function windowsTriggerSpec(launcherPath) {
   };
 }
 
+// Arguments embedded in a generated .ps1 need PowerShell quoting, NOT the Win32 quoting used for
+// wsl.exe does NOT strip surrounding double quotes from -d/-u values. Passing `-d "Ubuntu"` on a
+// raw command line fails with WSL_E_DISTRO_NOT_FOUND and exit -1 (verified against WSL 2.6.3), so
+// a Task Scheduler task built that way never starts anything. The spawnSync call sites are
+// unaffected because they pass an argv array and Node leaves a bare word bare; only code that
+// builds a command-line STRING is exposed - a Task Scheduler -Argument, or
+// ProcessStartInfo.Arguments. The trailing -lc command is the exception: wsl.exe does honour
+// quoting there, and it must stay quoted because it contains spaces and semicolons.
+function wslCommandLine(context, command) {
+  for (const [label, value] of [['distro', context.distro], ['user', context.user]]) {
+    if (/[\s"]/.test(value)) {
+      throw new Error(`The WSL ${label} name ${JSON.stringify(value)} contains whitespace or a quote. wsl.exe cannot receive that on a generated command line, so the auto-start task would silently fail.`);
+    }
+  }
+  return `-d ${context.distro} -u ${context.user} -e bash -lc ${windowsCommandLineArg(command)}`;
+}
+
+// Emits a PowerShell helper that runs wsl.exe under a hard timeout. Without it a wedged wsl.exe
+// blocks the caller forever: the keep-awake holder would stop probing while never advancing its
+// failure counter, and the boot launcher would never reach its own deadline check. Windows
+// PowerShell 5.1 runs on .NET Framework, whose ProcessStartInfo has no ArgumentList, so the
+// argument string has to be a pre-built command line.
+function powershellWslInvoker(timeoutMs) {
+  return [
+    'function Invoke-Wsl([string]$argumentString) {',
+    '  $psi = New-Object System.Diagnostics.ProcessStartInfo',
+    "  $psi.FileName = 'wsl.exe'",
+    '  $psi.Arguments = $argumentString',
+    '  $psi.UseShellExecute = $false',
+    '  $psi.CreateNoWindow = $true',
+    '  $p = [System.Diagnostics.Process]::Start($psi)',
+    '  if ($null -eq $p) { return 1 }',
+    `  if (-not $p.WaitForExit(${timeoutMs})) { try { $p.Kill() } catch { }; return 1 }`,
+    '  return $p.ExitCode',
+    '}',
+  ];
+}
+
 function wslKeepAwakeSpec(context) {
   const launcherPath = windowsDataPath('runnerize-wsl-keepawake.ps1');
-  const activeArgs = `-d ${windowsCommandLineArg(context.distro)} -u ${windowsCommandLineArg(context.user)} -e bash -lc ${windowsCommandLineArg('export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize')}`;
+  const activeArgs = wslCommandLine(context, 'export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize');
   mkdirSync(dirname(launcherPath), { recursive: true });
-  writeFileSync(launcherPath, `$ErrorActionPreference = 'SilentlyContinue'\r\nAdd-Type -Namespace Runnerize -Name Native -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'\r\n[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null\r\ntry { while ($true) { & wsl.exe ${activeArgs}; if ($LASTEXITCODE -ne 0) { break }; Start-Sleep -Seconds 30 } } finally { [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) | Out-Null }\r\n`);
+  writeFileSync(launcherPath, [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    'Add-Type -Namespace Runnerize -Name Native -MemberDefinition \'[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);\'',
+    "[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null",
+    ...powershellWslInvoker(KEEPAWAKE_PROBE_TIMEOUT_MS),
+    `$probeArgs = ${powershellLiteral(activeArgs)}`,
+    '$failures = 0',
+    'try {',
+    '  while ($true) {',
+    '    if ((Invoke-Wsl $probeArgs) -eq 0) {',
+    '      $failures = 0',
+    `      Start-Sleep -Seconds ${KEEPAWAKE_POLL_SECONDS}`,
+    '      continue',
+    '    }',
+    // A single probe failure is not proof runnerize is gone: the unit may be restarting, or the
+    // distro may still be booting. Retiring on the first failure leaves the distro to be idle-
+    // terminated seconds later, which is the whole problem this holder exists to prevent.
+    '    $failures++',
+    `    if ($failures -ge ${KEEPAWAKE_MAX_CONSECUTIVE_FAILURES}) { exit 1 }`,
+    `    Start-Sleep -Seconds ${KEEPAWAKE_RETRY_SECONDS}`,
+    '  }',
+    '} finally {',
+    "  [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) | Out-Null",
+    '}',
+    '',
+  ].join('\r\n'));
   const argument = `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${windowsCommandLineArg(launcherPath)}`;
   return {
     taskName: 'runnerize-wsl-keepawake',
     startupFileName: 'runnerize-wsl-keepawake.vbs',
     execute: powershellPath,
     argument,
+    launcherPath,
     startupCommand: `${windowsCommandLineArg(powershellPath)} ${argument}`,
+  };
+}
+
+function wslBootSpec(context) {
+  const launcherPath = windowsDataPath('runnerize-wsl-boot.ps1');
+  const logPath = windowsDataPath('runnerize-wsl-boot.log');
+  const startArgs = wslCommandLine(context, systemdStartCommand());
+  mkdirSync(dirname(launcherPath), { recursive: true });
+  writeFileSync(launcherPath, [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$log = ${powershellLiteral(logPath)}`,
+    'function Write-Diag($message) { "$([DateTime]::UtcNow.ToString(\'o\')) $message" | Add-Content -LiteralPath $log }',
+    ...powershellWslInvoker(WSL_BOOT_ATTEMPT_TIMEOUT_MS),
+    `$startArgs = ${powershellLiteral(startArgs)}`,
+    // S4U runs without an interactive profile, and a WSL2 distro is registered in its owning
+    // user's hive. Recording the effective identity and whether that hive is actually visible is
+    // the difference between a diagnosable cold-boot failure and a silent one that looks
+    // identical to WSL merely being slow to come up.
+    'Write-Diag "boot task running as $(whoami)"',
+    'Write-Diag "Lxss registrations visible: $((Get-ChildItem \'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\' -ErrorAction SilentlyContinue | Measure-Object).Count)"',
+    `$deadline = (Get-Date).AddSeconds(${WSL_BOOT_DEADLINE_SECONDS})`,
+    'while ((Get-Date) -lt $deadline) {',
+    '  Write-Diag "wsl --list --verbose: $(& wsl.exe --list --verbose 2>&1)"',
+    '  $code = Invoke-Wsl $startArgs',
+    "  if ($code -eq 0) { Write-Diag 'dispatcher start succeeded'; exit 0 }",
+    '  Write-Diag "dispatcher start failed with exit code $code; retrying"',
+    `  Start-Sleep -Seconds ${WSL_BOOT_RETRY_SECONDS}`,
+    '}',
+    // Exit non-zero so Task Scheduler's restart policy engages. Falling out of the loop silently
+    // would record a successful run and retire the task until the next boot.
+    "Write-Diag 'giving up: WSL did not become ready before the deadline'",
+    'exit 1',
+    '',
+  ].join('\r\n'));
+  // A finite limit, unlike the keep-awake holder's unlimited one: this launcher is expected to
+  // exit once WSL answers or the deadline passes. If wsl.exe hangs, the loop never reaches its own
+  // deadline check, so Task Scheduler killing the run is what lets the restart policy retry.
+  return bootCompanionSpec(`${SERVICE_NAME}-boot`, launcherPath, { executionTimeLimit: '(New-TimeSpan -Minutes 15)' });
+}
+
+function bootCompanionSpec(taskName, launcherPath, { executionTimeLimit = '([TimeSpan]::Zero)' } = {}) {
+  return {
+    taskName,
+    execute: powershellPath,
+    executionTimeLimit,
+    argument: `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${windowsCommandLineArg(launcherPath)}`,
+  };
+}
+
+// The generic scheduledTaskMatchesSpec only compares the action, which is not enough to confirm a
+// startup companion: a same-named task carrying the same action but an at-logon trigger or the
+// wrong principal would report success while unattended start stays broken.
+function startupTaskMatchesSpec(spec) {
+  const script = [
+    `$task = Get-ScheduledTask -TaskName ${powershellLiteral(spec.taskName)} -ErrorAction SilentlyContinue`,
+    'if ($null -eq $task) { exit 1 }',
+    '$a = $task.Actions | Select-Object -First 1',
+    `if ($a.Execute -ne ${powershellLiteral(spec.execute)} -or $a.Arguments -ne ${powershellLiteral(spec.argument)}) { exit 1 }`,
+    "if (-not ($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })) { exit 1 }",
+    "if ($task.Principal.LogonType -ne 'S4U') { exit 1 }",
+    'exit 0',
+  ].join('; ');
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ], { encoding: 'utf8', windowsHide: true });
+  return result.status === 0;
+}
+
+function startupTaskScript(spec, windowsUser) {
+  return [
+    `$taskName = ${powershellLiteral(spec.taskName)}`,
+    `$user = ${powershellLiteral(windowsUser)}`,
+    `$action = New-ScheduledTaskAction -Execute ${powershellLiteral(spec.execute)} -Argument ${powershellLiteral(spec.argument)}`,
+    '$trigger = New-ScheduledTaskTrigger -AtStartup',
+    // Deliberately not the SYSTEM principal systemStartupTaskScript uses: a WSL2 distro is
+    // registered under the owning user's HKCU hive, so SYSTEM cannot resolve it at all. S4U runs
+    // as that user with no stored password and no interactive session.
+    '$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited',
+    `$settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ${spec.executionTimeLimit} -StartWhenAvailable -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`,
+    'Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop',
+    'Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null',
+  ].join('; ');
+}
+
+// Best-effort by design: this only adds unattended-boot coverage on top of the logon trigger, so a
+// host that refuses the registration keeps working exactly as it did before. Reports instead of
+// throwing so a failure here never fails an otherwise good install.
+async function installStartupCompanion(spec, { noElevate = false, elevationTimeoutMs } = {}) {
+  const windowsUser = currentWindowsUser();
+  const script = startupTaskScript(spec, windowsUser);
+  console.log(`Registering startup task ${spec.taskName}...`);
+  const result = captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
+  ], { encoding: 'utf8', windowsHide: true });
+  // Same post-success powershell.exe crash tolerance as installLogonTrigger: confirm against Task
+  // Scheduler itself rather than trusting the exit code alone.
+  if (result.status === 0 || startupTaskMatchesSpec(spec)) {
+    return { ok: true, detail: `task ${spec.taskName} for ${windowsUser}` };
+  }
+  if (isAccessDenied(result) && !noElevate) {
+    const elevated = await runElevated('install', script, { timeoutMs: elevationTimeoutMs });
+    if (elevated.ok && startupTaskMatchesSpec(spec)) {
+      return { ok: true, detail: `task ${spec.taskName} for ${windowsUser} (elevated)` };
+    }
+    return { ok: false, reason: elevated.ok ? 'registration could not be confirmed' : elevated.reason };
+  }
+  return {
+    ok: false,
+    reason: result.stderr?.trim() || result.stdout?.trim() || result.error?.message || `exit code ${result.status}`,
   };
 }
 
@@ -1721,9 +1904,38 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
     statuses.push('windows=unavailable');
   }
 
-  if (!windowsInstalled && context && linuxInstalled) {
-    const trigger = await installLogonTrigger(wslKeepAwakeSpec(context), { noElevate, elevationTimeoutMs });
+  // Required whenever the Linux backend is installed, NOT only when the Windows backend is absent.
+  // The Windows dispatcher's own SetThreadExecutionState hold keeps the HOST awake, which is a
+  // different thing: nothing else keeps a WSL client session attached, and WSL idle-terminates the
+  // distro regardless of whether the host is awake. Gating this on !windowsInstalled left the Linux
+  // dispatcher being torn down seconds after every start on hosts that have both backends.
+  if (context && linuxInstalled) {
+    const keepAwake = wslKeepAwakeSpec(context);
+    const trigger = await installLogonTrigger(keepAwake, { noElevate, elevationTimeoutMs });
     console.log(`WSL host keep-awake trigger: ${trigger.kind} (${trigger.detail})`);
+
+    // Registering the holder is not enough. Its trigger is at-logon, so without an explicit start
+    // it does not run until the user next signs in, and WSL keeps idle-terminating the distro in
+    // the meantime: the install reports success while Linux runners stay dark. There is nothing to
+    // start when registration fell back to a Startup-folder entry.
+    if (trigger.kind.startsWith('Task Scheduler') && !scheduledTaskIsRunning(keepAwake.taskName)) {
+      try {
+        startScheduledTask(keepAwake.taskName);
+        console.log('WSL host keep-awake holder: started.');
+      } catch (error) {
+        console.warn(`Could not start the WSL keep-awake holder now: ${error.message}. It will start at the next logon.`);
+      }
+    }
+
+    // Companions to the logon triggers, not replacements: an always-on CI host that reboots
+    // unattended never sees a logon, so the at-logon tasks alone leave Linux runners dark until
+    // somebody signs in. The logon tasks are left exactly as they are, so a host where S4U cannot
+    // resolve the distro is no worse off than before.
+    for (const companion of [wslBootSpec(context), bootCompanionSpec(`${keepAwake.taskName}-boot`, keepAwake.launcherPath)]) {
+      const registered = await installStartupCompanion(companion, { noElevate, elevationTimeoutMs });
+      if (registered.ok) console.log(`Unattended startup trigger: ${registered.detail}`);
+      else console.warn(`Could not register the unattended startup task ${companion.taskName}: ${registered.reason}. Linux runners will still start at logon.`);
+    }
   }
 
   console.log(`Backend summary: ${statuses.join(', ')}`);
@@ -1790,7 +2002,7 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
     ]));
   }
 
-  for (const taskName of [SERVICE_NAME, 'runnerize-windows', 'runnerize-wsl-keepawake']) {
+  for (const taskName of [SERVICE_NAME, `${SERVICE_NAME}-boot`, 'runnerize-windows', 'runnerize-wsl-keepawake', 'runnerize-wsl-keepawake-boot']) {
     const script = `Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
     const taskRemoval = captureResult(powershellPath, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
@@ -1817,7 +2029,7 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
   for (const fileName of ['runnerize.vbs', 'runnerize-windows.vbs', 'runnerize-wsl-keepawake.vbs']) {
     rmSync(windowsStartupPath(fileName), { force: true });
   }
-  for (const artifact of ['app', 'releases', 'current-release', 'runnerize-windows.ps1', 'runnerize-wsl-keepawake.ps1', 'windows.token', 'runnerize-windows.log']) {
+  for (const artifact of ['app', 'releases', 'current-release', 'runnerize-windows.ps1', 'runnerize-wsl-keepawake.ps1', 'runnerize-wsl-boot.ps1', 'runnerize-wsl-boot.log', 'windows.token', 'runnerize-windows.log']) {
     rmSync(windowsDataPath(artifact), { recursive: true, force: true });
   }
   if (!noGuard && !noElevate) {
