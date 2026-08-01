@@ -888,7 +888,10 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     assert.equal(task.options.encoding, 'utf8');
     assert.equal(task.options.windowsHide, true);
     assert.match(task.args.at(-1), /New-ScheduledTaskTrigger -AtLogOn/);
-    assert.match(task.args.at(-1), /-d "Ubuntu" -u "ani"/);
+    // Bare, not quoted: wsl.exe does not strip quotes from -d/-u on a raw command line, so
+    // `-d "Ubuntu"` fails with WSL_E_DISTRO_NOT_FOUND and the task starts nothing.
+    assert.match(task.args.at(-1), /-d Ubuntu -u ani -e bash -lc "/);
+    assert.doesNotMatch(task.args.at(-1), /-d "Ubuntu"/);
     assert.match(task.args.at(-1), /systemctl --user start runnerize/);
     assert.ok(harness.calls.some((call) => commandOf(call).includes('RUNNERIZE_SERVICE_RUN_ONLY=linux')));
     const tasks = harness.calls.filter((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('New-ScheduledTaskTrigger'));
@@ -1010,8 +1013,9 @@ test('WSL keep-awake holder rides out transient probe failures before retiring',
     assert.ok(!/if \(\$LASTEXITCODE -ne 0\) \{ break \}/.test(launcher), 'does not retire on a single probe failure');
     assert.match(launcher, /\$failures\+\+/);
     assert.match(launcher, /if \(\$failures -ge 20\) \{ exit 1 \}/);
-    // Seeded so a wsl.exe that never launches cannot read as success via a stale exit code.
-    assert.match(launcher, /\$LASTEXITCODE = 1/);
+    // Invoke-Wsl returns an explicit code, so a wsl.exe that never launches cannot read as
+    // success via a stale $LASTEXITCODE.
+    assert.match(launcher, /if \(\$null -eq \$p\) \{ return 1 \}/);
   });
 });
 
@@ -1065,23 +1069,40 @@ test('a failed startup companion registration does not fail the install', async 
   });
 });
 
-// A double-quoted PowerShell string is expandable, so Win32-style quoting inside a generated .ps1
-// let PowerShell evaluate `$(id -u)` and `$XDG_RUNTIME_DIR` on the Windows side. The probe shipped
-// as /run/user/4096 (Git Bash's id.exe) instead of the WSL uid, so `systemctl --user` failed on
-// every iteration and the holder retired immediately.
+// A double-quoted PowerShell string is expandable, so PowerShell-quoting these args let it
+// evaluate `$(id -u)` and `$XDG_RUNTIME_DIR` on the Windows side. The probe shipped as
+// /run/user/4096 (Git Bash's id.exe) instead of the WSL uid, so `systemctl --user` failed on every
+// iteration and the holder retired immediately. The args must stay a Win32 command line (what
+// CreateProcess parses) wrapped in a single-quoted PowerShell literal (so PowerShell passes it
+// through untouched).
 test('generated WSL launchers quote arguments so bash expansions survive PowerShell', async () => {
   await withWindowsService({}, async (service, harness, appData) => {
     await service.installService();
     const keepAwake = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
     const boot = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-boot.ps1'), 'utf8');
-    assert.match(keepAwake, /-lc 'export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\); systemctl --user is-active --quiet runnerize'/);
-    assert.match(boot, /-lc 'export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\);/);
+    assert.match(keepAwake, /\$probeArgs = '-d Ubuntu -u ani -e bash -lc "export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\); systemctl --user is-active --quiet runnerize"'/);
+    assert.match(boot, /\$startArgs = '-d Ubuntu -u ani -e bash -lc "export XDG_RUNTIME_DIR=\/run\/user\/\$\(id -u\);/);
     assert.match(boot, /\$XDG_RUNTIME_DIR\/bus/);
     for (const launcher of [keepAwake, boot]) {
-      // No double-quoted wsl.exe argument may carry a bash expansion: PowerShell would eat it.
-      assert.doesNotMatch(launcher, /& wsl\.exe [^\r\n]*"[^\r\n]*\$\(/);
-      assert.match(launcher, /& wsl\.exe -d 'Ubuntu' -u 'ani' -e bash -lc '/);
+      // The bash expansions must never sit in an expandable (double-quoted) PowerShell string, and
+      // wsl.exe must not be invoked with them interpolated straight into the call.
+      assert.doesNotMatch(launcher, /& wsl\.exe [^\r\n]*\$\(id -u\)/);
+      assert.doesNotMatch(launcher, /^\s*\$\w+ = "[^\r\n]*\$\(id -u\)/m);
     }
+  });
+});
+
+test('WSL invocations are bounded so a wedged wsl.exe cannot block the loop', async () => {
+  await withWindowsService({}, async (service, harness, appData) => {
+    await service.installService();
+    const keepAwake = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-keepawake.ps1'), 'utf8');
+    const boot = readFileSync(join(appData, 'runnerize', 'runnerize-wsl-boot.ps1'), 'utf8');
+    // A hung probe would otherwise stall the holder without ever advancing $failures, and stall
+    // the boot launcher without ever reaching its deadline check.
+    assert.match(keepAwake, /if \(-not \$p\.WaitForExit\(60000\)\) \{ try \{ \$p\.Kill\(\) \} catch \{ \}; return 1 \}/);
+    assert.match(boot, /if \(-not \$p\.WaitForExit\(120000\)\) \{ try \{ \$p\.Kill\(\) \} catch \{ \}; return 1 \}/);
+    assert.match(keepAwake, /if \(\(Invoke-Wsl \$probeArgs\) -eq 0\)/);
+    assert.match(boot, /\$code = Invoke-Wsl \$startArgs/);
   });
 });
 

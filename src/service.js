@@ -26,8 +26,10 @@ const KEEPAWAKE_RETRY_SECONDS = 15;
 // before the holder retires. Long enough to ride out a restarting unit or a booting distro,
 // short enough that an uninstalled runnerize stops holding the host awake.
 const KEEPAWAKE_MAX_CONSECUTIVE_FAILURES = 20;
+const KEEPAWAKE_PROBE_TIMEOUT_MS = 60_000;
 const WSL_BOOT_DEADLINE_SECONDS = 600;
 const WSL_BOOT_RETRY_SECONDS = 15;
+const WSL_BOOT_ATTEMPT_TIMEOUT_MS = 120_000;
 const WSL_INSTALL_GUIDANCE = 'In an elevated PowerShell: wsl --install -d Ubuntu\nThen restart Windows if prompted and rerun this command.';
 const GITHUB_AUTH_GUIDANCE = 'Run: gh auth login\nOr set GH_TOKEN/GITHUB_TOKEN. The credential needs Administration, Actions, and Metadata access across all owned private repositories.';
 const DEFAULT_MACOS_IMAGE = 'ghcr.io/cirruslabs/macos-sequoia-base:latest';
@@ -1547,7 +1549,7 @@ async function installLogonTrigger(spec, { noElevate = false, elevationTimeoutMs
 }
 
 function wslTriggerSpec(context) {
-  const argument = `-d ${windowsCommandLineArg(context.distro)} -u ${windowsCommandLineArg(context.user)} -e bash -lc ${windowsCommandLineArg(systemdStartCommand())}`;
+  const argument = wslCommandLine(context, systemdStartCommand());
   return {
     taskName: SERVICE_NAME,
     startupFileName: 'runnerize.vbs',
@@ -1621,30 +1623,57 @@ function windowsTriggerSpec(launcherPath) {
 }
 
 // Arguments embedded in a generated .ps1 need PowerShell quoting, NOT the Win32 quoting used for
-// a Task Scheduler -Argument string. A double-quoted PowerShell string is expandable, so
-// `$(id -u)` and `$XDG_RUNTIME_DIR` get evaluated on the Windows side and never reach bash: the
-// probe shipped as `/run/user/4096` (Git Bash's id.exe) instead of the WSL uid, which made
-// `systemctl --user` fail every time. Single-quoted literals pass through verbatim.
-function powershellWslArgs(context, command) {
-  return `-d ${powershellLiteral(context.distro)} -u ${powershellLiteral(context.user)} -e bash -lc ${powershellLiteral(command)}`;
+// wsl.exe does NOT strip surrounding double quotes from -d/-u values. Passing `-d "Ubuntu"` on a
+// raw command line fails with WSL_E_DISTRO_NOT_FOUND and exit -1 (verified against WSL 2.6.3), so
+// a Task Scheduler task built that way never starts anything. The spawnSync call sites are
+// unaffected because they pass an argv array and Node leaves a bare word bare; only code that
+// builds a command-line STRING is exposed - a Task Scheduler -Argument, or
+// ProcessStartInfo.Arguments. The trailing -lc command is the exception: wsl.exe does honour
+// quoting there, and it must stay quoted because it contains spaces and semicolons.
+function wslCommandLine(context, command) {
+  for (const [label, value] of [['distro', context.distro], ['user', context.user]]) {
+    if (/[\s"]/.test(value)) {
+      throw new Error(`The WSL ${label} name ${JSON.stringify(value)} contains whitespace or a quote. wsl.exe cannot receive that on a generated command line, so the auto-start task would silently fail.`);
+    }
+  }
+  return `-d ${context.distro} -u ${context.user} -e bash -lc ${windowsCommandLineArg(command)}`;
+}
+
+// Emits a PowerShell helper that runs wsl.exe under a hard timeout. Without it a wedged wsl.exe
+// blocks the caller forever: the keep-awake holder would stop probing while never advancing its
+// failure counter, and the boot launcher would never reach its own deadline check. Windows
+// PowerShell 5.1 runs on .NET Framework, whose ProcessStartInfo has no ArgumentList, so the
+// argument string has to be a pre-built command line.
+function powershellWslInvoker(timeoutMs) {
+  return [
+    'function Invoke-Wsl([string]$argumentString) {',
+    '  $psi = New-Object System.Diagnostics.ProcessStartInfo',
+    "  $psi.FileName = 'wsl.exe'",
+    '  $psi.Arguments = $argumentString',
+    '  $psi.UseShellExecute = $false',
+    '  $psi.CreateNoWindow = $true',
+    '  $p = [System.Diagnostics.Process]::Start($psi)',
+    '  if ($null -eq $p) { return 1 }',
+    `  if (-not $p.WaitForExit(${timeoutMs})) { try { $p.Kill() } catch { }; return 1 }`,
+    '  return $p.ExitCode',
+    '}',
+  ];
 }
 
 function wslKeepAwakeSpec(context) {
   const launcherPath = windowsDataPath('runnerize-wsl-keepawake.ps1');
-  const activeArgs = powershellWslArgs(context, 'export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize');
+  const activeArgs = wslCommandLine(context, 'export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize');
   mkdirSync(dirname(launcherPath), { recursive: true });
   writeFileSync(launcherPath, [
     "$ErrorActionPreference = 'SilentlyContinue'",
     'Add-Type -Namespace Runnerize -Name Native -MemberDefinition \'[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);\'',
     "[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null",
+    ...powershellWslInvoker(KEEPAWAKE_PROBE_TIMEOUT_MS),
+    `$probeArgs = ${powershellLiteral(activeArgs)}`,
     '$failures = 0',
     'try {',
     '  while ($true) {',
-    // Seeded non-zero so a wsl.exe that never launches at all counts as a failure rather than
-    // inheriting a stale 0 from the previous iteration and reading as success.
-    '    $LASTEXITCODE = 1',
-    `    & wsl.exe ${activeArgs}`,
-    '    if ($LASTEXITCODE -eq 0) {',
+    '    if ((Invoke-Wsl $probeArgs) -eq 0) {',
     '      $failures = 0',
     `      Start-Sleep -Seconds ${KEEPAWAKE_POLL_SECONDS}`,
     '      continue',
@@ -1675,12 +1704,14 @@ function wslKeepAwakeSpec(context) {
 function wslBootSpec(context) {
   const launcherPath = windowsDataPath('runnerize-wsl-boot.ps1');
   const logPath = windowsDataPath('runnerize-wsl-boot.log');
-  const startArgs = powershellWslArgs(context, systemdStartCommand());
+  const startArgs = wslCommandLine(context, systemdStartCommand());
   mkdirSync(dirname(launcherPath), { recursive: true });
   writeFileSync(launcherPath, [
     "$ErrorActionPreference = 'SilentlyContinue'",
     `$log = ${powershellLiteral(logPath)}`,
     'function Write-Diag($message) { "$([DateTime]::UtcNow.ToString(\'o\')) $message" | Add-Content -LiteralPath $log }',
+    ...powershellWslInvoker(WSL_BOOT_ATTEMPT_TIMEOUT_MS),
+    `$startArgs = ${powershellLiteral(startArgs)}`,
     // S4U runs without an interactive profile, and a WSL2 distro is registered in its owning
     // user's hive. Recording the effective identity and whether that hive is actually visible is
     // the difference between a diagnosable cold-boot failure and a silent one that looks
@@ -1690,10 +1721,9 @@ function wslBootSpec(context) {
     `$deadline = (Get-Date).AddSeconds(${WSL_BOOT_DEADLINE_SECONDS})`,
     'while ((Get-Date) -lt $deadline) {',
     '  Write-Diag "wsl --list --verbose: $(& wsl.exe --list --verbose 2>&1)"',
-    '  $LASTEXITCODE = 1',
-    `  & wsl.exe ${startArgs}`,
-    "  if ($LASTEXITCODE -eq 0) { Write-Diag 'dispatcher start succeeded'; exit 0 }",
-    '  Write-Diag "dispatcher start failed with exit code $LASTEXITCODE; retrying"',
+    '  $code = Invoke-Wsl $startArgs',
+    "  if ($code -eq 0) { Write-Diag 'dispatcher start succeeded'; exit 0 }",
+    '  Write-Diag "dispatcher start failed with exit code $code; retrying"',
     `  Start-Sleep -Seconds ${WSL_BOOT_RETRY_SECONDS}`,
     '}',
     // Exit non-zero so Task Scheduler's restart policy engages. Falling out of the loop silently
