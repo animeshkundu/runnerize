@@ -11,7 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,30 @@ function npmRun(args, options = {}) {
 function run(command, args, options = {}) {
   return spawnSync(command, args, { encoding: 'utf8', windowsHide: true, ...options });
 }
+
+test('the CLI runs when reached through a symlinked path', { skip: process.platform === 'win32' && 'symlink creation needs elevation on Windows' }, () => {
+  // ESM resolves import.meta.url through symlinks while argv[1] keeps the path as typed, so a
+  // verbatim comparison of the two decides "was I run directly?" incorrectly and main() never
+  // fires — the process exits 0 having printed nothing. On macOS this hits every $TMPDIR path,
+  // because /var/folders/... is a symlink to /private/var/folders/....
+  const staging = mkdtempSync(join(tmpdir(), 'runnerize-symlink-'));
+  try {
+    const real = join(staging, 'real');
+    const link = join(staging, 'link');
+    cpSync(join(projectRoot, 'bin'), join(real, 'bin'), { recursive: true });
+    cpSync(join(projectRoot, 'src'), join(real, 'src'), { recursive: true });
+    cpSync(join(projectRoot, 'package.json'), join(real, 'package.json'));
+    symlinkSync(real, link, 'dir');
+
+    for (const [label, root] of [['real path', real], ['symlink', link]]) {
+      const result = run(process.execPath, [join(root, 'bin', 'runnerize.js'), '--help']);
+      assert.match(result.stdout, /runnerize - on-demand ephemeral GitHub Actions runners/,
+        `the CLI produced no output via its ${label}`);
+    }
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+});
 
 test('the published package installs and runs from an npm layout', { timeout: 300_000 }, () => {
   const staging = mkdtempSync(join(tmpdir(), 'runnerize-pack-'));

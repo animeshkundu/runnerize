@@ -16,7 +16,8 @@ import {
 import {
   createGuardLease, guardOff, guardStatus, installGuard, runGuardRecover, runGuardWatch, uninstallGuard,
 } from '../src/guard.js';
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isSea } from 'node:sea';
 
 const HELP = `runnerize - on-demand ephemeral GitHub Actions runners
@@ -306,10 +307,23 @@ export async function main() {
   }
 }
 
-const invokedDirectly = isSea() || process.argv[1]
-  && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Comparing the module URL to argv[1] verbatim breaks wherever the entrypoint is reached
+// through a symlink: ESM resolves import.meta.url to the real path, while argv[1] keeps the
+// path as typed. On macOS every $TMPDIR path is /var/folders/... symlinked to /private/var/...,
+// so the CLI would exit 0 having silently done nothing. Compare real paths instead, and fall
+// back to the URL comparison if either path cannot be resolved.
+function invokedDirectly() {
+  if (isSea()) return true;
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entry);
+  } catch {
+    return import.meta.url === pathToFileURL(entry).href;
+  }
+}
 
-if (invokedDirectly) {
+if (invokedDirectly()) {
   main().catch((error) => {
     console.error(`runnerize: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
