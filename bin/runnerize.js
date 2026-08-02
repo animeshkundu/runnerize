@@ -16,6 +16,7 @@ import {
 import {
   createGuardLease, guardOff, guardStatus, installGuard, runGuardRecover, runGuardWatch, uninstallGuard,
 } from '../src/guard.js';
+import { pathToFileURL } from 'node:url';
 
 const HELP = `runnerize - on-demand ephemeral GitHub Actions runners
 
@@ -200,7 +201,7 @@ async function runForeground(args) {
   await runDispatcher({ ...options, signal: controller.signal });
 }
 
-async function main() {
+export async function main() {
   const [command = '--help', ...args] = process.argv.slice(2);
 
   switch (command) {
@@ -304,7 +305,12 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(`runnerize: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
-});
+const invokedDirectly = process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
+  main().catch((error) => {
+    console.error(`runnerize: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  });
+}

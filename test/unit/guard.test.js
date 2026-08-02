@@ -13,6 +13,7 @@ import {
   shutdownGuardInstallScript,
   uninstallGuard,
 } from '../../src/guard.js';
+import { RUNNERIZE_VERSION } from '../../src/version.js';
 
 function spawnStub({ stdout = '', stderr = '', status = 0 } = {}) {
   const calls = [];
@@ -156,6 +157,35 @@ test('--shutdown-guard installs Tier-1 and the SYSTEM startup watchdog in one el
   assert.match(command, /Authenticated Users/);
 });
 
+test('shutdown guard task consumes its configured release entrypoint', () => {
+  const script = shutdownGuardInstallScript({
+    guardRoot: 'C:\\ProgramData\\runnerize\\guard',
+    guardAppRoot: 'C:\\ProgramData\\runnerize\\guard\\app',
+    guardEntrypoint: 'runnerize.mjs',
+    packageRoot: 'C:\\runnerize',
+  });
+  const registration = [...script.matchAll(/-EncodedCommand '([^']+)'/g)]
+    .map((match) => Buffer.from(match[1], 'base64').toString('utf16le'))
+    .find((value) => /runnerize-guard-watch/.test(value));
+  assert.match(registration, /-Argument '"C:\\ProgramData\\runnerize\\guard\\app\\runnerize\.mjs" guard-watch'/);
+  assert.doesNotMatch(registration, /bin\\runnerize\.js/);
+});
+
+test('shutdown guard defaults to an immutable versioned release and supports a single artifact', () => {
+  const script = shutdownGuardInstallScript({
+    guardRoot: 'C:\\ProgramData\\runnerize\\guard',
+    packageRoot: 'C:\\runnerize',
+    artifactLayout: 'single',
+    bundleExists: () => true,
+  });
+  const release = script.match(/releases\\(0\.9\.5\.\d+\.\d+)\.new/)?.[1];
+  assert.ok(release, 'guard app release includes version, timestamp, and process id');
+  assert.match(script, /Copy-Item -LiteralPath 'C:\\runnerize\\dist\\runnerize\.mjs' -Destination 'C:\\ProgramData\\runnerize\\guard\\releases\\[^']+\\bin\\runnerize\.js' -Force/);
+  assert.doesNotMatch(script, /Copy-Item -LiteralPath 'C:\\runnerize\\src'/);
+  assert.match(script, /"layout":"single"/);
+  assert.doesNotMatch(script, new RegExp(`Remove-Item -LiteralPath 'C:\\\\ProgramData\\\\runnerize\\\\guard\\\\releases\\\\${release}'`));
+});
+
 test('SYSTEM task script uses startup, highest service-account principals', () => {
   const script = shutdownGuardInstallScript({
     guardRoot: 'C:\\ProgramData\\runnerize\\guard',
@@ -174,7 +204,22 @@ test('SYSTEM task script uses startup, highest service-account principals', () =
   assert.match(registration, /RestartInterval \(New-TimeSpan -Minutes 1\) -RestartCount 999/);
   assert.ok(!taskScripts.some((value) => /Register-ScheduledTask.*runnerize-guard-recover/.test(value)));
   assert.ok(script.indexOf('Set-Acl -LiteralPath') < script.indexOf("Copy-Item -LiteralPath 'C:\\runnerize\\bin'"));
+  assert.match(script, /Copy-Item -LiteralPath 'C:\\runnerize\\bin' -Destination 'C:\\ProgramData\\runnerize\\guard\\app\.new' -Recurse -Force/);
+  assert.match(script, /Copy-Item -LiteralPath 'C:\\runnerize\\src' -Destination 'C:\\ProgramData\\runnerize\\guard\\app\.new' -Recurse -Force/);
+  assert.match(script, /Copy-Item -LiteralPath 'C:\\runnerize\\package\.json' -Destination 'C:\\ProgramData\\runnerize\\guard\\app\.new' -Force/);
+  const releaseLine = script.split('\r\n').find((line) => /release\.json/.test(line));
+  assert.ok(releaseLine);
+  const releaseJson = releaseLine.match(/WriteAllText\('[^']*release\.json', '((?:[^']|'')*)'/)?.[1]?.replaceAll("''", "'");
+  const metadata = JSON.parse(releaseJson);
+  assert.equal(metadata.version, RUNNERIZE_VERSION);
+  assert.equal(metadata.role, 'guard');
+  assert.equal(metadata.entrypoint, 'bin/runnerize.js');
+  assert.equal((script.match(/New-Item -ItemType Directory -Path 'C:\\ProgramData\\runnerize\\guard\\app\.new' -Force/g) ?? []).length, 1);
+  assert.match(script, /Move-Item -LiteralPath 'C:\\ProgramData\\runnerize\\guard\\app\.new' -Destination 'C:\\ProgramData\\runnerize\\guard\\app' -Force/);
+  assert.ok(script.indexOf("Copy-Item -LiteralPath 'C:\\runnerize\\bin'") < script.indexOf("Move-Item -LiteralPath 'C:\\ProgramData\\runnerize\\guard\\app.new'"));
+  assert.ok(script.indexOf("Move-Item -LiteralPath 'C:\\ProgramData\\runnerize\\guard\\app.new'") < script.indexOf("Set-Acl -LiteralPath 'C:\\ProgramData\\runnerize\\guard\\app' -AclObject $appAcl"));
   assert.match(script, /Set-Acl -LiteralPath 'C:\\ProgramData\\runnerize\\guard\\app' -AclObject \$appAcl/);
+  assert.match(registration, /New-ScheduledTaskAction -Execute '[^']*node(?:\.exe)?' -Argument '"C:\\ProgramData\\runnerize\\guard\\app\\bin\\runnerize\.js" guard-watch'/i);
 });
 
 test('shutdown uninstall stops tasks before restoring and deleting state', async () => {

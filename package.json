@@ -12,11 +12,14 @@
   "files": [
     "bin",
     "src",
+    "tools",
+    "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "start": "node bin/runnerize.js",
+    "build": "node tools/bundle.mjs",
     "test": "node --test test/unit/*.test.js",
     "test:e2e": "node --test test/e2e/*.test.js",
     "test:all": "node --test test/unit/*.test.js test/e2e/*.test.js"

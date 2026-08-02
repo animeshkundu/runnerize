@@ -40,15 +40,14 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-      # Syntax-check the CLI entrypoints and every source module without
-      # executing anything (zero deps, so nothing else to build). Covers every
-      # file under bin/ (CLI binaries may be extensionless) plus every .js under
-      # src/. Missing directories are tolerated so this never crashes on layout
-      # changes.
-      - name: Parse-check bin/** and src/**/*.js
+      # Syntax-check the CLI entrypoints and every source/tool module without
+      # executing anything. Covers every file under bin/ (CLI binaries may be
+      # extensionless) plus JavaScript modules under src/ and tools/. Missing
+      # directories are tolerated so this never crashes on layout changes.
+      - name: Parse-check bin/**, src/**/*.js, and tools/**/*.mjs
         run: |
           set -euo pipefail
-          files="$( { find bin -type f 2>/dev/null; find src -type f -name '*.js' 2>/dev/null; } | sort )"
+          files="$( { find bin -type f 2>/dev/null; find src tools -type f \( -name '*.js' -o -name '*.mjs' \) 2>/dev/null; } | sort )"
           if [ -z "$files" ]; then
             echo "::error::no files found to syntax-check"
             exit 1
@@ -57,6 +56,27 @@ jobs:
             echo "node --check $f"
             node --check "$f"
           done
+
+  bundle:
+    name: Bundle & determinism
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Build twice and verify deterministic output
+        run: |
+          set -euo pipefail
+          npm run build
+          first="$(sha256sum dist/runnerize.mjs | cut -d' ' -f1)"
+          npm run build
+          second="$(sha256sum dist/runnerize.mjs | cut -d' ' -f1)"
+          test "$first" = "$second"
+          node tools/bundle.mjs --check
 
   unit:
     name: Unit tests (Node ${{ matrix.node }})
