@@ -9,6 +9,9 @@ import { DEFAULT_LINUX_IMAGE, kvmStatus } from './sandbox/container.js';
 import { RUNNERIZE_VERSION } from './version.js';
 
 const SERVICE_NAME = 'runnerize';
+const WSL_KEEPAWAKE_TASK = 'runnerize-wsl-keepawake';
+const WSL_KEEPAWAKE_STARTUP_FILE = `${WSL_KEEPAWAKE_TASK}.vbs`;
+const WSL_KEEPAWAKE_LOG_FILE = `${WSL_KEEPAWAKE_TASK}.log`;
 const DEFAULT_WSL_NODE_VERSION = 'v24.18.0';
 const DEFAULT_WSL_NODE_SHA256 = '55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742';
 const binPath = fileURLToPath(new URL('../bin/runnerize.js', import.meta.url));
@@ -20,13 +23,6 @@ const SYSTEMD_VERIFY_TIMEOUT_MS = 5_000;
 const SYSTEMD_VERIFY_RETRY_MS = 100;
 const INSTALL_TIMEOUT_MS = 120_000;
 const NPM_LOOKUP_TIMEOUT_MS = 10_000;
-const KEEPAWAKE_POLL_SECONDS = 30;
-const KEEPAWAKE_RETRY_SECONDS = 15;
-// 20 consecutive failures at 15s apart, so roughly five minutes of sustained unavailability
-// before the holder retires. Long enough to ride out a restarting unit or a booting distro,
-// short enough that an uninstalled runnerize stops holding the host awake.
-const KEEPAWAKE_MAX_CONSECUTIVE_FAILURES = 20;
-const KEEPAWAKE_PROBE_TIMEOUT_MS = 60_000;
 const WSL_BOOT_DEADLINE_SECONDS = 600;
 const WSL_BOOT_RETRY_SECONDS = 15;
 const WSL_BOOT_ATTEMPT_TIMEOUT_MS = 120_000;
@@ -254,6 +250,34 @@ function windowsServiceState() {
   };
 }
 
+function wslHolderState() {
+  const principal = scheduledTaskPrincipal(WSL_KEEPAWAKE_TASK);
+  const registered = Boolean(principal);
+  const bootTaskName = `${WSL_KEEPAWAKE_TASK}-boot`;
+  const bootPrincipal = scheduledTaskPrincipal(bootTaskName);
+  const bootRegistered = Boolean(bootPrincipal);
+  return {
+    registered,
+    running: registered && scheduledTaskIsRunning(WSL_KEEPAWAKE_TASK),
+    fallback: existsSync(windowsStartupPath(WSL_KEEPAWAKE_STARTUP_FILE)),
+    bootRegistered,
+    bootRunning: bootRegistered && scheduledTaskIsRunning(bootTaskName),
+  };
+}
+
+function unavailableWslServiceState(distro, runtimeState) {
+  return {
+    backend: distro ? `linux (WSL ${distro})` : 'linux (WSL)',
+    installed: null,
+    version: null,
+    running: false,
+    runtimeState,
+    root: null,
+    environment: new Map(),
+    holder: wslHolderState(),
+  };
+}
+
 function wslServiceState(context) {
   const unitPath = `${context.home}/.config/systemd/user/${SERVICE_NAME}.service`;
   let unit = '';
@@ -287,7 +311,16 @@ function wslServiceState(context) {
     (fileName) => wslCapture(context.distro, context.user, ['cat', fileName], { timeout: PROBE_TIMEOUT_MS }),
     effectiveEnvironment,
   );
-  return { backend: `linux (WSL ${context.distro})`, installed: Boolean(root), version, running, root, environment };
+  return {
+    backend: `linux (WSL ${context.distro})`,
+    installed: Boolean(root),
+    version,
+    running,
+    runtimeState: root ? running ? 'running' : 'unit-inactive' : 'not-installed',
+    root,
+    environment,
+    holder: wslHolderState(),
+  };
 }
 
 const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -411,12 +444,14 @@ function wslImageState(context, state) {
 async function imageStates(states) {
   const serviceStateList = states ?? await serviceStates();
   if (platform() === 'win32') {
+    const state = serviceStateList.find(({ backend }) => backend.startsWith('linux (WSL'));
+    if (!state || state.runtimeState === 'vm-stopped' || state.runtimeState === 'unknown') {
+      return [{ reference: configuredLinuxImage(state), runtime: null, digest: null, created: null }];
+    }
     try {
-      const context = resolveWslContext();
-      const state = serviceStateList.find(({ backend }) => backend.startsWith('linux (WSL'));
-      return [wslImageState(context, state)];
+      return [wslImageState(resolveWslContext(), state)];
     } catch {
-      return [{ reference: configuredLinuxImage(), runtime: null, digest: null, created: null }];
+      return [{ reference: configuredLinuxImage(state), runtime: null, digest: null, created: null }];
     }
   }
   return [await nativeImageState(serviceStateList[0])];
@@ -449,13 +484,25 @@ async function refreshLinuxImages(state) {
   }
 }
 
-async function serviceStates() {
+async function serviceStates({ allowBoot = false } = {}) {
   if (platform() === 'win32') {
     const states = [];
     try {
-      states.push(wslServiceState(resolveWslContext()));
+      const distro = resolveWslDistro();
+      if (!allowBoot) {
+        const runningDistros = wslRunningDistros();
+        if (runningDistros === null) {
+          states.push(unavailableWslServiceState(distro, 'unknown'));
+        } else if (!runningDistros.some((name) => name.toLowerCase() === distro.toLowerCase())) {
+          states.push(unavailableWslServiceState(distro, 'vm-stopped'));
+        } else {
+          states.push(wslServiceState(resolveWslContext()));
+        }
+      } else {
+        states.push(wslServiceState(resolveWslContext()));
+      }
     } catch {
-      states.push({ backend: 'linux (WSL)', installed: false, version: null, running: false, root: null });
+      states.push(unavailableWslServiceState(null, 'unknown'));
     }
     states.push(windowsServiceState());
     return states;
@@ -515,8 +562,19 @@ export async function serviceStatus({ fetchImpl } = {}) {
   console.log(`Command package: runnerize ${RUNNERIZE_VERSION}`);
   console.log(`Latest on npm: ${latestVersion ?? 'unknown (offline or unavailable)'}`);
   for (const state of states) {
-    const relation = versionRelation(state.version, latestVersion);
-    console.log(`${state.backend}: installed=${state.version ?? 'no'} running=${state.running ? 'yes' : 'no'} status=${relation}`);
+    const relation = state.installed === null ? 'UNKNOWN' : versionRelation(state.version, latestVersion);
+    const installed = state.installed === null ? 'unknown' : state.version ?? 'no';
+    console.log(`${state.backend}: installed=${installed} running=${state.running ? 'yes' : 'no'}${state.runtimeState ? ` runtime=${state.runtimeState}` : ''} status=${relation}`);
+    if (state.holder) {
+      const holder = [];
+      if (state.holder.registered) holder.push(`task=${state.holder.running ? 'running' : 'not-running'}`);
+      if (state.holder.bootRegistered) holder.push(`boot-task=${state.holder.bootRunning ? 'running' : 'not-running'}`);
+      if (state.holder.fallback) holder.push('startup-fallback=yes');
+      console.log(`WSL holder: ${holder.join(' ') || 'not-installed'}`);
+    }
+    if (state.runtimeState === 'vm-stopped') {
+      console.log(`WSL is stopped. Check the ${WSL_KEEPAWAKE_TASK} holder and ${windowsDataPath(WSL_KEEPAWAKE_LOG_FILE)}.`);
+    }
   }
   for (const image of images) {
     console.log(`Linux image: reference=${image.reference} runtime=${image.runtime ?? 'unavailable'} digest=${image.digest ?? 'not present'} created=${image.created ?? 'unknown'}`);
@@ -565,7 +623,7 @@ export async function updateService({ force = false, fetchImpl, installVersion =
   const latestVersion = await latestPublishedVersion({ fetchImpl });
   if (!latestVersion) throw new Error('Could not resolve the latest runnerize version from npm. Check the network connection and try again.');
 
-  const states = await serviceStates();
+  const states = await serviceStates({ allowBoot: true });
   const installedStates = states.filter((state) => state.installed);
   if (!installedStates.length) {
     throw new Error('No runnerize service is installed on this host. Run `runnerize service install` first.');
@@ -923,6 +981,12 @@ export function powershellLiteral(value) {
 
 function cleanWslOutput(value) {
   return String(value).replaceAll('\0', '').replaceAll('\r', '').replace(/^[﻿�]+/, '').trim();
+}
+
+function wslRunningDistros() {
+  const result = captureResult('wsl.exe', ['-l', '-q', '--running'], { timeout: PROBE_TIMEOUT_MS });
+  if (result.status !== 0) return null;
+  return cleanWslOutput(result.stdout).split('\n').map((line) => line.trim()).filter(Boolean);
 }
 
 function wslArgs(distro, user, args) {
@@ -1440,7 +1504,7 @@ function scheduledTaskIsRunning(taskName) {
   const script = `$task = Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue; if ($null -eq $task -or $task.State -ne 'Running') { exit 1 }`;
   return captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-  ]).status === 0;
+  ], { timeout: PROBE_TIMEOUT_MS }).status === 0;
 }
 
 function stopScheduledTask(taskName) {
@@ -1449,6 +1513,24 @@ function stopScheduledTask(taskName) {
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
   ]);
   if (result.status !== 0) throw new Error(`Could not stop ${taskName}.`);
+}
+
+function waitForScheduledTaskStop(taskName, launcherPath) {
+  const holderArgument = `-File ${windowsCommandLineArg(launcherPath)}`;
+  const script = [
+    `$deadline = [DateTime]::UtcNow.AddMilliseconds(${Math.min(PROBE_TIMEOUT_MS, 5_000)})`,
+    `$holderArgument = ${powershellLiteral(holderArgument)}`,
+    'while ($true) {',
+    `  $task = Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue`,
+    "  $holder = Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq 'powershell.exe' -and $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($holderArgument, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -First 1",
+    "  if (($null -eq $task -or $task.State -ne 'Running') -and $null -eq $holder) { exit 0 }",
+    '  if ([DateTime]::UtcNow -ge $deadline) { exit 1 }',
+    '  Start-Sleep -Milliseconds 100',
+    '}',
+  ].join('; ');
+  return captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ], { timeout: PROBE_TIMEOUT_MS }).status === 0;
 }
 
 function startScheduledTask(taskName) {
@@ -1463,7 +1545,7 @@ function scheduledTaskPrincipal(taskName) {
   const script = `$task = Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 1 }; [Console]::Out.Write($task.Principal.UserId)`;
   const result = captureResult(powershellPath, [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-  ]);
+  ], { timeout: PROBE_TIMEOUT_MS });
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
@@ -1660,40 +1742,79 @@ function powershellWslInvoker(timeoutMs) {
   ];
 }
 
-function wslKeepAwakeSpec(context) {
-  const launcherPath = windowsDataPath('runnerize-wsl-keepawake.ps1');
-  const activeArgs = wslCommandLine(context, 'export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-active --quiet runnerize');
+function writeWslKeepAwake(context, sleepPath) {
+  const launcherPath = windowsDataPath(`${WSL_KEEPAWAKE_TASK}.ps1`);
+  const logPath = windowsDataPath(WSL_KEEPAWAKE_LOG_FILE);
   mkdirSync(dirname(launcherPath), { recursive: true });
-  writeFileSync(launcherPath, [
-    "$ErrorActionPreference = 'SilentlyContinue'",
-    'Add-Type -Namespace Runnerize -Name Native -MemberDefinition \'[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);\'',
-    "[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null",
-    ...powershellWslInvoker(KEEPAWAKE_PROBE_TIMEOUT_MS),
-    `$probeArgs = ${powershellLiteral(activeArgs)}`,
-    '$failures = 0',
+  const script = [
+    "$ErrorActionPreference = 'Continue'",
+    `$distro = ${powershellLiteral(context.distro)}`,
+    `$user = ${powershellLiteral(context.user)}`,
+    `$log = ${powershellLiteral(logPath)}`,
+    `$sleepPath = ${powershellLiteral(sleepPath)}`,
+    '$created = $false',
+    `$mutex = [Threading.Mutex]::new($true, ${powershellLiteral(`Local\\${WSL_KEEPAWAKE_TASK}`)}, [ref]$created)`,
+    'if (-not $created) { $mutex.Dispose(); exit 0 }',
+    'function Write-HolderLog {',
+    '  param([string]$Message)',
+    '  try {',
+    '    if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).Length -gt 1MB) { Set-Content -LiteralPath $log -Value \"\" }',
+    "    Add-Content -LiteralPath $log -Value ((Get-Date).ToString('o') + ' ' + $Message)",
+    '  } catch {}',
+    '}',
+    '$wakeAvailable = $false',
+    '$wake = $false',
+    'function Set-WakeState {',
+    '  param([bool]$Hold)',
+    '  if (-not $script:wakeAvailable -or $script:wake -eq $Hold) { return }',
+    '  try {',
+    "    $flags = if ($Hold) { '80000001' } else { '80000000' }",
+    '    [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32($flags, 16)) | Out-Null',
+    '    $script:wake = $Hold',
+    "  } catch { Write-HolderLog ('Could not change sleep inhibition: ' + $_.Exception.Message) }",
+    '}',
     'try {',
+    '  try {',
+    `    Add-Type -Namespace Runnerize -Name Native -MemberDefinition ${powershellLiteral('[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);')}`,
+    '    $wakeAvailable = $true',
+    "  } catch { Write-HolderLog ('Sleep inhibition unavailable: ' + $_.Exception.Message) }",
+    '  $backoff = @(0, 1, 2, 4, 8, 16, 30)',
+    '  $failures = 0',
     '  while ($true) {',
-    '    if ((Invoke-Wsl $probeArgs) -eq 0) {',
+    '    if (-not (Test-Path -LiteralPath $PSCommandPath)) { break }',
+    '    $delay = $backoff[[Math]::Min($failures, $backoff.Count - 1)]',
+    '    Set-WakeState $false',
+    '    if ($delay -gt 0) { Start-Sleep -Seconds $delay }',
+    '    Set-WakeState $true',
+    '    $started = [DateTime]::UtcNow',
+    '    Write-HolderLog (\'Starting held WSL session for \' + $distro)',
+    '    & wsl.exe -d $distro -u $user --exec $sleepPath 2147483647 2>&1 | ForEach-Object { Write-HolderLog ([string]$_) }',
+    '    $exitCode = $LASTEXITCODE',
+    '    $heldSeconds = ([DateTime]::UtcNow - $started).TotalSeconds',
+    '    Set-WakeState $false',
+    "    Write-HolderLog ('Held WSL session exited with code ' + $exitCode + ' after ' + [Math]::Round($heldSeconds, 1) + ' seconds')",
+    '    if ($heldSeconds -ge 60) {',
     '      $failures = 0',
-    `      Start-Sleep -Seconds ${KEEPAWAKE_POLL_SECONDS}`,
-    '      continue',
+    '    } else {',
+    '      $failures = [Math]::Min($failures + 1, $backoff.Count - 1)',
     '    }',
-    // A single probe failure is not proof runnerize is gone: the unit may be restarting, or the
-    // distro may still be booting. Retiring on the first failure leaves the distro to be idle-
-    // terminated seconds later, which is the whole problem this holder exists to prevent.
-    '    $failures++',
-    `    if ($failures -ge ${KEEPAWAKE_MAX_CONSECUTIVE_FAILURES}) { exit 1 }`,
-    `    Start-Sleep -Seconds ${KEEPAWAKE_RETRY_SECONDS}`,
     '  }',
     '} finally {',
-    "  [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) | Out-Null",
+    '  Set-WakeState $false',
+    '  $mutex.ReleaseMutex()',
+    '  $mutex.Dispose()',
     '}',
     '',
-  ].join('\r\n'));
+  ].join('\r\n');
+  writeFileSync(launcherPath, script);
+  return launcherPath;
+}
+
+function wslKeepAwakeSpec(launcherPath) {
   const argument = `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${windowsCommandLineArg(launcherPath)}`;
   return {
-    taskName: 'runnerize-wsl-keepawake',
-    startupFileName: 'runnerize-wsl-keepawake.vbs',
+    taskName: WSL_KEEPAWAKE_TASK,
+    startupFileName: WSL_KEEPAWAKE_STARTUP_FILE,
     execute: powershellPath,
     argument,
     launcherPath,
@@ -1814,7 +1935,7 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
   const audit = await auditWindowsPrerequisites({ noElevate, elevationTimeoutMs });
   if (audit.rebootRequired) return;
 
-  const previousStates = update ? await serviceStates() : [];
+  const previousStates = update ? await serviceStates({ allowBoot: true }) : [];
   const requiredBackends = new Set(previousStates.filter((state) => state.installed).map((state) => state.backend.startsWith('linux (WSL') ? 'linux' : state.backend));
   const statuses = [];
   let context;
@@ -1910,7 +2031,19 @@ async function installWindows({ noElevate = false, elevationTimeoutMs, noGuard =
   // distro regardless of whether the host is awake. Gating this on !windowsInstalled left the Linux
   // dispatcher being torn down seconds after every start on hosts that have both backends.
   if (context && linuxInstalled) {
-    const keepAwake = wslKeepAwakeSpec(context);
+    let sleepPath = '/usr/bin/sleep';
+    try {
+      sleepPath = wslCapture(context.distro, context.user, ['sh', '-c', 'command -v sleep'], { timeout: PROBE_TIMEOUT_MS }) || sleepPath;
+    } catch {
+      // The conventional path remains a useful fallback on distros without a working shell lookup.
+    }
+    const keepAwake = wslKeepAwakeSpec(writeWslKeepAwake(context, sleepPath));
+    if (scheduledTaskIsRunning(keepAwake.taskName)) {
+      stopScheduledTask(keepAwake.taskName);
+      if (!waitForScheduledTaskStop(keepAwake.taskName, keepAwake.launcherPath)) {
+        console.warn(`The previous ${keepAwake.taskName} holder did not stop within ${Math.min(PROBE_TIMEOUT_MS, 5_000)}ms; continuing registration.`);
+      }
+    }
     const trigger = await installLogonTrigger(keepAwake, { noElevate, elevationTimeoutMs });
     console.log(`WSL host keep-awake trigger: ${trigger.kind} (${trigger.detail})`);
 
@@ -2002,7 +2135,14 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
     ]));
   }
 
-  for (const taskName of [SERVICE_NAME, `${SERVICE_NAME}-boot`, 'runnerize-windows', 'runnerize-wsl-keepawake', 'runnerize-wsl-keepawake-boot']) {
+  if (scheduledTaskIsRunning(WSL_KEEPAWAKE_TASK)) {
+    try {
+      stopScheduledTask(WSL_KEEPAWAKE_TASK);
+    } catch (error) {
+      console.warn(`Could not stop the ${WSL_KEEPAWAKE_TASK} task before removal: ${error.message}`);
+    }
+  }
+  for (const taskName of [SERVICE_NAME, `${SERVICE_NAME}-boot`, 'runnerize-windows', WSL_KEEPAWAKE_TASK, `${WSL_KEEPAWAKE_TASK}-boot`]) {
     const script = `Get-ScheduledTask -TaskName ${powershellLiteral(taskName)} -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop`;
     const taskRemoval = captureResult(powershellPath, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', taskSchedulerAttemptScript(script),
@@ -2026,10 +2166,24 @@ async function uninstallWindows({ noElevate = false, elevationTimeoutMs, noGuard
       console.warn(`Could not remove the ${taskName} task: ${detail}. Remove it manually in Task Scheduler if it still exists.`);
     }
   }
-  for (const fileName of ['runnerize.vbs', 'runnerize-windows.vbs', 'runnerize-wsl-keepawake.vbs']) {
+  const holderArgument = `-File ${windowsCommandLineArg(windowsDataPath(`${WSL_KEEPAWAKE_TASK}.ps1`))}`;
+  const holderProcessStop = `$holderArgument = ${powershellLiteral(holderArgument)}; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -ieq 'powershell.exe' -and $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($holderArgument, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+  captureResult(powershellPath, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', holderProcessStop,
+  ], { timeout: PROBE_TIMEOUT_MS });
+  if (context) {
+    const termination = captureResult('wsl.exe', ['--terminate', context.distro], { timeout: PROBE_TIMEOUT_MS });
+    if (termination.status === 0) {
+      console.log(`Terminated WSL distro ${context.distro} to release any surviving keep-awake session.`);
+    } else {
+      const detail = termination.stderr?.trim() || termination.stdout?.trim() || termination.error?.message || `exit code ${termination.status}`;
+      console.warn(`Could not terminate WSL distro ${context.distro}: ${detail}. A surviving keep-awake session may keep it running.`);
+    }
+  }
+  for (const fileName of ['runnerize.vbs', 'runnerize-windows.vbs', WSL_KEEPAWAKE_STARTUP_FILE]) {
     rmSync(windowsStartupPath(fileName), { force: true });
   }
-  for (const artifact of ['app', 'releases', 'current-release', 'runnerize-windows.ps1', 'runnerize-wsl-keepawake.ps1', 'runnerize-wsl-boot.ps1', 'runnerize-wsl-boot.log', 'windows.token', 'runnerize-windows.log']) {
+  for (const artifact of ['app', 'releases', 'current-release', 'runnerize-windows.ps1', `${WSL_KEEPAWAKE_TASK}.ps1`, 'runnerize-wsl-boot.ps1', 'runnerize-wsl-boot.log', 'windows.token', 'runnerize-windows.log', WSL_KEEPAWAKE_LOG_FILE]) {
     rmSync(windowsDataPath(artifact), { recursive: true, force: true });
   }
   if (!noGuard && !noElevate) {
