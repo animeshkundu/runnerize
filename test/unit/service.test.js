@@ -977,7 +977,14 @@ test('systemd install materializes a cache-independent package release', async (
 
 test('single-artifact systemd install writes exactly bundle, tombstone, and metadata and status reads it', async () => {
   const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBundle = process.env.RUNNERIZE_BUNDLE;
+  // Point at a stand-in bundle so the unit suite stays hermetic: CI runs unit tests without
+  // building dist/, and a test that needs a build artifact is a test that fails on a clean clone.
+  const bundleDir = mkdtempSync(join(tmpdir(), 'runnerize-bundle-stub-'));
+  const bundlePath = join(bundleDir, 'runnerize.mjs');
+  writeFileSync(bundlePath, '#!/usr/bin/env node\nconsole.log("stub");\n');
   process.env.RUNNERIZE_ARTIFACT = 'single';
+  process.env.RUNNERIZE_BUNDLE = bundlePath;
   try {
     await withLinuxService({}, async (service, _calls, home) => {
       await service.installService();
@@ -1003,23 +1010,29 @@ test('single-artifact systemd install writes exactly bundle, tombstone, and meta
   } finally {
     if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
     else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBundle === undefined) delete process.env.RUNNERIZE_BUNDLE;
+    else process.env.RUNNERIZE_BUNDLE = oldBundle;
+    rmSync(bundleDir, { recursive: true, force: true });
   }
 });
 
 test('single-artifact request without a bundle fails without a partial release', async () => {
   const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBundle = process.env.RUNNERIZE_BUNDLE;
   process.env.RUNNERIZE_ARTIFACT = 'single';
-  const originalExists = fs.existsSync;
-  const restoreFs = patchFs({ existsSync: (path) => String(path).endsWith(join('dist', 'runnerize.mjs')) ? false : originalExists(path) });
+  // Point at a path that cannot exist rather than patching fs, so the test does not depend on
+  // whether dist/ happens to be built in this checkout.
+  process.env.RUNNERIZE_BUNDLE = join(tmpdir(), 'runnerize-absent-bundle', 'runnerize.mjs');
   try {
     await withLinuxService({}, async (service, _calls, home) => {
-      await assert.rejects(service.installService(), /requires the prebuilt dist\/runnerize\.mjs bundle/);
+      await assert.rejects(service.installService(), /requires a prebuilt bundle at/);
       assert.deepEqual(readdirSync(join(home, '.local', 'share', 'runnerize-service', 'releases')), []);
     });
   } finally {
-    restoreFs();
     if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
     else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBundle === undefined) delete process.env.RUNNERIZE_BUNDLE;
+    else process.env.RUNNERIZE_BUNDLE = oldBundle;
   }
 });
 
@@ -1053,6 +1066,35 @@ test('pending operation recovery restores last-known-good and marks failure', as
     service.recoverPendingOperation({ root, restore: (target) => { restored = target; } });
     assert.equal(restored, good);
     assert.equal(service.readOperationJournal(root).phase, 'failed');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an expired lock is reclaimed even when its recorded pid still looks alive', async () => {
+  const service = await freshImport('../../src/service.js');
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-lockage-'));
+  try {
+    // process.pid is definitely alive, standing in for a reused pid whose original owner died.
+    // Without an age check this lock would wedge every future install until reboot.
+    const lockPath = join(root, 'operation.lock');
+    mkdirSync(lockPath, { recursive: true });
+    service.atomicWriteJson(join(lockPath, 'owner.json'), {
+      operationId: 'crashed-owner', pid: process.pid,
+      startedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+    });
+
+    const release = service.acquireServiceLock({ root, operationId: 'newcomer', timeoutMs: 0 });
+    assert.equal(typeof release, 'function', 'a stale-by-age lock is reclaimed');
+    release();
+
+    // A fresh lock held by a live pid is still respected.
+    mkdirSync(lockPath, { recursive: true });
+    service.atomicWriteJson(join(lockPath, 'owner.json'), {
+      operationId: 'active-owner', pid: process.pid, startedAt: new Date().toISOString(),
+    });
+    assert.throws(() => service.acquireServiceLock({ root, operationId: 'other', timeoutMs: 0 }),
+      /operation is active/, 'a fresh lock held by a live process is not stolen');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

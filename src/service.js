@@ -25,6 +25,11 @@ const RELEASE_STABILITY_MS = 24 * 60 * 60_000;
 const RELEASE_GRACE_MS = 7 * 24 * 60 * 60_000;
 const LOCK_RETRY_MS = 100;
 const LOCK_TIMEOUT_MS = 120_000;
+// A lock older than this is stale no matter what its recorded pid looks like. PIDs are reused,
+// so a crashed owner whose number gets handed to some unrelated long-lived process would
+// otherwise read as alive forever and wedge every future install. The longest operation is the
+// npm-exec self-update at 10 minutes, so an hour is far beyond any legitimate holder.
+const LOCK_MAX_AGE_MS = 60 * 60_000;
 const operationLocks = new Map();
 
 function resolvePackageRoot(moduleUrl = import.meta.url) {
@@ -181,9 +186,11 @@ function requestedArtifactLayout() {
 
 function copyServicePackage(destination, manifest = servicePackageManifest(), layout = requestedArtifactLayout()) {
   if (layout === 'single') {
-    const bundle = join(packageRoot, 'dist', 'runnerize.mjs');
+    // RUNNERIZE_BUNDLE lets an operator (or a hermetic test) point at an already-verified
+    // artifact instead of the one built into this package.
+    const bundle = process.env.RUNNERIZE_BUNDLE || join(packageRoot, 'dist', 'runnerize.mjs');
     if (!existsSync(bundle)) {
-      throw new Error('RUNNERIZE_ARTIFACT=single requires the prebuilt dist/runnerize.mjs bundle.');
+      throw new Error(`RUNNERIZE_ARTIFACT=single requires a prebuilt bundle at ${bundle}.`);
     }
     mkdirSync(join(destination, 'bin'), { recursive: true });
     cpSync(bundle, join(destination, 'bin', 'runnerize.js'));
@@ -365,7 +372,7 @@ export function acquireServiceLock({ root = serviceDataPath(), operationId = ran
         operationLocks.set(root, state);
         return state.release;
       }
-      if (!owner || !processIsAlive(owner.pid)) {
+      if (!owner || !processIsAlive(owner.pid) || now() - Date.parse(owner.startedAt) >= LOCK_MAX_AGE_MS) {
         try { rmSync(lockPath, { recursive: true, force: true }); } catch { /* race; retry */ }
         continue;
       }
