@@ -61,7 +61,9 @@ async function targetExecutable(targetName, target) {
   }
   if (sha256(archive) !== target.hash) throw new Error(`Cached Node.js ${targetName} archive SHA-256 mismatch.`);
   const extraction = mkdtempSync(join(tmpdir(), 'runnerize-node-'));
-  if (process.platform === 'win32') {
+  // Branch on the ARCHIVE, not the host. Cross-building the win-x64 target from Linux CI still
+  // has to unpack a .zip, and GNU tar cannot read one.
+  if (target.archive.endsWith('.zip')) {
     const localExtraction = mkdtempSync(join(cache, 'extract-'));
     try {
       execFileSync('unzip', ['-q', target.archive, '-d', localExtraction.slice(cache.length + 1)], { cwd: cache, stdio: 'inherit' });

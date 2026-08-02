@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
-  accessSync, closeSync, constants, cpSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync,
+  accessSync, chmodSync, closeSync, constants, cpSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync,
   readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -195,7 +195,11 @@ function copyServicePackage(destination, manifest = servicePackageManifest(), la
       throw new Error('RUNNERIZE_ARTIFACT=binary requires a compiled executable (or RUNNERIZE_BINARY for a prebuilt executable).');
     }
     const name = platform() === 'win32' ? 'runnerize.exe' : 'runnerize';
-    cpSync(binary, join(destination, name));
+    const installedBinary = join(destination, name);
+    cpSync(binary, installedBinary);
+    // The release must be executable whatever the source file's mode was. Without this a POSIX
+    // binary install materializes fine and then fails verification with EACCES on X_OK.
+    chmodSync(installedBinary, 0o755);
     return manifest;
   }
   if (layout === 'single' || layout === 'flat') {
@@ -514,18 +518,21 @@ export function pruneReleases({ root = serviceDataPath(), live = null, journal =
 
 const EXECUTABLE_END = /(?:[\\/]bin[\\/]runnerize\.js|[\\/]runnerize\.mjs|[\\/]runnerize\.exe|[\\/]runnerize)$/;
 
-function rootFromEntrypoint(entrypoint, pathApi = { dirname }) {
+function rootFromEntrypoint(entrypoint) {
+  // Strip the matched suffix rather than calling dirname: these strings come from units and
+  // plists that may have been written on a different OS, and node:path's dirname only
+  // understands the separators of the host it is running on. Slicing preserves whichever
+  // separator the source used and parses a Windows path on Linux and vice versa.
   if (!EXECUTABLE_END.test(entrypoint)) return null;
-  return /[\\/]bin[\\/]runnerize\.js$/.test(entrypoint)
-    ? pathApi.dirname(pathApi.dirname(entrypoint))
-    : pathApi.dirname(entrypoint);
+  const root = entrypoint.replace(EXECUTABLE_END, '');
+  return root || null;
 }
 
-export function executableRoot(spec, pathApi = { dirname }) {
+export function executableRoot(spec) {
   const normalized = spec?.replaceAll('\\\\', '\\');
   const candidates = [...(normalized?.matchAll(/(?:^|[=\s])(?:"([^"]+)"|'([^']+)'|([^"'\s]+))(?=\s|$)/g) ?? [])];
   for (const match of candidates) {
-    const root = rootFromEntrypoint(match[1] ?? match[2] ?? match[3], pathApi);
+    const root = rootFromEntrypoint(match[1] ?? match[2] ?? match[3]);
     if (root) return root;
   }
   return null;
