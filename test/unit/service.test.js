@@ -478,12 +478,18 @@ async function withLinuxService({ active = false, imageDetails, imagePullFails =
       error.status = 3;
       throw error;
     }
-    if (file === 'readlink' && args[0] === '-f') return process.execPath;
+    if (file === 'readlink' && args[0] === '-f') {
+      if (!String(args[1]).startsWith('/proc/')) return args[1];
+      const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
+      return [...unit.split(/\r?\n/).find((line) => line.startsWith('ExecStart=')).matchAll(/"([^"]+)"/g)][0][1]
+        .replaceAll('\\\\', '\\');
+    }
     if (file === 'bash' && args[1]?.includes('/proc/$1/cmdline')) {
       const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
-      installedBin = unit.match(/ExecStart="[^"]+" "([^"]+)"/)?.[1]
-        ?.replaceAll('\\\\', '\\');
-      return `${process.execPath}\0${staleExecStart ? '/home/ani/.local/share/runnerize/bin/runnerize.js' : installedBin}\0run\0`;
+      const execStart = unit.split(/\r?\n/).find((line) => line.startsWith('ExecStart='));
+      const command = [...execStart.matchAll(/"([^"]+)"/g)].map((match) => match[1].replaceAll('\\\\', '\\'));
+      installedBin = command.length === 3 ? command[1] : command[0];
+      return `${staleExecStart ? `${process.execPath}\0/home/ani/.local/share/runnerize/bin/runnerize.js\0run` : command.join('\0')}\0`;
     }
     if (file === 'podman' && args[0] === '--version') return 'podman 5\n';
     if (file === 'podman' && args[0] === 'pull' && imagePullFails) throw new Error('pull failed');
@@ -1016,6 +1022,65 @@ test('single-artifact systemd install writes exactly bundle, tombstone, and meta
   }
 });
 
+test('flat-artifact systemd install writes only runnerize.mjs and release metadata', async () => {
+  const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBundle = process.env.RUNNERIZE_BUNDLE;
+  const bundleDir = mkdtempSync(join(tmpdir(), 'runnerize-flat-stub-'));
+  const bundlePath = join(bundleDir, 'runnerize.mjs');
+  writeFileSync(bundlePath, '#!/usr/bin/env node\nconsole.log("flat");\n');
+  process.env.RUNNERIZE_ARTIFACT = 'flat';
+  process.env.RUNNERIZE_BUNDLE = bundlePath;
+  try {
+    await withLinuxService({}, async (service, _calls, home) => {
+      await service.installService();
+      const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+      const release = join(releases, readdirSync(releases)[0]);
+      assert.deepEqual(readdirSync(release).sort(), ['release.json', 'runnerize.mjs']);
+      const metadata = JSON.parse(readFileSync(join(release, 'release.json'), 'utf8'));
+      assert.equal(metadata.layout, 'flat');
+      assert.equal(metadata.entrypoint, 'runnerize.mjs');
+      assert.equal(service.executableRoot(`ExecStart=/usr/bin/node ${join(release, 'runnerize.mjs')} run`), release);
+    });
+  } finally {
+    if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
+    else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBundle === undefined) delete process.env.RUNNERIZE_BUNDLE;
+    else process.env.RUNNERIZE_BUNDLE = oldBundle;
+    rmSync(bundleDir, { recursive: true, force: true });
+  }
+});
+
+test('binary artifact materializes an immutable executable and invokes it directly', async () => {
+  const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBinary = process.env.RUNNERIZE_BINARY;
+  const binaryDir = mkdtempSync(join(tmpdir(), 'runnerize-binary-stub-'));
+  const binaryPath = join(binaryDir, 'runnerize');
+  writeFileSync(binaryPath, 'binary');
+  process.env.RUNNERIZE_ARTIFACT = 'binary';
+  process.env.RUNNERIZE_BINARY = binaryPath;
+  try {
+    await withLinuxService({}, async (service, _calls, home) => {
+      await service.installService();
+      const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+      const release = join(releases, readdirSync(releases)[0]);
+      assert.deepEqual(readdirSync(release).sort(), ['release.json', 'runnerize']);
+      const metadata = JSON.parse(readFileSync(join(release, 'release.json'), 'utf8'));
+      assert.equal(metadata.layout, 'binary');
+      assert.equal(metadata.entrypoint, 'runnerize');
+      const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
+      const execStart = unit.split(/\r?\n/).find((line) => line.startsWith('ExecStart='));
+      assert.equal(execStart.replaceAll('\\\\', '\\'), `ExecStart="${join(release, 'runnerize')}" "run"`);
+      assert.ok(!unit.includes(process.execPath));
+    });
+  } finally {
+    if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
+    else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBinary === undefined) delete process.env.RUNNERIZE_BINARY;
+    else process.env.RUNNERIZE_BINARY = oldBinary;
+    rmSync(binaryDir, { recursive: true, force: true });
+  }
+});
+
 test('single-artifact request without a bundle fails without a partial release', async () => {
   const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
   const oldBundle = process.env.RUNNERIZE_BUNDLE;
@@ -1350,6 +1415,21 @@ test('Windows status reports independent WSL and native installed versions', asy
       { backend: 'windows', version: '0.7.0', running: true },
     ]);
   });
+});
+
+test('a binary install refuses the WSL backend instead of shipping an unrunnable executable', async () => {
+  const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  process.env.RUNNERIZE_ARTIFACT = 'binary';
+  try {
+    await withWindowsService({}, async (service) => {
+      // A win-x64 executable cannot run inside the Linux distro. Failing loudly beats
+      // materializing a release whose ExecStart points at something the distro cannot exec.
+      await assert.rejects(service.installService(), /cannot install the WSL backend/);
+    });
+  } finally {
+    if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
+    else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+  }
 });
 
 test('Windows status reports a stopped WSL VM without booting it', async () => {

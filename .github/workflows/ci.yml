@@ -78,6 +78,26 @@ jobs:
           test "$first" = "$second"
           node tools/bundle.mjs --check
 
+  sea:
+    name: Build SEA (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [win-x64, linux-x64, darwin-arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node 26
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26.5.1
+      - name: Build checksum-verified executable
+        run: |
+          npm run build
+          node tools/build-sea.mjs "${{ matrix.target }}"
+
   unit:
     name: Unit tests (Node ${{ matrix.node }})
     runs-on: ubuntu-latest

@@ -17,6 +17,7 @@ import {
   createGuardLease, guardOff, guardStatus, installGuard, runGuardRecover, runGuardWatch, uninstallGuard,
 } from '../src/guard.js';
 import { pathToFileURL } from 'node:url';
+import { isSea } from 'node:sea';
 
 const HELP = `runnerize - on-demand ephemeral GitHub Actions runners
 
@@ -305,7 +306,7 @@ export async function main() {
   }
 }
 
-const invokedDirectly = process.argv[1]
+const invokedDirectly = isSea() || process.argv[1]
   && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (invokedDirectly) {

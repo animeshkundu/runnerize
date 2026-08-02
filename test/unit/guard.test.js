@@ -186,6 +186,21 @@ test('shutdown guard defaults to an immutable versioned release and supports a s
   assert.doesNotMatch(script, new RegExp(`Remove-Item -LiteralPath 'C:\\\\ProgramData\\\\runnerize\\\\guard\\\\releases\\\\${release}'`));
 });
 
+test('binary shutdown guard task executes the versioned binary directly', () => {
+  const script = shutdownGuardInstallScript({
+    guardRoot: 'C:\\ProgramData\\runnerize\\guard',
+    guardAppRoot: 'C:\\ProgramData\\runnerize\\guard\\releases\\0.9.5.1',
+    artifactLayout: 'binary',
+    binaryPath: 'C:\\runnerize.exe',
+  });
+  const registration = [...script.matchAll(/-EncodedCommand '([^']+)'/g)]
+    .map((match) => Buffer.from(match[1], 'base64').toString('utf16le'))
+    .find((value) => /runnerize-guard-watch/.test(value));
+  assert.match(registration, /-Execute 'C:\\ProgramData\\runnerize\\guard\\releases\\0\.9\.5\.1\\runnerize\.exe' -Argument 'guard-watch'/);
+  assert.doesNotMatch(registration, /node(?:\.exe)?/i);
+  assert.match(script, /Copy-Item -LiteralPath 'C:\\runnerize\.exe' -Destination 'C:\\ProgramData\\runnerize\\guard\\releases\\0\.9\.5\.1\.new\\runnerize\.exe'/);
+});
+
 test('SYSTEM task script uses startup, highest service-account principals', () => {
   const script = shutdownGuardInstallScript({
     guardRoot: 'C:\\ProgramData\\runnerize\\guard',

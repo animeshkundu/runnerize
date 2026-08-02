@@ -7,6 +7,7 @@ import {
 import { homedir, platform } from 'node:os';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isSea } from 'node:sea';
 import { getToken, listOwnedPrivateRepos, listRunners, sanitizeHostname } from './github.js';
 import { installGuard, uninstallGuard } from './guard.js';
 import { DEFAULT_LINUX_IMAGE, kvmStatus } from './sandbox/container.js';
@@ -33,6 +34,7 @@ const LOCK_MAX_AGE_MS = 60 * 60_000;
 const operationLocks = new Map();
 
 function resolvePackageRoot(moduleUrl = import.meta.url) {
+  if (isSea()) return process.execPath;
   let candidate = dirname(fileURLToPath(moduleUrl));
   while (true) {
     const manifestPath = join(candidate, 'package.json');
@@ -164,6 +166,7 @@ function systemdAppPath(...parts) {
 }
 
 function servicePackageManifest() {
+  if (isSea()) return { name: 'runnerize', version: RUNNERIZE_VERSION };
   const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
   if (!SEMVER_PATTERN.test(manifest.version)) {
     throw new Error('runnerize package version is invalid.');
@@ -177,28 +180,42 @@ function servicePackageManifest() {
 }
 
 function requestedArtifactLayout() {
-  const layout = process.env.RUNNERIZE_ARTIFACT || 'tree';
-  if (!['tree', 'single'].includes(layout)) {
-    throw new Error('RUNNERIZE_ARTIFACT must be either tree or single.');
+  const layout = process.env.RUNNERIZE_ARTIFACT || (isSea() ? 'binary' : 'tree');
+  if (!['tree', 'single', 'flat', 'binary'].includes(layout)) {
+    throw new Error('RUNNERIZE_ARTIFACT must be tree, single, flat, or binary.');
   }
+  if (isSea() && layout !== 'binary') throw new Error('A compiled runnerize executable can only install RUNNERIZE_ARTIFACT=binary.');
   return layout;
 }
 
 function copyServicePackage(destination, manifest = servicePackageManifest(), layout = requestedArtifactLayout()) {
-  if (layout === 'single') {
+  if (layout === 'binary') {
+    const binary = isSea() ? process.execPath : process.env.RUNNERIZE_BINARY;
+    if (!binary || !existsSync(binary)) {
+      throw new Error('RUNNERIZE_ARTIFACT=binary requires a compiled executable (or RUNNERIZE_BINARY for a prebuilt executable).');
+    }
+    const name = platform() === 'win32' ? 'runnerize.exe' : 'runnerize';
+    cpSync(binary, join(destination, name));
+    return manifest;
+  }
+  if (layout === 'single' || layout === 'flat') {
     // RUNNERIZE_BUNDLE lets an operator (or a hermetic test) point at an already-verified
     // artifact instead of the one built into this package.
     const bundle = process.env.RUNNERIZE_BUNDLE || join(packageRoot, 'dist', 'runnerize.mjs');
     if (!existsSync(bundle)) {
-      throw new Error(`RUNNERIZE_ARTIFACT=single requires a prebuilt bundle at ${bundle}.`);
+      throw new Error(`RUNNERIZE_ARTIFACT=${layout} requires a prebuilt bundle at ${bundle}.`);
     }
-    mkdirSync(join(destination, 'bin'), { recursive: true });
-    cpSync(bundle, join(destination, 'bin', 'runnerize.js'));
-    writeFileSync(join(destination, 'package.json'), JSON.stringify({
-      name: manifest.name,
-      version: manifest.version,
-      type: 'module',
-    }));
+    if (layout === 'flat') {
+      cpSync(bundle, join(destination, 'runnerize.mjs'));
+    } else {
+      mkdirSync(join(destination, 'bin'), { recursive: true });
+      cpSync(bundle, join(destination, 'bin', 'runnerize.js'));
+      writeFileSync(join(destination, 'package.json'), JSON.stringify({
+        name: manifest.name,
+        version: manifest.version,
+        type: 'module',
+      }));
+    }
     return manifest;
   }
   for (const entry of SERVICE_PACKAGE_ENTRIES) {
@@ -207,11 +224,17 @@ function copyServicePackage(destination, manifest = servicePackageManifest(), la
   return manifest;
 }
 
+function artifactEntrypoint(layout) {
+  if (layout === 'flat') return 'runnerize.mjs';
+  if (layout === 'binary') return platform() === 'win32' ? 'runnerize.exe' : 'runnerize';
+  return 'bin/runnerize.js';
+}
+
 function releaseMetadata(version, role = 'service', layout = 'tree') {
   return {
     schemaVersion: 1,
     version,
-    entrypoint: 'bin/runnerize.js',
+    entrypoint: artifactEntrypoint(layout),
     layout,
     role,
     installedAt: new Date().toISOString(),
@@ -252,6 +275,13 @@ function releaseEntrypoint(root) {
     throw new Error(`Release metadata at ${root} does not contain a valid entrypoint.`);
   }
   return join(root, ...metadata.entrypoint.split('/'));
+}
+
+function releaseCommand(installation, ...args) {
+  const metadata = readReleaseMetadata(installation.root);
+  return metadata?.layout === 'binary'
+    ? [installation.bin, ...args]
+    : [process.execPath, installation.bin, ...args];
 }
 
 function isInstalledRoot(root) {
@@ -482,18 +512,31 @@ export function pruneReleases({ root = serviceDataPath(), live = null, journal =
   return { dryRun, kept, removed };
 }
 
-const EXECUTABLE_SUFFIX = /(?:[\\/]bin[\\/]runnerize\.js|[\\/]runnerize\.mjs)/;
+const EXECUTABLE_END = /(?:[\\/]bin[\\/]runnerize\.js|[\\/]runnerize\.mjs|[\\/]runnerize\.exe|[\\/]runnerize)$/;
+
+function rootFromEntrypoint(entrypoint, pathApi = { dirname }) {
+  if (!EXECUTABLE_END.test(entrypoint)) return null;
+  return /[\\/]bin[\\/]runnerize\.js$/.test(entrypoint)
+    ? pathApi.dirname(pathApi.dirname(entrypoint))
+    : pathApi.dirname(entrypoint);
+}
 
 export function executableRoot(spec, pathApi = { dirname }) {
   const normalized = spec?.replaceAll('\\\\', '\\');
-  const match = normalized?.match(new RegExp(`(?:^|\\s)(?:"([^"]*${EXECUTABLE_SUFFIX.source})"|'([^']*${EXECUTABLE_SUFFIX.source})'|([^"'\\s]*${EXECUTABLE_SUFFIX.source}))(?=\\s|$)`));
-  if (!match) return null;
-  return (match[1] ?? match[2] ?? match[3]).replace(EXECUTABLE_SUFFIX, '');
+  const candidates = [...(normalized?.matchAll(/(?:^|[=\s])(?:"([^"]+)"|'([^']+)'|([^"'\s]+))(?=\s|$)/g) ?? [])];
+  for (const match of candidates) {
+    const root = rootFromEntrypoint(match[1] ?? match[2] ?? match[3], pathApi);
+    if (root) return root;
+  }
+  return null;
 }
 
 export function launchdExecutableRoot(plist) {
-  const match = plist?.match(new RegExp(`<string>([^<]*${EXECUTABLE_SUFFIX.source})<\\/string>`));
-  return match ? match[1].replace(EXECUTABLE_SUFFIX, '') : null;
+  for (const match of plist?.matchAll(/<string>([^<]+)<\/string>/g) ?? []) {
+    const root = rootFromEntrypoint(match[1]);
+    if (root) return root;
+  }
+  return null;
 }
 
 export function assertExecutableRoundTrip(rendered, installation, parser = executableRoot) {
@@ -1045,7 +1088,7 @@ async function verifySystemdInstall(unitName, expectedArgs) {
     });
   }
 
-  const expectedNode = capture('readlink', ['-f', process.execPath], {
+  const expectedNode = capture('readlink', ['-f', expectedArgs[0]], {
     timeout: PROBE_TIMEOUT_MS,
   });
   const deadline = Date.now() + SYSTEMD_VERIFY_TIMEOUT_MS;
@@ -1096,8 +1139,9 @@ async function installSystemd({ force = false, operationId = process.env.RUNNERI
     recoverPendingOperation({ root, restore: (target) => {
       const unitPath = systemdUnitPath();
       if (!existsSync(unitPath)) return;
+      const targetInstallation = { root: target, bin: releaseEntrypoint(target) };
       const unit = readFileSync(unitPath, 'utf8').replace(/^ExecStart=.*$/m,
-        `ExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(releaseEntrypoint(target))} run`);
+        `ExecStart=${releaseCommand(targetInstallation, 'run').map(quoteSystemd).join(' ')}`);
       writeFileSync(unitPath, unit, { mode: 0o644 });
       systemdUserRun(['systemctl', '--user', 'daemon-reload']);
     } });
@@ -1123,12 +1167,7 @@ async function installSystemd({ force = false, operationId = process.env.RUNNERI
     ? `EnvironmentFile=-${quoteSystemd(environmentFilePath)}\n`
     : '';
   const runOnly = process.env.RUNNERIZE_SERVICE_RUN_ONLY;
-  const expectedArgs = [
-    process.execPath,
-    installation.bin,
-    'run',
-    ...(runOnly ? ['--only', runOnly] : []),
-  ];
+  const expectedArgs = releaseCommand(installation, 'run', ...(runOnly ? ['--only', runOnly] : []));
   mkdirSync(dirname(unitPath), { recursive: true });
   const unit = `[Unit]
 Description=runnerize ephemeral GitHub Actions dispatcher
@@ -1138,7 +1177,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Delegate=yes
-ExecStart=${quoteSystemd(process.execPath)} ${quoteSystemd(installation.bin)} run${runOnly ? ` --only ${quoteSystemd(runOnly)}` : ''}
+ExecStart=${expectedArgs.map(quoteSystemd).join(' ')}
 ${environmentFile}Restart=always
 RestartSec=5
 KillMode=mixed
@@ -1344,7 +1383,7 @@ async function installLaunchd({ force = false } = {}) {
 <dict>
   <key>Label</key><string>io.runnerize.dispatcher</string>
   <key>ProgramArguments</key>
-  <array><string>${xmlEscape(process.execPath)}</string><string>${xmlEscape(installation.bin)}</string><string>run</string></array>
+  <array>${releaseCommand(installation, 'run').map((argument) => `<string>${xmlEscape(argument)}</string>`).join('')}</array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 ${launchdEnvironmentXml()}  <key>ProcessType</key><string>Background</string>
@@ -1678,6 +1717,9 @@ function ensureWslNode({ distro, user, home }) {
 }
 
 function materializeRunnerize({ distro, user, home }) {
+  if (requestedArtifactLayout() === 'binary') {
+    throw new Error('RUNNERIZE_ARTIFACT=binary cannot install the WSL backend: the Windows executable cannot run inside Linux. Install a signed linux-x64 artifact when one becomes available.');
+  }
   const manifest = servicePackageManifest();
   const releases = `${home}/.local/share/runnerize-service/releases`;
   const windowsRoot = capture('wsl.exe', ['-d', distro, '-u', user, '-e', 'wslpath', '-a', packageRoot]);
@@ -2115,9 +2157,13 @@ function writeWindowsLauncher(appBin, { keepAwake = true, root } = {}) {
     ? "Add-Type -Namespace Runnerize -Name Native -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint esFlags);'; [Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16)) | Out-Null"
     : '';
   const wakeStop = keepAwake ? "[Runnerize.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) | Out-Null" : '';
-  const script = `$ErrorActionPreference = 'Stop'\r\n$created = $false\r\n$mutex = [Threading.Mutex]::new($true, 'Local\\runnerize-windows', [ref]$created)\r\nif (-not $created) { $mutex.Dispose(); exit 0 }\r\ntry {\r\n  ${wakeStart}\r\n  $node = (Get-Command node.exe -ErrorAction Stop).Source\r\n  & $node ${powershellLiteral(appBin)} run --only windows *>> ${powershellLiteral(logPath)}\r\n} finally {\r\n  ${wakeStop}\r\n  $mutex.ReleaseMutex()\r\n  $mutex.Dispose()\r\n}\r\n`;
+  const binary = root && readReleaseMetadata(root)?.layout === 'binary';
+  const invocation = binary
+    ? `& ${powershellLiteral(appBin)} run --only windows`
+    : `$node = (Get-Command node.exe -ErrorAction Stop).Source\r\n  & $node ${powershellLiteral(appBin)} run --only windows`;
+  const script = `$ErrorActionPreference = 'Stop'\r\n$created = $false\r\n$mutex = [Threading.Mutex]::new($true, 'Local\\runnerize-windows', [ref]$created)\r\nif (-not $created) { $mutex.Dispose(); exit 0 }\r\ntry {\r\n  ${wakeStart}\r\n  ${invocation} *>> ${powershellLiteral(logPath)}\r\n} finally {\r\n  ${wakeStop}\r\n  $mutex.ReleaseMutex()\r\n  $mutex.Dispose()\r\n}\r\n`;
   writeFileSync(launcherPath, script);
-  if (root) assertExecutableRoundTrip(script.split(/\r?\n/).find((line) => line.includes('& $node')), { root });
+  if (root) assertExecutableRoundTrip(script.split(/\r?\n/).find((line) => line.includes(appBin)), { root });
   return launcherPath;
 }
 

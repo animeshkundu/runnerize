@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { basename as winBasename, join as winJoin } from 'node:path/win32';
 import { platform } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { isSea } from 'node:sea';
 import { RUNNERIZE_VERSION } from './version.js';
 import {
   powershellLiteral, runElevated, systemStartupTaskScript, systemTasksRemovalScript, windowsPowerShellPath,
@@ -24,6 +25,7 @@ const WATCH_TASK = 'runnerize-guard-watch';
 const RECOVER_TASK = 'runnerize-guard-recover';
 
 function resolvePackageRoot(moduleUrl = import.meta.url) {
+  if (isSea()) return process.execPath;
   let candidate = dirname(fileURLToPath(moduleUrl));
   while (true) {
     const manifestPath = join(candidate, 'package.json');
@@ -169,38 +171,52 @@ function restoreScript(path) {
 function taskSpec(taskName, command, options = {}) {
   const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
   const root = options.guardAppRoot ?? winJoin(guardRoot(), 'releases', RUNNERIZE_VERSION);
-  const entrypoint = options.guardEntrypoint ?? 'bin/runnerize.js';
-  return { taskName, execute: process.execPath, argument: `${quote(winJoin(root, ...entrypoint.split('/')))} ${command}` };
+  const entrypoint = options.guardEntrypoint ?? (options.artifactLayout === 'binary' ? 'runnerize.exe' : options.artifactLayout === 'flat' ? 'runnerize.mjs' : 'bin/runnerize.js');
+  const executable = winJoin(root, ...entrypoint.split('/'));
+  return options.artifactLayout === 'binary'
+    ? { taskName, execute: executable, argument: command }
+    : { taskName, execute: process.execPath, argument: `${quote(executable)} ${command}` };
 }
 
 function copyShutdownGuardAppScript(options = {}) {
   const root = options.guardAppRoot ?? winJoin(guardRoot(), 'releases', RUNNERIZE_VERSION);
   const staging = `${root}.new`;
   const source = options.packageRoot ?? packageRoot;
-  const layout = options.artifactLayout ?? process.env.RUNNERIZE_ARTIFACT ?? 'tree';
-  if (!['tree', 'single'].includes(layout)) throw new Error('RUNNERIZE_ARTIFACT must be either tree or single.');
+  const layout = options.artifactLayout ?? process.env.RUNNERIZE_ARTIFACT ?? (isSea() ? 'binary' : 'tree');
+  if (!['tree', 'single', 'flat', 'binary'].includes(layout)) throw new Error('RUNNERIZE_ARTIFACT must be tree, single, flat, or binary.');
   const bundle = winJoin(source, 'dist', 'runnerize.mjs');
-  if (layout === 'single' && !(options.bundleExists ?? existsSync)(join(source, 'dist', 'runnerize.mjs'))) {
-    throw new Error('RUNNERIZE_ARTIFACT=single requires the prebuilt dist/runnerize.mjs bundle.');
+  if (['single', 'flat'].includes(layout) && !(options.bundleExists ?? existsSync)(join(source, 'dist', 'runnerize.mjs'))) {
+    throw new Error(`RUNNERIZE_ARTIFACT=${layout} requires the prebuilt dist/runnerize.mjs bundle.`);
   }
+  const entrypoint = layout === 'flat' ? 'runnerize.mjs' : layout === 'binary' ? 'runnerize.exe' : 'bin/runnerize.js';
   const metadata = JSON.stringify({
     schemaVersion: 1,
     version: RUNNERIZE_VERSION,
-    entrypoint: 'bin/runnerize.js',
+    entrypoint,
     layout,
     role: 'guard',
     installedAt: new Date().toISOString(),
     installedBy: RUNNERIZE_VERSION,
   });
-  const copies = layout === 'single' ? [
-    `New-Item -ItemType Directory -Path ${powershellLiteral(winJoin(staging, 'bin'))} -Force | Out-Null`,
-    `Copy-Item -LiteralPath ${powershellLiteral(bundle)} -Destination ${powershellLiteral(winJoin(staging, 'bin', 'runnerize.js'))} -Force`,
-    `[System.IO.File]::WriteAllText(${powershellLiteral(winJoin(staging, 'package.json'))}, ${powershellLiteral(JSON.stringify({ name: 'runnerize', version: RUNNERIZE_VERSION, type: 'module' }))}, [System.Text.UTF8Encoding]::new($false))`,
-  ] : [
-    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'bin'))} -Destination ${powershellLiteral(staging)} -Recurse -Force`,
-    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'src'))} -Destination ${powershellLiteral(staging)} -Recurse -Force`,
-    `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'package.json'))} -Destination ${powershellLiteral(staging)} -Force`,
-  ];
+  let copies;
+  if (layout === 'single') {
+    copies = [
+      `New-Item -ItemType Directory -Path ${powershellLiteral(winJoin(staging, 'bin'))} -Force | Out-Null`,
+      `Copy-Item -LiteralPath ${powershellLiteral(bundle)} -Destination ${powershellLiteral(winJoin(staging, 'bin', 'runnerize.js'))} -Force`,
+      `[System.IO.File]::WriteAllText(${powershellLiteral(winJoin(staging, 'package.json'))}, ${powershellLiteral(JSON.stringify({ name: 'runnerize', version: RUNNERIZE_VERSION, type: 'module' }))}, [System.Text.UTF8Encoding]::new($false))`,
+    ];
+  } else if (layout === 'flat') {
+    copies = [`Copy-Item -LiteralPath ${powershellLiteral(bundle)} -Destination ${powershellLiteral(winJoin(staging, entrypoint))} -Force`];
+  } else if (layout === 'binary') {
+    const executable = options.binaryPath ?? process.execPath;
+    copies = [`Copy-Item -LiteralPath ${powershellLiteral(executable)} -Destination ${powershellLiteral(winJoin(staging, entrypoint))} -Force`];
+  } else {
+    copies = [
+      `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'bin'))} -Destination ${powershellLiteral(staging)} -Recurse -Force`,
+      `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'src'))} -Destination ${powershellLiteral(staging)} -Recurse -Force`,
+      `Copy-Item -LiteralPath ${powershellLiteral(winJoin(source, 'package.json'))} -Destination ${powershellLiteral(staging)} -Force`,
+    ];
+  }
   return [
     `Remove-Item -LiteralPath ${powershellLiteral(staging)} -Recurse -Force -ErrorAction SilentlyContinue`,
     `New-Item -ItemType Directory -Path ${powershellLiteral(staging)} -Force | Out-Null`,
@@ -215,7 +231,11 @@ export function shutdownGuardInstallScript(options = {}) {
   const leases = options.leasesPath ?? winJoin(root, 'leases');
   const state = options.shutdownStatePath ?? winJoin(root, 'state.json');
   const appRoot = options.guardAppRoot ?? winJoin(root, 'releases', `${RUNNERIZE_VERSION}.${Date.now()}.${process.pid}`);
-  const taskOptions = { ...options, guardAppRoot: appRoot };
+  const taskOptions = {
+    ...options,
+    guardAppRoot: appRoot,
+    artifactLayout: options.artifactLayout ?? process.env.RUNNERIZE_ARTIFACT ?? (isSea() ? 'binary' : 'tree'),
+  };
   const watch = taskSpec(WATCH_TASK, 'guard-watch', taskOptions);
   return [
     `New-Item -ItemType Directory -Path ${powershellLiteral(leases)} -Force | Out-Null`,
