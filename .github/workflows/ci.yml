@@ -143,10 +143,10 @@ jobs:
       fail-fast: false
       matrix:
         # Windows is the primary deployment target: Task Scheduler, the PowerShell launcher, WSL
-        # interop and the guard only take their real branches there. Running the suite on Linux
-        # alone leaves all of that behind stubs.
+        # interop and the guard only take their real branches there. macOS covers the launchd and
+        # tart paths. Running the suite on Linux alone leaves all of that behind stubs.
         node: [22, 24]
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-14]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
