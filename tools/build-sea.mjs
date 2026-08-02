@@ -75,7 +75,13 @@ async function targetExecutable(targetName, target) {
       rmSync(localExtraction, { recursive: true, force: true });
     }
   }
-  execFileSync('tar', ['-xf', archive, '-C', extraction], { stdio: 'inherit' });
+  // Pin bsdtar by absolute path on Windows. A Git-provided MSYS tar earlier on PATH reads the
+  // leading "C:" of an absolute path as a remote host and fails with "Cannot connect to C:".
+  // src/runner.js pins System32\tar.exe for exactly this reason.
+  const tar = process.platform === 'win32'
+    ? join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
+    : 'tar';
+  execFileSync(tar, ['-xf', archive, '-C', extraction], { stdio: 'inherit' });
   return { path: join(extraction, ...target.executable.split('/')), cleanup: extraction };
 }
 

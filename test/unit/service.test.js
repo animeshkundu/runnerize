@@ -1053,9 +1053,14 @@ test('flat-artifact systemd install writes only runnerize.mjs and release metada
 test('binary artifact materializes an immutable executable and invokes it directly', async () => {
   const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
   const oldBinary = process.env.RUNNERIZE_BINARY;
+  // CI's SEA job sets RUNNERIZE_BINARY to a freshly compiled executable so this exercises a real
+  // artifact — the copy, the mode bits, and the ExecStart wiring. Everywhere else a stub keeps
+  // the test hermetic and fast; the stub proves the plumbing but not that the binary runs, which
+  // is what test/integration/binary-install.test.js is for.
+  const providedBinary = oldBinary;
   const binaryDir = mkdtempSync(join(tmpdir(), 'runnerize-binary-stub-'));
-  const binaryPath = join(binaryDir, 'runnerize');
-  writeFileSync(binaryPath, 'binary');
+  const binaryPath = providedBinary ?? join(binaryDir, 'runnerize');
+  if (!providedBinary) writeFileSync(binaryPath, 'binary');
   process.env.RUNNERIZE_ARTIFACT = 'binary';
   process.env.RUNNERIZE_BINARY = binaryPath;
   try {
@@ -1419,16 +1424,38 @@ test('Windows status reports independent WSL and native installed versions', asy
 
 test('a binary install refuses the WSL backend instead of shipping an unrunnable executable', async () => {
   const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBinary = process.env.RUNNERIZE_BINARY;
+  const binaryDir = mkdtempSync(join(tmpdir(), 'runnerize-wsl-binary-'));
+  const binaryPath = oldBinary ?? join(binaryDir, 'runnerize.exe');
+  if (!oldBinary) writeFileSync(binaryPath, 'binary');
   process.env.RUNNERIZE_ARTIFACT = 'binary';
+  process.env.RUNNERIZE_BINARY = binaryPath;
+  const logs = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (value = '') => logs.push(String(value));
+  console.warn = (value = '') => logs.push(String(value));
   try {
-    await withWindowsService({}, async (service) => {
-      // A win-x64 executable cannot run inside the Linux distro. Failing loudly beats
-      // materializing a release whose ExecStart points at something the distro cannot exec.
-      await assert.rejects(service.installService(), /cannot install the WSL backend/);
+    await withWindowsService({}, async (service, _harness, appData) => {
+      // A win-x64 executable cannot run inside the distro. Refusing that one backend beats both
+      // alternatives: materializing a release whose ExecStart points at something the distro
+      // cannot exec, and failing the whole install when the native half is perfectly installable.
+      await service.installService();
+      assert.ok(logs.some((line) => /cannot install the WSL backend/.test(line)),
+        `the WSL refusal is surfaced to the operator; saw: ${logs.join(' | ')}`);
+      const releases = join(appData, 'runnerize', 'releases');
+      assert.ok(existsSync(releases), 'the native Windows backend still installs');
+      const release = join(releases, readdirSync(releases)[0]);
+      assert.equal(JSON.parse(readFileSync(join(release, 'release.json'), 'utf8')).layout, 'binary');
     });
   } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
     if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
     else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBinary === undefined) delete process.env.RUNNERIZE_BINARY;
+    else process.env.RUNNERIZE_BINARY = oldBinary;
+    rmSync(binaryDir, { recursive: true, force: true });
   }
 });
 

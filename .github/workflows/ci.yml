@@ -80,12 +80,24 @@ jobs:
 
   sea:
     name: Build SEA (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        target: [win-x64, linux-x64, darwin-arm64]
+        # Each target is built on a host that can actually EXECUTE it, so the smoke test below
+        # exercises the artifact rather than only proving it links. A cross-built binary that is
+        # never launched tells you nothing about whether the embedded app runs.
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+            binary: dist/linux-x64/runnerize
+          - target: win-x64
+            os: windows-latest
+            binary: dist/win-x64/runnerize.exe
+          - target: darwin-arm64
+            os: macos-14
+            binary: dist/darwin-arm64/runnerize
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -97,15 +109,44 @@ jobs:
         run: |
           npm run build
           node tools/build-sea.mjs "${{ matrix.target }}"
+      - name: Smoke-test the executable against the source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="${{ matrix.binary }}"
+          test -x "$bin" || { echo "::error::$bin is not executable"; exit 1; }
+          # An unknown command exits 1 and prints a known line; compare the compiled artifact to
+          # the tree so a SEA that silently behaves as plain node cannot pass.
+          set +e
+          "./$bin" wat > /tmp/sea.out 2>&1; sea_status=$?
+          node bin/runnerize.js wat > /tmp/tree.out 2>&1; tree_status=$?
+          set -e
+          diff /tmp/tree.out /tmp/sea.out
+          test "$sea_status" = "$tree_status"
+          echo "SEA matches the tree (exit $sea_status)"
+      - name: Exercise the executable end to end
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUNNERIZE_BINARY="$PWD/${{ matrix.binary }}"
+          # Execution parity and SEA-awareness against the compiled artifact.
+          node --test test/integration/binary-install.test.js
+          # Re-run the unit suite with the real executable standing in for the binary-layout
+          # stub, so materialization, the mode bits and the ExecStart wiring see a real file.
+          node --test test/unit/service.test.js
 
   unit:
-    name: Unit tests (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    name: Unit tests (Node ${{ matrix.node }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        # Windows is the primary deployment target: Task Scheduler, the PowerShell launcher, WSL
+        # interop and the guard only take their real branches there. Running the suite on Linux
+        # alone leaves all of that behind stubs.
         node: [22, 24]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
