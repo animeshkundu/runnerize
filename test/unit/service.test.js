@@ -2231,7 +2231,11 @@ test('Windows install writes no fallback when elevated registration times out', 
       service.installService({ elevationTimeoutMs: 10 }),
       /no Startup fallback was written because the elevated task may still complete/,
     );
-    assert.ok(Date.now() - started < 1_000, 'test timeout remains bounded');
+    // The point is that the injected 10ms elevation timeout was honoured rather than the 55s
+    // default, not that the whole install is fast. A one-second wall-clock bound was really a
+    // proxy for that and tipped over on a loaded CI runner; keep a margin that still fails
+    // loudly if the default timeout is ever waited on.
+    assert.ok(Date.now() - started < 20_000, 'the injected elevation timeout is honoured, not the default');
     const elevated = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('Start-Process'));
     assert.equal(elevated.options.timeout, 10);
     assert.equal(existsSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs')), false);
