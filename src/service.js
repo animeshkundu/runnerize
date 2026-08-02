@@ -1010,12 +1010,25 @@ async function activeRunnerNames() {
   return active;
 }
 
-function installPublishedVersion(version, { force = false } = {}) {
-  const npm = platform() === 'win32' ? 'npm.cmd' : 'npm';
-  run(npm, [
+// Exported for tests: the default installer is injected out of every updateService test, so
+// without a direct test nothing exercises how npm is actually spawned.
+export function publishedInstallCommand(version, { force = false } = {}) {
+  const npmArgs = [
     'exec', '--yes', `--package=runnerize@${version}`, '--',
     'runnerize', 'service', 'install', '--update', ...(force ? ['--force'] : []),
-  ], { timeout: 10 * 60_000, env: { ...process.env, RUNNERIZE_SERVICE_UPDATE: '1' } });
+  ];
+  // Node refuses to execFile a .cmd shim directly (the CVE-2024-27980 mitigation), so
+  // spawning npm.cmd fails with EINVAL and self-update dies before it starts. Go through
+  // cmd.exe rather than shell:true so Node still escapes the arguments for us — shell:true
+  // only concatenates them, which is what DEP0190 warns about.
+  return platform() === 'win32'
+    ? { command: process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c', 'npm', ...npmArgs] }
+    : { command: 'npm', args: npmArgs };
+}
+
+function installPublishedVersion(version, options = {}) {
+  const { command, args } = publishedInstallCommand(version, options);
+  run(command, args, { timeout: 10 * 60_000, env: { ...process.env, RUNNERIZE_SERVICE_UPDATE: '1' } });
 }
 
 export async function updateService({ force = false, fetchImpl, installVersion = installPublishedVersion } = {}) {

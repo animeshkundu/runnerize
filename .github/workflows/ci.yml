@@ -135,6 +135,27 @@ jobs:
           # stub, so materialization, the mode bits and the ExecStart wiring see a real file.
           node --test test/unit/service.test.js
 
+  packaging:
+    name: Packaging (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # `npx runnerize@latest service install` runs from an npm-installed copy, not a checkout.
+      # Nothing covered that layout, so a package missing src/ or resolving its root to the
+      # wrong directory would only fail on a user's machine.
+      - name: Pack, install, and run the published layout
+        run: node --test test/integration/packaging.test.js
+
   unit:
     name: Unit tests (Node ${{ matrix.node }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}

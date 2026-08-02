@@ -1106,6 +1106,33 @@ test('single-artifact request without a bundle fails without a partial release',
   }
 });
 
+test('the self-update installer spawns npm in a way this platform can actually launch', async () => {
+  const service = await freshImport('../../src/service.js');
+  const { command, args } = service.publishedInstallCommand('1.2.3', { force: true });
+
+  assert.ok(args.includes('--package=runnerize@1.2.3'), 'the resolved version is passed through');
+  assert.ok(args.includes('--update') && args.includes('--force'), 'the update and force flags survive');
+
+  if (process.platform === 'win32') {
+    // Node refuses to execFile a .cmd shim (CVE-2024-27980), so spawning npm.cmd directly
+    // fails with EINVAL and self-update dies before it starts. Nothing caught that, because
+    // every updateService test injects its own installer.
+    assert.match(command, /cmd\.exe$/i, 'npm is launched through the command processor, not the .cmd shim');
+    assert.ok(!args.some((arg) => /\.cmd$/i.test(arg)), 'no .cmd shim is passed as an argument');
+  } else {
+    assert.equal(command, 'npm');
+  }
+
+  // The real regression guard: prove the chosen command is launchable here. A shape assertion
+  // alone would still have passed with the broken npm.cmd form.
+  const probe = childProcess.spawnSync(command, process.platform === 'win32'
+    ? ['/d', '/s', '/c', 'npm', '--version']
+    : ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 120_000 });
+  assert.equal(probe.error, undefined, `the installer command cannot be spawned: ${probe.error?.code}`);
+  assert.equal(probe.status, 0, `npm --version failed via the installer command: ${probe.stderr}`);
+  assert.match(probe.stdout.trim(), /^\d+\.\d+\.\d+/, 'npm reported a version');
+});
+
 test('operation journal records pending boundaries before committing a systemd install', async () => {
   await withLinuxService({}, async (service, _calls, home) => {
     await service.installService();
