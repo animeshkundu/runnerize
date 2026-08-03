@@ -9,7 +9,21 @@ import { RUNNERIZE_VERSION } from '../../src/version.js';
 
 const require = createRequire(import.meta.url);
 const childProcess = require('node:child_process');
+const fs = require('node:fs');
 const os = require('node:os');
+
+function patchFs(overrides) {
+  const originals = new Map();
+  for (const [name, implementation] of Object.entries(overrides)) {
+    originals.set(name, fs[name]);
+    fs[name] = implementation;
+  }
+  syncBuiltinESMExports();
+  return () => {
+    for (const [name, implementation] of originals) fs[name] = implementation;
+    syncBuiltinESMExports();
+  };
+}
 
 function installStubs({ exec, spawn, platformName = 'win32', home }) {
   const originalExec = childProcess.execFileSync;
@@ -43,6 +57,16 @@ function successfulHarness(options = {}) {
       if (command.includes('WindowsIdentity]::GetCurrent().User.Value')) return 'S-1-5-21-1234\n';
       if (command.includes('[System.Environment]::OSVersion.Version.Build')) return `${options.windowsBuild ?? (options.noWsb ? 26000 : 26100)}\n`;
       const elevatedLaunch = command.includes('Start-Process -FilePath');
+      const waitForStop = command.includes('Get-CimInstance Win32_Process')
+        && command.includes("Start-Sleep -Milliseconds 100");
+      if (waitForStop && options.windowsTaskStopTimeout) {
+        const error = new Error('dispatcher still running');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = '';
+        throw error;
+      }
+      if (waitForStop) return '';
       const runningProbe = command.includes("$task.State -ne 'Running'");
       if (runningProbe) {
         const taskName = command.match(/-TaskName '([^']*)'/)?.[1];
@@ -68,7 +92,7 @@ function successfulHarness(options = {}) {
         const taskNameMatch = command.match(/-TaskName '([^']*)'/);
         const taskName = taskNameMatch?.[1];
         if (options.recordRegisteredArguments) {
-          const expectedArgument = command.match(/\$a\.Arguments -eq '([^']*)'/)?.[1]?.replaceAll("''", "'");
+          const expectedArgument = command.match(/\$a\.Arguments -(?:eq|ne) '([^']*)'/)?.[1]?.replaceAll("''", "'");
           if (expectedArgument !== registeredArguments.get(taskName)) {
             const error = new Error('no match');
             error.status = 1;
@@ -234,8 +258,8 @@ function successfulHarness(options = {}) {
       if (!options.wslInstalledRoot) throw new Error('unit missing');
       return `ExecStart="/usr/bin/node" "${options.wslInstalledRoot}/bin/runnerize.js" run --only linux\n`;
     }
-    if (command[0] === 'cat' && command[1] === `${options.wslInstalledRoot}/package.json`) {
-      return JSON.stringify({ version: options.wslInstalledVersion ?? RUNNERIZE_VERSION });
+    if (command[0] === 'bash' && command[1] === '-c' && command[3] === 'runnerize-meta') {
+      return options.wslReleaseMetadata ?? JSON.stringify({ version: options.wslInstalledVersion ?? RUNNERIZE_VERSION });
     }
     if (command[0] === 'sh' && command[1] === '-c' && command[2].includes('command -v node')) {
       if (options.nodeAbsent) throw new Error('node missing');
@@ -246,7 +270,16 @@ function successfulHarness(options = {}) {
       return '';
     }
     if (command[0] === 'bash' && command[1] === '-c' && command[3] === 'runnerize-copy') {
-      return `${command[5]}/${command[6]}.123.456`;
+      const release = `${command[5]}/${command[6]}.123.456`;
+      options.wslMaterializedReleases?.push(release);
+      return release;
+    }
+    if (command[0] === 'bash' && command[1] === '-c'
+      && command.includes('service') && command.includes('install')) {
+      if (options.wslStage2Fails) throw new Error('stage 2 failed');
+      const release = `${options.wslServiceReleases ?? '/home/ani/.local/share/runnerize-service/releases'}/${RUNNERIZE_VERSION}.789.012`;
+      options.wslMaterializedReleases?.push(release);
+      return '';
     }
     if (command[0] === 'podman') {
       if (options.noRuntime && !(options.podmanInstallSucceeds && command[1] === '--version')) throw new Error('podman missing');
@@ -357,6 +390,15 @@ async function withMacosService({ force = false, linuxRuntime = false } = {}, ac
       return force ? JSON.stringify([{ name: 'runnerize-active' }, { name: 'other-vm' }]) : JSON.stringify([]);
     }
     if (file === 'gh' && args[0] === 'auth') return 'test-token';
+    if (file === 'launchctl' && args[0] === 'print') {
+      const plist = readFileSync(join(home, 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist'), 'utf8');
+      const executable = plist.match(/<string>([^<]*runnerize\.js)<\/string>/)?.[1];
+      return `pid = 4242\nprogram = ${executable}`;
+    }
+    if (file === 'ps' && args[0] === '-p') {
+      const plist = readFileSync(join(home, 'Library', 'LaunchAgents', 'io.runnerize.dispatcher.plist'), 'utf8');
+      return `${process.execPath} ${plist.match(/<string>([^<]*runnerize\.js)<\/string>/)?.[1]} run`;
+    }
     return '';
   };
   const spawn = (file, args, options = {}) => {
@@ -420,6 +462,10 @@ async function withLinuxService({ active = false, imageDetails, imagePullFails =
         throw error;
       }
       if (command.includes('start') || command.includes('restart')) serviceActive = true;
+      if (command.includes('--property=ExecStart')) {
+        const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
+        return unit.split(/\r?\n/).find((line) => line.startsWith('ExecStart='))?.slice('ExecStart='.length) ?? '';
+      }
       if (command.includes('--property=MainPID')) {
         mainPidChecks += 1;
         return transientMainPid && mainPidChecks === 1 ? '0\n' : '4242\n';
@@ -432,12 +478,18 @@ async function withLinuxService({ active = false, imageDetails, imagePullFails =
       error.status = 3;
       throw error;
     }
-    if (file === 'readlink' && args[0] === '-f') return process.execPath;
+    if (file === 'readlink' && args[0] === '-f') {
+      if (!String(args[1]).startsWith('/proc/')) return args[1];
+      const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
+      return [...unit.split(/\r?\n/).find((line) => line.startsWith('ExecStart=')).matchAll(/"([^"]+)"/g)][0][1]
+        .replaceAll('\\\\', '\\');
+    }
     if (file === 'bash' && args[1]?.includes('/proc/$1/cmdline')) {
       const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
-      installedBin = unit.match(/ExecStart="[^"]+" "([^"]+)"/)?.[1]
-        ?.replaceAll('\\\\', '\\');
-      return `${process.execPath}\0${staleExecStart ? '/home/ani/.local/share/runnerize/bin/runnerize.js' : installedBin}\0run\0`;
+      const execStart = unit.split(/\r?\n/).find((line) => line.startsWith('ExecStart='));
+      const command = [...execStart.matchAll(/"([^"]+)"/g)].map((match) => match[1].replaceAll('\\\\', '\\'));
+      installedBin = command.length === 3 ? command[1] : command[0];
+      return `${staleExecStart ? `${process.execPath}\0/home/ani/.local/share/runnerize/bin/runnerize.js\0run` : command.join('\0')}\0`;
     }
     if (file === 'podman' && args[0] === '--version') return 'podman 5\n';
     if (file === 'podman' && args[0] === 'pull' && imagePullFails) throw new Error('pull failed');
@@ -469,6 +521,76 @@ async function withLinuxService({ active = false, imageDetails, imagePullFails =
   }
 }
 
+test('service command parsers recognize literal legacy and flat-entrypoint fixtures', async () => {
+  const service = await freshImport('../../src/service.js');
+  const fixtures = [
+    ['Windows 0.9.5 systemd', 'ExecStart="/usr/bin/node" "C:\\\\Users\\\\ani\\\\AppData\\\\Local\\\\runnerize\\\\releases\\\\0.9.5.1\\\\bin\\\\runnerize.js" run', 'C:\\Users\\ani\\AppData\\Local\\runnerize\\releases\\0.9.5.1'],
+    ['WSL posix', 'ExecStart="/usr/bin/node" "/home/ani/.local/share/runnerize-service/releases/0.9.5.1/bin/runnerize.js" run', '/home/ani/.local/share/runnerize-service/releases/0.9.5.1'],
+    ['interpreter first', 'ExecStart=/usr/bin/node /opt/runnerize/releases/0.9.5.1/bin/runnerize.js run', '/opt/runnerize/releases/0.9.5.1'],
+    ['flat entrypoint', 'ExecStart=/usr/bin/node /opt/runnerize/releases/1.0.0/runnerize.mjs run', '/opt/runnerize/releases/1.0.0'],
+    ['garbage', 'ExecStart=/usr/bin/node /opt/not-runnerize.js', null],
+  ];
+  for (const [name, fixture, expected] of fixtures) {
+    assert.equal(service.executableRoot(fixture), expected, name);
+  }
+
+  const plists = [
+    ['macOS 0.9.5', '<array><string>/opt/homebrew/bin/node</string><string>/Users/ani/Library/Application Support/runnerize/releases/0.9.5.1/bin/runnerize.js</string><string>run</string></array>', '/Users/ani/Library/Application Support/runnerize/releases/0.9.5.1'],
+    ['flat entrypoint', '<array><string>/usr/bin/node</string><string>/opt/runnerize/releases/1.0.0/runnerize.mjs</string><string>run</string></array>', '/opt/runnerize/releases/1.0.0'],
+    ['garbage', '<array><string>/usr/bin/node</string><string>run</string></array>', null],
+  ];
+  for (const [name, fixture, expected] of plists) {
+    assert.equal(service.launchdExecutableRoot(fixture), expected, name);
+  }
+});
+
+test('install-time command round trip rejects a mismatched installation root', async () => {
+  const service = await freshImport('../../src/service.js');
+  assert.throws(
+    () => service.assertExecutableRoundTrip('ExecStart=/usr/bin/node /opt/releases/next/runnerize.mjs run', { root: '/opt/releases/expected' }),
+    /Refusing to install: ExecStart does not parse back to \/opt\/releases\/expected \(got \/opt\/releases\/next\)/,
+  );
+});
+
+test('release metadata prefers release.json and remains compatible with package.json', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-release-metadata-'));
+  try {
+    const service = await freshImport('../../src/service.js');
+    const cases = [
+      ['package only', null, { version: '0.9.5' }, '0.9.5', 'package.json'],
+      ['release only', { schemaVersion: 1, version: '0.9.6', entrypoint: 'bin/runnerize.js' }, null, '0.9.6', 'release.json'],
+      ['release wins', { schemaVersion: 1, version: '0.9.6', entrypoint: 'bin/runnerize.js' }, { version: '0.9.5' }, '0.9.6', 'release.json'],
+      ['neither', null, null, null, null],
+      ['malformed preferred fallback', '{bad', { version: '0.9.5' }, '0.9.5', 'package.json'],
+      ['unknown schema', { schemaVersion: 2, version: '99.0.0', entrypoint: 'bin/runnerize.js' }, { version: '0.9.5' }, null, 'release.json'],
+    ];
+    for (const [name, release, manifest, version, source] of cases) {
+      rmSync(root, { recursive: true, force: true });
+      mkdirSync(root, { recursive: true });
+      if (release !== null) writeFileSync(join(root, 'release.json'), typeof release === 'string' ? release : JSON.stringify(release));
+      if (manifest !== null) writeFileSync(join(root, 'package.json'), JSON.stringify(manifest));
+      const metadata = service.readReleaseMetadata(root);
+      assert.equal(metadata?.version ?? null, version, name);
+      assert.equal(metadata?.source ?? null, source, name);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('release metadata rejects unsafe entrypoints', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-release-entrypoint-'));
+  try {
+    const service = await freshImport('../../src/service.js');
+    for (const entrypoint of ['../bin/runnerize.js', '/bin/runnerize.js', 'bin/../bin/runnerize.js', 'bin\\runnerize.js']) {
+      writeFileSync(join(root, 'release.json'), JSON.stringify({ schemaVersion: 1, version: '0.9.6', entrypoint }));
+      assert.equal(service.readReleaseMetadata(root)?.version, null, entrypoint);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('service status distinguishes a stale installed release and reports image identity', async () => {
   await withLinuxService({
     active: true,
@@ -480,10 +602,10 @@ test('service status distinguishes a stale installed release and reports image i
     await service.installService();
     const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
     const releaseRoot = join(releases, readdirSync(releases)[0]);
-    const manifestPath = join(releaseRoot, 'package.json');
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-    manifest.version = '0.6.0';
-    writeFileSync(manifestPath, JSON.stringify(manifest));
+    const descriptorPath = join(releaseRoot, 'release.json');
+    const descriptor = JSON.parse(readFileSync(descriptorPath, 'utf8'));
+    descriptor.version = '0.6.0';
+    writeFileSync(descriptorPath, JSON.stringify(descriptor));
 
     const logs = [];
     const originalLog = console.log;
@@ -502,6 +624,28 @@ test('service status distinguishes a stale installed release and reports image i
     assert.ok(logs.includes(`Latest on npm: ${RUNNERIZE_VERSION}`));
     assert.ok(logs.some((line) => /linux: installed=0\.6\.0 running=yes status=STALE/.test(line)));
     assert.ok(logs.some((line) => /Linux image: reference=docker\.io\/catthehacker\/ubuntu:full-latest runtime=podman digest=sha256:abc123 created=2026-07-01T12:34:56Z/.test(line)));
+  });
+});
+
+test('service status distinguishes an unparseable unit from no installation', async () => {
+  await withLinuxService({}, async (service, _calls, home) => {
+    const unitPath = join(home, '.config', 'systemd', 'user', 'runnerize.service');
+    mkdirSync(join(home, '.config', 'systemd', 'user'), { recursive: true });
+    writeFileSync(unitPath, '[Service]\nExecStart=/usr/bin/node /opt/unknown-dispatcher.js run\n');
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message = '') => logs.push(String(message));
+    try {
+      await service.serviceStatus({
+        fetchImpl: async () => new Response(JSON.stringify({ version: RUNNERIZE_VERSION }), {
+          headers: { 'content-type': 'application/json' },
+        }),
+      });
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(logs.some((line) => /linux: installed=unrecognized .* status=UNKNOWN/.test(line)));
+    assert.ok(logs.includes('Unrecognized service command: ExecStart=/usr/bin/node /opt/unknown-dispatcher.js run'));
   });
 });
 
@@ -578,10 +722,10 @@ test('service status treats a stable release as newer than its prerelease', asyn
   await withLinuxService({}, async (service, _calls, home) => {
     await service.installService();
     const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
-    const manifestPath = join(releases, readdirSync(releases)[0], 'package.json');
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-    manifest.version = '1.0.0-beta.1';
-    writeFileSync(manifestPath, JSON.stringify(manifest));
+    const descriptorPath = join(releases, readdirSync(releases)[0], 'release.json');
+    const descriptor = JSON.parse(readFileSync(descriptorPath, 'utf8'));
+    descriptor.version = '1.0.0-beta.1';
+    writeFileSync(descriptorPath, JSON.stringify(descriptor));
     const logs = [];
     const originalLog = console.log;
     console.log = (message = '') => logs.push(String(message));
@@ -720,6 +864,9 @@ test('launchd install materializes a private release and status reads its versio
     const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
     const release = join(releases, readdirSync(releases)[0]);
     assert.ok(plist.includes(join(release, 'bin', 'runnerize.js')));
+    const metadata = JSON.parse(readFileSync(join(release, 'release.json'), 'utf8'));
+    assert.equal(metadata.version, RUNNERIZE_VERSION);
+    assert.equal(metadata.role, 'service');
     assert.ok(calls.some((call) => call.file === 'launchctl' && call.args[0] === 'bootstrap'));
 
     const status = await service.serviceStatus({
@@ -775,6 +922,48 @@ test('forced launchd install stops runnerize tart VMs before restarting', async 
   });
 });
 
+test('service package installation rejects runtime dependencies and invalid versions', async () => {
+  await withLinuxService({}, async (service) => {
+    const manifestPath = join(process.cwd(), 'package.json');
+    const originalReadFileSync = fs.readFileSync;
+    for (const [manifest, message] of [
+      [{ version: RUNNERIZE_VERSION, dependencies: { runtime: '1.0.0' } }, /does not support runtime dependencies: runtime/],
+      [{ version: RUNNERIZE_VERSION, optionalDependencies: { optional: '1.0.0' } }, /does not support runtime dependencies: optional/],
+      [{ version: 'not-semver' }, /package version is invalid/],
+    ]) {
+      const restoreFs = patchFs({
+        readFileSync: (path, ...args) => String(path) === manifestPath
+          ? JSON.stringify(manifest)
+          : originalReadFileSync(path, ...args),
+      });
+      try {
+        await assert.rejects(service.installService(), message);
+      } finally {
+        restoreFs();
+      }
+    }
+  });
+});
+
+test('failed systemd materialization removes its partial release', async () => {
+  await withLinuxService({}, async (service, _calls, home) => {
+    const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+    const originalCpSync = fs.cpSync;
+    const restoreFs = patchFs({
+      cpSync: (source, destination, options) => {
+        if (String(source).endsWith(`${join('', 'src')}`)) throw new Error('copy failed');
+        return originalCpSync(source, destination, options);
+      },
+    });
+    try {
+      await assert.rejects(service.installService(), /copy failed/);
+    } finally {
+      restoreFs();
+    }
+    assert.deepEqual(readdirSync(releases), []);
+  });
+});
+
 test('systemd install materializes a cache-independent package release', async () => {
   await withLinuxService({}, async (service, calls, home) => {
     await service.installService();
@@ -785,7 +974,375 @@ test('systemd install materializes a cache-independent package release', async (
     assert.match(unit, /^Delegate=yes$/m);
     assert.ok(existsSync(join(release, 'src', 'service.js')));
     assert.ok(existsSync(join(release, 'package.json')));
+    const metadata = JSON.parse(readFileSync(join(release, 'release.json'), 'utf8'));
+    assert.equal(metadata.version, RUNNERIZE_VERSION);
+    assert.equal(metadata.role, 'service');
+    assert.ok(!readdirSync(releases).some((name) => name.includes('.new.')));
   });
+});
+
+test('single-artifact systemd install writes exactly bundle, tombstone, and metadata and status reads it', async () => {
+  const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBundle = process.env.RUNNERIZE_BUNDLE;
+  // Point at a stand-in bundle so the unit suite stays hermetic: CI runs unit tests without
+  // building dist/, and a test that needs a build artifact is a test that fails on a clean clone.
+  const bundleDir = mkdtempSync(join(tmpdir(), 'runnerize-bundle-stub-'));
+  const bundlePath = join(bundleDir, 'runnerize.mjs');
+  writeFileSync(bundlePath, '#!/usr/bin/env node\nconsole.log("stub");\n');
+  process.env.RUNNERIZE_ARTIFACT = 'single';
+  process.env.RUNNERIZE_BUNDLE = bundlePath;
+  try {
+    await withLinuxService({}, async (service, _calls, home) => {
+      await service.installService();
+      const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+      const release = join(releases, readdirSync(releases)[0]);
+      assert.deepEqual(readdirSync(release).sort(), ['bin', 'package.json', 'release.json']);
+      assert.deepEqual(readdirSync(join(release, 'bin')), ['runnerize.js']);
+      assert.deepEqual(JSON.parse(readFileSync(join(release, 'package.json'), 'utf8')), {
+        name: 'runnerize', version: RUNNERIZE_VERSION, type: 'module',
+      });
+      assert.equal(JSON.parse(readFileSync(join(release, 'release.json'), 'utf8')).layout, 'single');
+      assert.equal(service.executableRoot(`ExecStart=/usr/bin/node ${join(release, 'bin', 'runnerize.js')} run`), release);
+      assert.equal(JSON.parse(readFileSync(join(release, 'package.json'), 'utf8')).version, RUNNERIZE_VERSION,
+        'a package.json-only legacy reader sees the new release');
+      const logs = [];
+      const originalLog = console.log;
+      console.log = (value = '') => logs.push(String(value));
+      try {
+        await service.serviceStatus({ fetchImpl: async () => new Response(JSON.stringify({ version: RUNNERIZE_VERSION })) });
+      } finally { console.log = originalLog; }
+      assert.ok(logs.some((line) => line.includes(`installed=${RUNNERIZE_VERSION}`)));
+    });
+  } finally {
+    if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
+    else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBundle === undefined) delete process.env.RUNNERIZE_BUNDLE;
+    else process.env.RUNNERIZE_BUNDLE = oldBundle;
+    rmSync(bundleDir, { recursive: true, force: true });
+  }
+});
+
+test('flat-artifact systemd install writes only runnerize.mjs and release metadata', async () => {
+  const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBundle = process.env.RUNNERIZE_BUNDLE;
+  const bundleDir = mkdtempSync(join(tmpdir(), 'runnerize-flat-stub-'));
+  const bundlePath = join(bundleDir, 'runnerize.mjs');
+  writeFileSync(bundlePath, '#!/usr/bin/env node\nconsole.log("flat");\n');
+  process.env.RUNNERIZE_ARTIFACT = 'flat';
+  process.env.RUNNERIZE_BUNDLE = bundlePath;
+  try {
+    await withLinuxService({}, async (service, _calls, home) => {
+      await service.installService();
+      const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+      const release = join(releases, readdirSync(releases)[0]);
+      assert.deepEqual(readdirSync(release).sort(), ['release.json', 'runnerize.mjs']);
+      const metadata = JSON.parse(readFileSync(join(release, 'release.json'), 'utf8'));
+      assert.equal(metadata.layout, 'flat');
+      assert.equal(metadata.entrypoint, 'runnerize.mjs');
+      assert.equal(service.executableRoot(`ExecStart=/usr/bin/node ${join(release, 'runnerize.mjs')} run`), release);
+    });
+  } finally {
+    if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
+    else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBundle === undefined) delete process.env.RUNNERIZE_BUNDLE;
+    else process.env.RUNNERIZE_BUNDLE = oldBundle;
+    rmSync(bundleDir, { recursive: true, force: true });
+  }
+});
+
+test('binary artifact materializes an immutable executable and invokes it directly', async () => {
+  const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBinary = process.env.RUNNERIZE_BINARY;
+  // CI's SEA job sets RUNNERIZE_BINARY to a freshly compiled executable so this exercises a real
+  // artifact — the copy, the mode bits, and the ExecStart wiring. Everywhere else a stub keeps
+  // the test hermetic and fast; the stub proves the plumbing but not that the binary runs, which
+  // is what test/integration/binary-install.test.js is for.
+  const providedBinary = oldBinary;
+  const binaryDir = mkdtempSync(join(tmpdir(), 'runnerize-binary-stub-'));
+  const binaryPath = providedBinary ?? join(binaryDir, 'runnerize');
+  if (!providedBinary) writeFileSync(binaryPath, 'binary');
+  process.env.RUNNERIZE_ARTIFACT = 'binary';
+  process.env.RUNNERIZE_BINARY = binaryPath;
+  try {
+    await withLinuxService({}, async (service, _calls, home) => {
+      await service.installService();
+      const releases = join(home, '.local', 'share', 'runnerize-service', 'releases');
+      const release = join(releases, readdirSync(releases)[0]);
+      assert.deepEqual(readdirSync(release).sort(), ['release.json', 'runnerize']);
+      const metadata = JSON.parse(readFileSync(join(release, 'release.json'), 'utf8'));
+      assert.equal(metadata.layout, 'binary');
+      assert.equal(metadata.entrypoint, 'runnerize');
+      const unit = readFileSync(join(home, '.config', 'systemd', 'user', 'runnerize.service'), 'utf8');
+      const execStart = unit.split(/\r?\n/).find((line) => line.startsWith('ExecStart='));
+      assert.equal(execStart.replaceAll('\\\\', '\\'), `ExecStart="${join(release, 'runnerize')}" "run"`);
+      assert.ok(!unit.includes(process.execPath));
+    });
+  } finally {
+    if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
+    else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBinary === undefined) delete process.env.RUNNERIZE_BINARY;
+    else process.env.RUNNERIZE_BINARY = oldBinary;
+    rmSync(binaryDir, { recursive: true, force: true });
+  }
+});
+
+test('single-artifact request without a bundle fails without a partial release', async () => {
+  const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBundle = process.env.RUNNERIZE_BUNDLE;
+  process.env.RUNNERIZE_ARTIFACT = 'single';
+  // Point at a path that cannot exist rather than patching fs, so the test does not depend on
+  // whether dist/ happens to be built in this checkout.
+  process.env.RUNNERIZE_BUNDLE = join(tmpdir(), 'runnerize-absent-bundle', 'runnerize.mjs');
+  try {
+    await withLinuxService({}, async (service, _calls, home) => {
+      await assert.rejects(service.installService(), /requires a prebuilt bundle at/);
+      assert.deepEqual(readdirSync(join(home, '.local', 'share', 'runnerize-service', 'releases')), []);
+    });
+  } finally {
+    if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
+    else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBundle === undefined) delete process.env.RUNNERIZE_BUNDLE;
+    else process.env.RUNNERIZE_BUNDLE = oldBundle;
+  }
+});
+
+test('the self-update installer spawns npm in a way this platform can actually launch', async () => {
+  const service = await freshImport('../../src/service.js');
+  const { command, args } = service.publishedInstallCommand('1.2.3', { force: true });
+
+  assert.ok(args.includes('--package=runnerize@1.2.3'), 'the resolved version is passed through');
+  assert.ok(args.includes('--update') && args.includes('--force'), 'the update and force flags survive');
+
+  if (process.platform === 'win32') {
+    // Node refuses to execFile a .cmd shim (CVE-2024-27980), so spawning npm.cmd directly
+    // fails with EINVAL and self-update dies before it starts. Nothing caught that, because
+    // every updateService test injects its own installer.
+    assert.match(command, /cmd\.exe$/i, 'npm is launched through the command processor, not the .cmd shim');
+    assert.ok(!args.some((arg) => /\.cmd$/i.test(arg)), 'no .cmd shim is passed as an argument');
+  } else {
+    assert.equal(command, 'npm');
+  }
+
+  // The real regression guard: prove the chosen command is launchable here. A shape assertion
+  // alone would still have passed with the broken npm.cmd form.
+  const probe = childProcess.spawnSync(command, process.platform === 'win32'
+    ? ['/d', '/s', '/c', 'npm', '--version']
+    : ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 120_000 });
+  assert.equal(probe.error, undefined, `the installer command cannot be spawned: ${probe.error?.code}`);
+  assert.equal(probe.status, 0, `npm --version failed via the installer command: ${probe.stderr}`);
+  assert.match(probe.stdout.trim(), /^\d+\.\d+\.\d+/, 'npm reported a version');
+});
+
+test('operation journal records pending boundaries before committing a systemd install', async () => {
+  await withLinuxService({}, async (service, _calls, home) => {
+    await service.installService();
+    const root = join(home, '.local', 'share', 'runnerize-service');
+    const journal = service.readOperationJournal(root);
+    assert.equal(journal.phase, 'committed');
+    assert.equal(journal.schemaVersion, 1);
+    assert.ok(journal.operationId);
+    assert.ok(journal.startedAt);
+    assert.ok(journal.current.startsWith(join(root, 'releases')));
+    assert.ok(journal.materializedAt);
+    assert.ok(journal.committedAt);
+  });
+});
+
+test('pending operation recovery restores last-known-good and marks failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-recovery-'));
+  try {
+    mkdirSync(root, { recursive: true });
+    const good = join(root, 'releases', 'good');
+    const service = await freshImport('../../src/service.js');
+    service.atomicWriteJson(join(root, 'operation.json'), {
+      operationId: 'interrupted', phase: 'pending', current: join(root, 'releases', 'bad'),
+      previous: good, lastKnownGood: good, layout: 'systemd', schemaVersion: 1,
+      startedAt: new Date().toISOString(),
+    });
+    let restored;
+    service.recoverPendingOperation({ root, restore: (target) => { restored = target; } });
+    assert.equal(restored, good);
+    assert.equal(service.readOperationJournal(root).phase, 'failed');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an expired lock is reclaimed even when its recorded pid still looks alive', async () => {
+  const service = await freshImport('../../src/service.js');
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-lockage-'));
+  try {
+    // process.pid is definitely alive, standing in for a reused pid whose original owner died.
+    // Without an age check this lock would wedge every future install until reboot.
+    const lockPath = join(root, 'operation.lock');
+    mkdirSync(lockPath, { recursive: true });
+    service.atomicWriteJson(join(lockPath, 'owner.json'), {
+      operationId: 'crashed-owner', pid: process.pid,
+      startedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+    });
+
+    const release = service.acquireServiceLock({ root, operationId: 'newcomer', timeoutMs: 0 });
+    assert.equal(typeof release, 'function', 'a stale-by-age lock is reclaimed');
+    release();
+
+    // A fresh lock held by a live pid is still respected.
+    mkdirSync(lockPath, { recursive: true });
+    service.atomicWriteJson(join(lockPath, 'owner.json'), {
+      operationId: 'active-owner', pid: process.pid, startedAt: new Date().toISOString(),
+    });
+    assert.throws(() => service.acquireServiceLock({ root, operationId: 'other', timeoutMs: 0 }),
+      /operation is active/, 'a fresh lock held by a live process is not stolen');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('prune floor retains the newest unprotected releases, not whatever readdir returns first', async () => {
+  const service = await freshImport('../../src/service.js');
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-floor-'));
+  try {
+    const now = Date.parse('2026-08-02T00:00:00.000Z');
+    const day = 24 * 60 * 60_000;
+    // Names sort oldest-first alphabetically while the CONTENT says the opposite is newest.
+    // Taking records in readdir order would retain 0.8.0/0.8.1 and delete 0.9.5 — the reverse
+    // of a useful rollback target.
+    const make = (name, ageDays) => {
+      const dir = join(root, 'releases', name);
+      mkdirSync(dir, { recursive: true });
+      service.atomicWriteJson(join(dir, 'release.json'), {
+        schemaVersion: 1, version: name.split('.').slice(0, 3).join('.'), entrypoint: 'bin/runnerize.js',
+        layout: 'tree', role: 'service', installedAt: new Date(now - ageDays * day).toISOString(),
+      });
+      return dir;
+    };
+    make('0.8.0.100', 60);
+    make('0.8.1.200', 50);
+    const newest = make('0.9.5.300', 40);
+    const secondNewest = make('0.9.4.400', 45);
+
+    const result = service.pruneReleases({
+      root, live: null, journal: { schemaVersion: 1, phase: 'committed', current: null, lastKnownGood: null },
+      now, dryRun: false, warn: () => {},
+    });
+
+    assert.equal(result.kept.length, 2, 'the floor keeps exactly two when nothing else qualifies');
+    assert.ok(result.kept.includes(newest), 'the newest release survives the floor');
+    assert.ok(result.kept.includes(secondNewest), 'the second-newest release survives the floor');
+    assert.ok(!result.kept.some((k) => k.endsWith('0.8.0.100')), 'the oldest release is not retained by the floor');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('last-known-good only advances after the stability window, and never to an unproven release', async () => {
+  const service = await freshImport('../../src/service.js');
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-stability-'));
+  try {
+    const now = Date.parse('2026-08-02T00:00:00.000Z');
+    const day = 24 * 60 * 60_000;
+    const release = (name, ageMs) => {
+      const dir = join(root, 'releases', name);
+      mkdirSync(dir, { recursive: true });
+      service.atomicWriteJson(join(dir, 'release.json'), {
+        schemaVersion: 1, version: '0.9.5', entrypoint: 'bin/runnerize.js',
+        layout: 'tree', role: 'service', installedAt: new Date(now - ageMs).toISOString(),
+      });
+      return dir;
+    };
+
+    // A previous release that has survived longer than the window is promoted.
+    const seasoned = release('seasoned', 3 * day);
+    const fresh = release('fresh', 0);
+    const journalPath = join(root, 'operation.json');
+
+    service.atomicWriteJson(journalPath, {
+      operationId: 'a', phase: 'pending', current: fresh, previous: seasoned,
+      lastKnownGood: null, layout: 'systemd', schemaVersion: 1,
+    });
+    let journal = service.readOperationJournal(root);
+    service.successfulOperation(root, journal, fresh, now);
+    assert.equal(service.readOperationJournal(root).lastKnownGood, seasoned,
+      'a previous release older than the window becomes last-known-good');
+
+    // A previous release younger than the window is NOT promoted — it has not proven itself.
+    const young = release('young', day / 2);
+    service.atomicWriteJson(journalPath, {
+      operationId: 'b', phase: 'pending', current: fresh, previous: young,
+      lastKnownGood: null, layout: 'systemd', schemaVersion: 1,
+    });
+    journal = service.readOperationJournal(root);
+    service.successfulOperation(root, journal, fresh, now);
+    assert.equal(service.readOperationJournal(root).lastKnownGood, null,
+      'a previous release younger than the window is not promoted');
+
+    // The release being installed right now is never itself last-known-good.
+    assert.notEqual(service.readOperationJournal(root).lastKnownGood, fresh,
+      'the release being installed is unproven and must never become last-known-good');
+
+    // Once set, last-known-good is sticky: a later success does not overwrite it with an
+    // unproven release. This is what survives the good-A / bad-B / bad-C rollback case.
+    service.atomicWriteJson(journalPath, {
+      operationId: 'c', phase: 'pending', current: fresh, previous: young,
+      lastKnownGood: seasoned, layout: 'systemd', schemaVersion: 1,
+    });
+    journal = service.readOperationJournal(root);
+    service.successfulOperation(root, journal, fresh, now);
+    assert.equal(service.readOperationJournal(root).lastKnownGood, seasoned,
+      'an established last-known-good is not replaced by an unproven release');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('service lock is reentrant by operation id and recovers a stale owner', async () => {
+  const service = await freshImport('../../src/service.js');
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-lock-'));
+  try {
+    const releaseOuter = service.acquireServiceLock({ root, operationId: 'same' });
+    const releaseInner = service.acquireServiceLock({ root, operationId: 'same' });
+    assert.throws(() => service.acquireServiceLock({ root, operationId: 'different', timeoutMs: 0 }), /already active/);
+    releaseInner();
+    releaseOuter();
+    mkdirSync(join(root, 'operation.lock'));
+    writeFileSync(join(root, 'operation.lock', 'owner.json'), JSON.stringify({ operationId: 'dead', pid: 2147483647, startedAt: new Date().toISOString() }));
+    service.acquireServiceLock({ root, operationId: 'replacement' })();
+    assert.equal(existsSync(join(root, 'operation.lock')), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('prune keys retention to live and last-known-good and defaults legacy trees to dry-run', async () => {
+  const service = await freshImport('../../src/service.js');
+  const root = mkdtempSync(join(tmpdir(), 'runnerize-prune-'));
+  try {
+    const releases = join(root, 'releases');
+    mkdirSync(releases, { recursive: true });
+    const make = (name, schemaVersion = 1) => {
+      const release = join(releases, name);
+      mkdirSync(release);
+      writeFileSync(join(release, 'release.json'), JSON.stringify({
+        schemaVersion, version: '1.0.0', entrypoint: 'bin/runnerize.js', layout: 'tree', role: 'service',
+        installedAt: '2020-01-01T00:00:00.000Z', installedBy: '1.0.0',
+      }));
+      return release;
+    };
+    const live = make('oldest-live');
+    const good = make('known-good');
+    const stale = make('stale');
+    const unknown = make('unknown', 99);
+    const journal = { phase: 'committed', current: live, previous: stale, lastKnownGood: good };
+    const dry = service.pruneReleases({ root, live, journal: null, now: Date.parse('2026-01-01T00:00:00Z') });
+    assert.equal(dry.dryRun, true);
+    assert.ok(existsSync(stale));
+    const pruned = service.pruneReleases({ root, live, journal, now: Date.parse('2026-01-01T00:00:00Z'), dryRun: false });
+    assert.ok(existsSync(live));
+    assert.ok(existsSync(good));
+    assert.ok(existsSync(unknown));
+    assert.ok(pruned.removed.includes(stale));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('systemd reinstall creates a new immutable release and restarts an active dispatcher', async () => {
@@ -892,6 +1449,43 @@ test('Windows status reports independent WSL and native installed versions', asy
   });
 });
 
+test('a binary install refuses the WSL backend instead of shipping an unrunnable executable', async () => {
+  const oldArtifact = process.env.RUNNERIZE_ARTIFACT;
+  const oldBinary = process.env.RUNNERIZE_BINARY;
+  const binaryDir = mkdtempSync(join(tmpdir(), 'runnerize-wsl-binary-'));
+  const binaryPath = oldBinary ?? join(binaryDir, 'runnerize.exe');
+  if (!oldBinary) writeFileSync(binaryPath, 'binary');
+  process.env.RUNNERIZE_ARTIFACT = 'binary';
+  process.env.RUNNERIZE_BINARY = binaryPath;
+  const logs = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (value = '') => logs.push(String(value));
+  console.warn = (value = '') => logs.push(String(value));
+  try {
+    await withWindowsService({}, async (service, _harness, appData) => {
+      // A win-x64 executable cannot run inside the distro. Refusing that one backend beats both
+      // alternatives: materializing a release whose ExecStart points at something the distro
+      // cannot exec, and failing the whole install when the native half is perfectly installable.
+      await service.installService();
+      assert.ok(logs.some((line) => /cannot install the WSL backend/.test(line)),
+        `the WSL refusal is surfaced to the operator; saw: ${logs.join(' | ')}`);
+      const releases = join(appData, 'runnerize', 'releases');
+      assert.ok(existsSync(releases), 'the native Windows backend still installs');
+      const release = join(releases, readdirSync(releases)[0]);
+      assert.equal(JSON.parse(readFileSync(join(release, 'release.json'), 'utf8')).layout, 'binary');
+    });
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+    if (oldArtifact === undefined) delete process.env.RUNNERIZE_ARTIFACT;
+    else process.env.RUNNERIZE_ARTIFACT = oldArtifact;
+    if (oldBinary === undefined) delete process.env.RUNNERIZE_BINARY;
+    else process.env.RUNNERIZE_BINARY = oldBinary;
+    rmSync(binaryDir, { recursive: true, force: true });
+  }
+});
+
 test('Windows status reports a stopped WSL VM without booting it', async () => {
   await withWindowsService({ runningDistros: '' }, async (service, harness) => {
     const status = await service.serviceStatus({ fetchImpl: async () => { throw new Error('offline'); } });
@@ -960,6 +1554,75 @@ test('Windows status reports WSL holder task and Startup fallback health', async
   });
 });
 
+test('Windows WSL install deletes its bootstrap only after stage 2 exits', async () => {
+  const releases = [];
+  await withWindowsService({ wslMaterializedReleases: releases }, async (service, harness) => {
+    await service.installService();
+    assert.equal(releases.length, 2);
+    const [bootstrap, installed] = releases;
+    assert.notEqual(installed, bootstrap);
+    const copy = harness.calls.find((call) => commandOf(call)[3] === 'runnerize-copy');
+    const metadata = JSON.parse(commandOf(copy)[7]);
+    assert.equal(metadata.version, RUNNERIZE_VERSION);
+    assert.equal(metadata.role, 'bootstrap');
+    const delegatedIndex = harness.calls.findIndex((call) => {
+      const command = commandOf(call);
+      return command[0] === 'bash' && command[1] === '-c'
+        && command.includes('service') && command.includes('install');
+    });
+    const removalIndex = harness.calls.findIndex((call) => {
+      const command = commandOf(call);
+      return command[0] === 'rm' && command.includes(bootstrap);
+    });
+    assert.ok(delegatedIndex >= 0 && removalIndex > delegatedIndex);
+    assert.ok(commandOf(harness.calls[delegatedIndex]).includes(`${bootstrap}/bin/runnerize.js`));
+  });
+});
+
+test('failed Windows stage 2 retains its bootstrap for diagnosis', async () => {
+  const releases = [];
+  await withWindowsService({ wslMaterializedReleases: releases, wslStage2Fails: true }, async (service, harness) => {
+    await service.installService();
+    const [bootstrap] = releases;
+    assert.ok(bootstrap);
+    assert.ok(!harness.calls.some((call) => commandOf(call)[0] === 'rm' && commandOf(call).includes(bootstrap)));
+  });
+});
+
+test('failed Windows materialization removes its staging release', async () => {
+  await withWindowsService({}, async (service, _harness, appData) => {
+    const releases = join(appData, 'runnerize', 'releases');
+    const originalCpSync = fs.cpSync;
+    const restoreFs = patchFs({
+      cpSync: (source, destination, options) => {
+        if (String(source).endsWith(`${join('', 'src')}`)) throw new Error('copy failed');
+        return originalCpSync(source, destination, options);
+      },
+    });
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      await service.installService();
+    } finally {
+      console.warn = originalWarn;
+      restoreFs();
+    }
+    assert.deepEqual(readdirSync(releases), []);
+  });
+});
+
+test('Windows install journals native materialization and commit', async () => {
+  await withWindowsService({}, async (service, _harness, appData) => {
+    await service.installService();
+    const root = join(appData, 'runnerize');
+    const journal = service.readOperationJournal(root);
+    assert.equal(journal.phase, 'committed');
+    assert.equal(journal.current, readFileSync(join(root, 'current-release'), 'utf8'));
+    assert.ok(journal.materializedAt);
+    assert.ok(journal.committedAt);
+  });
+});
+
 test('Windows install skips docker-desktop, reuses PATH Node, and delegates service install', async () => {
   await withWindowsService({ installedNode: false }, async (service, harness, appData) => {
     await service.installService();
@@ -1010,6 +1673,11 @@ test('Windows install skips docker-desktop, reuses PATH Node, and delegates serv
     const installedRoot = readFileSync(join(appData, 'runnerize', 'current-release'), 'utf8');
     assert.ok(installedRoot.startsWith(join(appData, 'runnerize', 'releases')));
     assert.ok(existsSync(join(installedRoot, 'bin', 'runnerize.js')));
+    const metadata = JSON.parse(readFileSync(join(installedRoot, 'release.json'), 'utf8'));
+    assert.equal(metadata.version, RUNNERIZE_VERSION);
+    assert.equal(metadata.role, 'service');
+    assert.ok(!readdirSync(join(appData, 'runnerize', 'releases')).some((name) => name.includes('.new.')),
+      'release metadata is written in staging and appears only in the renamed destination');
   });
 });
 
@@ -1028,7 +1696,7 @@ test('Windows first install does not restart an inactive dispatcher task', async
   });
 });
 
-test('Windows update restarts the native task after installing its replacement', async () => {
+test('Windows update waits for the native task to stop before installing its replacement', async () => {
   await withWindowsService({ windowsTaskRunning: true }, async (service, harness) => {
     await service.installService();
     harness.calls.length = 0;
@@ -1037,9 +1705,29 @@ test('Windows update restarts the native task after installing its replacement',
       .filter((call) => call.file.toLowerCase().endsWith('powershell.exe'))
       .map((call) => call.args.at(-1));
     const stop = taskCommands.findIndex((command) => command.includes("Stop-ScheduledTask -TaskName 'runnerize-windows'"));
+    const wait = taskCommands.findIndex((command) => command.includes('Get-CimInstance Win32_Process')
+      && command.includes('runnerize-windows.ps1'));
     const register = taskCommands.findIndex((command) => command.includes("$taskName = 'runnerize-windows'") && command.includes('Register-ScheduledTask'));
     const start = taskCommands.findIndex((command) => command.includes("Start-ScheduledTask -TaskName 'runnerize-windows'"));
-    assert.ok(stop >= 0 && register > stop && start > register);
+    assert.ok(stop >= 0 && wait > stop && register > wait && start > register);
+  });
+});
+
+test('Windows update timeout leaves current-release on the previous native release', async () => {
+  await withWindowsService({ windowsTaskRunning: true }, async (service, harness, appData) => {
+    await service.installService();
+    const currentRelease = join(appData, 'runnerize', 'current-release');
+    const previousRoot = readFileSync(currentRelease, 'utf8');
+    harness.options.windowsTaskStopTimeout = true;
+
+    await assert.rejects(
+      service.installService({ update: true }),
+      /Could not update every installed runnerize backend: windows/,
+    );
+
+    assert.equal(readFileSync(currentRelease, 'utf8'), previousRoot);
+    assert.ok(harness.calls.some((call) => call.args.at(-1)?.includes('Get-CimInstance Win32_Process')
+      && call.args.at(-1).includes('runnerize-windows.ps1')));
   });
 });
 
@@ -1066,10 +1754,17 @@ test('Windows update boots WSL to preserve the installed Linux backend requireme
   });
 });
 
-test('Windows update restores an inactive native task registration when startup fails', async () => {
+test('Windows update restores an inactive native task registration using the previous release entrypoint', async () => {
   await withWindowsService({ recordRegisteredArguments: true }, async (service, harness, appData) => {
     await service.installService();
     const previousRoot = readFileSync(join(appData, 'runnerize', 'current-release'), 'utf8');
+    const previousEntrypoint = 'runnerize.mjs';
+    const descriptorPath = join(previousRoot, 'release.json');
+    const descriptor = JSON.parse(readFileSync(descriptorPath, 'utf8'));
+    descriptor.entrypoint = previousEntrypoint;
+    descriptor.layout = 'flat';
+    writeFileSync(descriptorPath, JSON.stringify(descriptor));
+    writeFileSync(join(previousRoot, previousEntrypoint), '// captured previous flat release');
     harness.options.startTaskFailsOnce = true;
 
     await assert.rejects(service.installService({ update: true }), /Could not update every installed runnerize backend: windows/);
@@ -1080,7 +1775,7 @@ test('Windows update restores an inactive native task registration when startup 
       && call.args.at(-1).includes("$taskName = 'runnerize-windows'")
       && call.args.at(-1).includes('Register-ScheduledTask'));
     assert.ok(registrations.length >= 3, 'initial, replacement, and rollback task registrations run');
-    const restoredBin = join(previousRoot, 'bin', 'runnerize.js');
+    const restoredBin = join(previousRoot, previousEntrypoint);
     assert.ok(readFileSync(join(appData, 'runnerize', 'runnerize-windows.ps1'), 'utf8').includes(restoredBin));
   });
 });
@@ -1536,7 +2231,11 @@ test('Windows install writes no fallback when elevated registration times out', 
       service.installService({ elevationTimeoutMs: 10 }),
       /no Startup fallback was written because the elevated task may still complete/,
     );
-    assert.ok(Date.now() - started < 1_000, 'test timeout remains bounded');
+    // The point is that the injected 10ms elevation timeout was honoured rather than the 55s
+    // default, not that the whole install is fast. A one-second wall-clock bound was really a
+    // proxy for that and tipped over on a loaded CI runner; keep a margin that still fails
+    // loudly if the default timeout is ever waited on.
+    assert.ok(Date.now() - started < 20_000, 'the injected elevation timeout is honoured, not the default');
     const elevated = harness.calls.find((call) => call.file.toLowerCase().endsWith('powershell.exe') && call.args.at(-1).includes('Start-Process'));
     assert.equal(elevated.options.timeout, 10);
     assert.equal(existsSync(join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'runnerize.vbs')), false);

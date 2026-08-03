@@ -40,15 +40,14 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-      # Syntax-check the CLI entrypoints and every source module without
-      # executing anything (zero deps, so nothing else to build). Covers every
-      # file under bin/ (CLI binaries may be extensionless) plus every .js under
-      # src/. Missing directories are tolerated so this never crashes on layout
-      # changes.
-      - name: Parse-check bin/** and src/**/*.js
+      # Syntax-check the CLI entrypoints and every source/tool module without
+      # executing anything. Covers every file under bin/ (CLI binaries may be
+      # extensionless) plus JavaScript modules under src/ and tools/. Missing
+      # directories are tolerated so this never crashes on layout changes.
+      - name: Parse-check bin/**, src/**/*.js, and tools/**/*.mjs
         run: |
           set -euo pipefail
-          files="$( { find bin -type f 2>/dev/null; find src -type f -name '*.js' 2>/dev/null; } | sort )"
+          files="$( { find bin -type f 2>/dev/null; find src tools -type f \( -name '*.js' -o -name '*.mjs' \) 2>/dev/null; } | sort )"
           if [ -z "$files" ]; then
             echo "::error::no files found to syntax-check"
             exit 1
@@ -58,14 +57,144 @@ jobs:
             node --check "$f"
           done
 
-  unit:
-    name: Unit tests (Node ${{ matrix.node }})
+  bundle:
+    name: Bundle & determinism
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Build twice and verify deterministic output
+        run: |
+          set -euo pipefail
+          npm run build
+          first="$(sha256sum dist/runnerize.mjs | cut -d' ' -f1)"
+          npm run build
+          second="$(sha256sum dist/runnerize.mjs | cut -d' ' -f1)"
+          test "$first" = "$second"
+          node tools/bundle.mjs --check
+
+  sea:
+    name: Build SEA (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each target is built on a host that can actually EXECUTE it, so the smoke test below
+        # exercises the artifact rather than only proving it links. A cross-built binary that is
+        # never launched tells you nothing about whether the embedded app runs.
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+            binary: dist/linux-x64/runnerize
+          - target: win-x64
+            os: windows-latest
+            binary: dist/win-x64/runnerize.exe
+          - target: darwin-arm64
+            os: macos-14
+            binary: dist/darwin-arm64/runnerize
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node 26
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26.5.1
+      - name: Build checksum-verified executable
+        run: |
+          npm run build
+          node tools/build-sea.mjs "${{ matrix.target }}"
+      - name: Smoke-test the executable against the source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="${{ matrix.binary }}"
+          test -x "$bin" || { echo "::error::$bin is not executable"; exit 1; }
+          # An unknown command exits 1 and prints a known line; compare the compiled artifact to
+          # the tree so a SEA that silently behaves as plain node cannot pass.
+          set +e
+          "./$bin" wat > /tmp/sea.out 2>&1; sea_status=$?
+          node bin/runnerize.js wat > /tmp/tree.out 2>&1; tree_status=$?
+          set -e
+          diff /tmp/tree.out /tmp/sea.out
+          test "$sea_status" = "$tree_status"
+          echo "SEA matches the tree (exit $sea_status)"
+      - name: Exercise the executable end to end
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUNNERIZE_BINARY="$PWD/${{ matrix.binary }}"
+          # Execution parity and SEA-awareness against the compiled artifact.
+          node --test test/integration/binary-install.test.js
+          # Re-run the unit suite with the real executable standing in for the binary-layout
+          # stub, so materialization, the mode bits and the ExecStart wiring see a real file.
+          node --test test/unit/service.test.js
+
+  # The one check branch protection should require. Every other job is a matrix entry whose
+  # name changes whenever a platform or Node version is added, and a renamed job silently
+  # becomes an unsatisfiable required check that blocks every PR forever. Requiring this
+  # aggregate instead means the matrix can change freely without touching branch protection.
+  gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [lint, bundle, sea, packaging, unit, e2e]
+    steps:
+      - name: Require every job to have succeeded or been deliberately skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "upstream results: $RESULTS"
+          # 'skipped' is legitimate: E2E skips on fork PRs, which have no secrets. Anything
+          # else - failure, cancelled, or a job that never ran - must block.
+          for result in $RESULTS; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::a required job reported '$result'"; exit 1 ;;
+            esac
+          done
+          echo "All CI jobs passed."
+
+  packaging:
+    name: Packaging (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # `npx runnerize@latest service install` runs from an npm-installed copy, not a checkout.
+      # Nothing covered that layout, so a package missing src/ or resolving its root to the
+      # wrong directory would only fail on a user's machine.
+      - name: Pack, install, and run the published layout
+        run: node --test test/integration/packaging.test.js
+
+  unit:
+    name: Unit tests (Node ${{ matrix.node }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        # Windows is the primary deployment target: Task Scheduler, the PowerShell launcher, WSL
+        # interop and the guard only take their real branches there. macOS covers the launchd and
+        # tart paths. Running the suite on Linux alone leaves all of that behind stubs.
         node: [22, 24]
+        os: [ubuntu-latest, windows-latest, macos-14]
     steps:
       - name: Checkout
         uses: actions/checkout@v7

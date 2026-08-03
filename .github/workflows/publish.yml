@@ -140,6 +140,17 @@ jobs:
           git commit -m "release: $TAG"
           git tag -a "$TAG" -m "$TAG"
 
+      # Build from the exact release commit and independently rebuild before any
+      # irreversible action. --check fails if dist is absent, stale, or carries
+      # metadata for a different commit/version. dist remains ignored and unstaged.
+      - name: Build and verify release bundle
+        run: |
+          set -euo pipefail
+          npm run build
+          test -s dist/runnerize.mjs
+          node tools/bundle.mjs --check
+          test -z "$(git status --porcelain --untracked-files=all)"
+
       # OIDC trusted publishing requires npm >= 11.5.1. Pin to the 11.x line
       # rather than relying on Node 24's bundled npm or using @latest, so a future
       # npm major cannot silently break the publish. Done BEFORE publish
