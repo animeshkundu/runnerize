@@ -17,7 +17,11 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # release/** so the reconcile PR the publish workflow opens gets checks. GitHub does not
+    # trigger workflows for events raised by GITHUB_TOKEN, so those PRs report no checks at all
+    # and sit blocked forever against a required status - which is why several were stuck open.
+    # A push-triggered run reports on the same head commit, which satisfies the requirement.
+    branches: [main, 'release/**']
 
 # Least privilege: CI only reads the repository.
 permissions:
