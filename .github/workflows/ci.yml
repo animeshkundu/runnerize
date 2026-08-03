@@ -135,6 +135,33 @@ jobs:
           # stub, so materialization, the mode bits and the ExecStart wiring see a real file.
           node --test test/unit/service.test.js
 
+  # The one check branch protection should require. Every other job is a matrix entry whose
+  # name changes whenever a platform or Node version is added, and a renamed job silently
+  # becomes an unsatisfiable required check that blocks every PR forever. Requiring this
+  # aggregate instead means the matrix can change freely without touching branch protection.
+  gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [lint, bundle, sea, packaging, unit, e2e]
+    steps:
+      - name: Require every job to have succeeded or been deliberately skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "upstream results: $RESULTS"
+          # 'skipped' is legitimate: E2E skips on fork PRs, which have no secrets. Anything
+          # else - failure, cancelled, or a job that never ran - must block.
+          for result in $RESULTS; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::a required job reported '$result'"; exit 1 ;;
+            esac
+          done
+          echo "All CI jobs passed."
+
   packaging:
     name: Packaging (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
