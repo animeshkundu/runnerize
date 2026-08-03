@@ -178,7 +178,10 @@ test('shutdown guard defaults to an immutable versioned release and supports a s
     artifactLayout: 'single',
     bundleExists: () => true,
   });
-  const release = script.match(/releases\\(0\.9\.5\.\d+\.\d+)\.new/)?.[1];
+  // Derive the version rather than hardcoding it: a literal here silently breaks on the next
+  // release, and 0.9.5 -> 0.10.0 did exactly that.
+  const versionPattern = RUNNERIZE_VERSION.replaceAll('.', '\\.');
+  const release = script.match(new RegExp(`releases\\\\(${versionPattern}\\.\\d+\\.\\d+)\\.new`))?.[1];
   assert.ok(release, 'guard app release includes version, timestamp, and process id');
   assert.match(script, /Copy-Item -LiteralPath 'C:\\runnerize\\dist\\runnerize\.mjs' -Destination 'C:\\ProgramData\\runnerize\\guard\\releases\\[^']+\\bin\\runnerize\.js' -Force/);
   assert.doesNotMatch(script, /Copy-Item -LiteralPath 'C:\\runnerize\\src'/);
